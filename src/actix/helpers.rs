@@ -4,12 +4,12 @@ use std::future::Future;
 use actix_web::http::header;
 use actix_web::http::header::HeaderMap;
 use actix_web::rt::time::Instant;
-use actix_web::{http, HttpResponse, ResponseError};
-use api::rest::models::{ApiResponse, ApiStatus, HardwareUsage};
+use actix_web::{HttpResponse, ResponseError, http};
+use api::rest::models::{ApiResponse, ApiStatus, HardwareUsage, InferenceUsage, Usage};
 use collection::operations::types::CollectionError;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use serde::Serialize;
-use storage::content_manager::errors::StorageError;
+use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
 use storage::dispatcher::Dispatcher;
 
@@ -17,7 +17,9 @@ pub fn get_request_hardware_counter(
     dispatcher: &Dispatcher,
     collection_name: String,
     report_to_api: bool,
+    wait: Option<bool>,
 ) -> RequestHwCounter {
+    let report_to_api = report_to_api && wait != Some(false);
     RequestHwCounter::new(
         HwMeasurementAcc::new_with_metrics_drain(
             dispatcher.get_collection_hw_metrics(collection_name),
@@ -26,13 +28,53 @@ pub fn get_request_hardware_counter(
     )
 }
 
-pub fn accepted_response(timing: Instant, hardware_usage: Option<HardwareUsage>) -> HttpResponse {
+pub fn accepted_response(
+    timing: Instant,
+    hardware_usage: Option<HardwareUsage>,
+    inference_usage: Option<InferenceUsage>,
+) -> HttpResponse {
+    let usage = {
+        let u = Usage {
+            hardware: hardware_usage,
+            inference: inference_usage,
+        };
+        if u.is_empty() { None } else { Some(u) }
+    };
+
     HttpResponse::Accepted().json(ApiResponse::<()> {
         result: None,
         status: ApiStatus::Accepted,
         time: timing.elapsed().as_secs_f64(),
-        usage: hardware_usage,
+        usage,
     })
+}
+
+pub fn process_response_with_inference_usage<T>(
+    response: Result<T, StorageError>,
+    timing: Instant,
+    hardware_usage: Option<HardwareUsage>,
+    inference_usage: Option<InferenceUsage>,
+) -> HttpResponse
+where
+    T: Serialize,
+{
+    match response {
+        Ok(res) => HttpResponse::Ok().json(ApiResponse {
+            result: Some(res),
+            status: ApiStatus::Ok,
+            time: timing.elapsed().as_secs_f64(),
+            usage: Some(Usage {
+                hardware: hardware_usage,
+                inference: inference_usage,
+            }),
+        }),
+        Err(err) => process_response_error_with_inference_usage(
+            err,
+            timing,
+            hardware_usage,
+            inference_usage,
+        ),
+    }
 }
 
 pub fn process_response<T>(
@@ -43,21 +85,14 @@ pub fn process_response<T>(
 where
     T: Serialize,
 {
-    match response {
-        Ok(res) => HttpResponse::Ok().json(ApiResponse {
-            result: Some(res),
-            status: ApiStatus::Ok,
-            time: timing.elapsed().as_secs_f64(),
-            usage: hardware_usage,
-        }),
-        Err(err) => process_response_error(err, timing, hardware_usage),
-    }
+    process_response_with_inference_usage(response, timing, hardware_usage, None)
 }
 
-pub fn process_response_error(
+pub fn process_response_error_with_inference_usage(
     err: StorageError,
     timing: Instant,
     hardware_usage: Option<HardwareUsage>,
+    inference_usage: Option<InferenceUsage>,
 ) -> HttpResponse {
     log_service_error(&err);
 
@@ -68,7 +103,10 @@ pub fn process_response_error(
         result: None,
         status: ApiStatus::Error(error.to_string()),
         time: timing.elapsed().as_secs_f64(),
-        usage: hardware_usage,
+        usage: Some(Usage {
+            hardware: hardware_usage,
+            inference: inference_usage,
+        }),
     };
 
     let mut response_builder = HttpResponse::build(http_code);
@@ -78,6 +116,23 @@ pub fn process_response_error(
     response_builder.json(json_body)
 }
 
+pub fn process_response_error(
+    err: StorageError,
+    timing: Instant,
+    hardware_usage: Option<HardwareUsage>,
+) -> HttpResponse {
+    process_response_error_with_inference_usage(err, timing, hardware_usage, None)
+}
+
+pub fn already_in_progress_response() -> HttpResponse {
+    HttpResponse::build(http::StatusCode::SERVICE_UNAVAILABLE).json(ApiResponse::<()> {
+        result: None,
+        status: ApiStatus::AlreadyInProgress,
+        time: 0.0,
+        usage: None,
+    })
+}
+
 /// Response wrapper for a `Future` returning `Result`.
 ///
 /// # Cancel safety
@@ -85,7 +140,7 @@ pub fn process_response_error(
 /// Future must be cancel safe.
 pub async fn time<T, Fut>(future: Fut) -> HttpResponse
 where
-    Fut: Future<Output = Result<T, StorageError>>,
+    Fut: Future<Output = StorageResult<T>>,
     T: serde::Serialize,
 {
     time_impl(async { future.await.map(Some) }).await
@@ -95,17 +150,15 @@ where
 /// If `wait` is false, returns `202 Accepted` immediately.
 pub async fn time_or_accept<T, Fut>(future: Fut, wait: bool) -> HttpResponse
 where
-    Fut: Future<Output = Result<T, StorageError>> + Send + 'static,
+    Fut: Future<Output = StorageResult<T>> + Send + 'static,
     T: serde::Serialize + Send + 'static,
 {
     let future = async move {
         let handle = tokio::task::spawn(async move {
             let result = future.await;
 
-            if !wait {
-                if let Err(err) = &result {
-                    log_service_error(err);
-                }
+            if !wait && let Err(err) = &result {
+                log_service_error(err);
             }
 
             result
@@ -132,7 +185,7 @@ where
     let instant = Instant::now();
     match future.await.transpose() {
         Some(res) => process_response(res, instant, None),
-        None => accepted_response(instant, None),
+        None => accepted_response(instant, None, None),
     }
 }
 
@@ -179,6 +232,8 @@ impl HttpError {
             StorageError::Forbidden { .. } => {}
             StorageError::PreconditionFailed { .. } => {}
             StorageError::InferenceError { .. } => {}
+            StorageError::ShardUnavailable { .. } => {}
+            StorageError::EmptyPartialSnapshot { .. } => {}
         }
         headers
     }
@@ -199,6 +254,8 @@ impl ResponseError for HttpError {
             StorageError::PreconditionFailed { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             StorageError::InferenceError { .. } => http::StatusCode::BAD_REQUEST,
             StorageError::RateLimitExceeded { .. } => http::StatusCode::TOO_MANY_REQUESTS,
+            StorageError::ShardUnavailable { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
+            StorageError::EmptyPartialSnapshot { .. } => http::StatusCode::NOT_MODIFIED,
         }
     }
 }

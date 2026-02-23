@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,22 @@ pub fn transpose_map_into_named_vector<TVector: Into<VectorInternal>>(
     result
 }
 
+/// Hashes an iterator of unique items in an order-independent way.
+///
+/// The order of items does not affect the resulting hash.
+/// Assumes that each item is unique. Suitable for hashing, e.g., sets and maps,
+/// but not for vectors or multisets.
+#[inline(always)]
+pub fn unordered_hash_unique<T: Hash, I: Iterator<Item = T>, H: Hasher>(state: &mut H, iter: I) {
+    iter.fold(0u64, |res, item| {
+        let mut hasher = DefaultHasher::new();
+        item.hash(&mut hasher);
+        // NOTE: xor is used, duplicates will cancel each other out
+        res ^ hasher.finish()
+    })
+    .hash(state);
+}
+
 /// Deserializer helper for `Option<Vec<T>>` that allows deserializing both single and an array of values.
 ///
 /// Use via `#[serde(with = "MaybeOneOrMany")]` and `#[schemars(with="MaybeOneOrMany<T>")]` field attributes
@@ -90,7 +107,7 @@ impl<'de, T: Deserialize<'de>> MaybeOneOrMany<T> {
 }
 
 impl<T: JsonSchema> JsonSchema for MaybeOneOrMany<T> {
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         use schemars::schema::SchemaObject;
 
         #[derive(JsonSchema)]
@@ -101,7 +118,7 @@ impl<T: JsonSchema> JsonSchema for MaybeOneOrMany<T> {
             _None(()),
         }
 
-        let schema: SchemaObject = <OneOrMany<T>>::json_schema(gen).into();
+        let schema: SchemaObject = <OneOrMany<T>>::json_schema(generator).into();
         schema.into()
     }
 
@@ -116,7 +133,7 @@ impl<T: JsonSchema> JsonSchema for MaybeOneOrMany<T> {
 
 #[cfg(test)]
 mod tests {
-    use schemars::{schema_for, JsonSchema};
+    use schemars::{JsonSchema, schema_for};
     use serde::{Deserialize, Serialize};
 
     use crate::common::utils::MaybeOneOrMany;
@@ -184,14 +201,16 @@ mod tests {
             _field: Option<Vec<String>>,
         }
 
-        let mut field_schema = dbg!(schemars::schema_for!(Test)
-            .schema
-            .object
-            .unwrap()
-            .properties
-            .remove("_field")
-            .unwrap()
-            .into_object());
+        let mut field_schema = dbg!(
+            schemars::schema_for!(Test)
+                .schema
+                .object
+                .unwrap()
+                .properties
+                .remove("_field")
+                .unwrap()
+                .into_object(),
+        );
 
         assert!(field_schema.subschemas.is_some());
 

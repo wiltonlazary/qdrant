@@ -1,21 +1,26 @@
 use std::cmp::max;
-use std::fs::create_dir_all;
+use std::io::BufReader;
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
-use io::file_operations::atomic_save_json;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::fs::{atomic_save_json, clear_disk_cache};
+use common::maybe_uninit::maybe_uninit_fill_from;
+use common::mmap::chunked::{chunk_name, create_chunk, read_mmaps};
+use common::mmap::{
+    Advice, AdviceSetting, MmapType, UniversalMmapChunk, create_and_ensure_length, open_write_mmap,
+};
+use fs_err as fs;
+use fs_err::File;
 use memmap2::MmapMut;
-use memory::chunked_utils::{chunk_name, create_chunk, read_mmaps, UniversalMmapChunk};
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_ops::{create_and_ensure_length, open_write_mmap};
-use memory::mmap_type::MmapType;
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
-use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::Flusher;
-use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::vector_storage::common::{CHUNK_SIZE, PAGE_SIZE_BYTES, VECTOR_READ_BATCH_SIZE};
-use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient_vectors;
+use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
+use crate::vector_storage::{AccessPattern, VectorOffset, VectorOffsetType};
 
 const CONFIG_FILE_NAME: &str = "config.json";
 const STATUS_FILE_NAME: &str = "status.dat";
@@ -30,8 +35,6 @@ struct ChunkedMmapConfig {
     chunk_size_bytes: usize,
     chunk_size_vectors: usize,
     dim: usize,
-    #[serde(default)]
-    mlock: Option<bool>,
     #[serde(default)]
     populate: Option<bool>,
 }
@@ -71,7 +74,6 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
     fn ensure_config(
         directory: &Path,
         dim: usize,
-        mlock: Option<bool>,
         populate: Option<bool>,
     ) -> OperationResult<ChunkedMmapConfig> {
         let config_file = Self::config_file(directory);
@@ -87,17 +89,17 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
                     )))
                 }
             }
-            Ok(None) => Self::create_config(&config_file, dim, mlock, populate),
+            Ok(None) => Self::create_config(&config_file, dim, populate),
             Err(e) => {
                 log::error!("Failed to deserialize config file {:?}: {e}", &config_file);
-                Self::create_config(&config_file, dim, mlock, populate)
+                Self::create_config(&config_file, dim, populate)
             }
         }
     }
 
     fn load_config(config_file: &Path) -> OperationResult<Option<ChunkedMmapConfig>> {
         if config_file.exists() {
-            let file = std::fs::File::open(config_file)?;
+            let file = BufReader::new(File::open(config_file)?);
             let config: ChunkedMmapConfig = serde_json::from_reader(file)?;
             Ok(Some(config))
         } else {
@@ -108,7 +110,6 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
     fn create_config(
         config_file: &Path,
         dim: usize,
-        mlock: Option<bool>,
         populate: Option<bool>,
     ) -> OperationResult<ChunkedMmapConfig> {
         let chunk_size_bytes = CHUNK_SIZE;
@@ -120,7 +121,6 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
             chunk_size_bytes: corrected_chunk_size_bytes,
             chunk_size_vectors,
             dim,
-            mlock,
             populate,
         };
         atomic_save_json(config_file, &config)?;
@@ -130,21 +130,15 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
     pub fn open(
         directory: &Path,
         dim: usize,
-        mlock: Option<bool>,
         advice: AdviceSetting,
         populate: Option<bool>,
     ) -> OperationResult<Self> {
-        create_dir_all(directory)?;
+        fs::create_dir_all(directory)?;
         let status_mmap = Self::ensure_status_file(directory)?;
         let status = unsafe { MmapType::from(status_mmap) };
 
-        let config = Self::ensure_config(directory, dim, mlock, populate)?;
-        let chunks = read_mmaps(
-            directory,
-            config.mlock.unwrap_or_default(),
-            populate.unwrap_or_default(),
-            advice,
-        )?;
+        let config = Self::ensure_config(directory, dim, populate)?;
+        let chunks = read_mmaps(directory, populate.unwrap_or_default(), advice)?;
         let vectors = Self {
             status,
             config,
@@ -166,14 +160,17 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         chunk_vector_idx * self.config.dim
     }
 
+    #[inline]
     pub fn max_vector_size_bytes(&self) -> usize {
         self.config.chunk_size_bytes
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.status.len
     }
 
+    #[inline]
     pub fn dim(&self) -> usize {
         self.config.dim
     }
@@ -183,15 +180,19 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
             &self.directory,
             self.chunks.len(),
             self.config.chunk_size_bytes,
-            self.config.mlock.unwrap_or_default(),
         )?;
 
         self.chunks.push(chunk);
         Ok(())
     }
 
-    pub fn insert(&mut self, key: VectorOffsetType, vector: &[T]) -> OperationResult<()> {
-        self.insert_many(key, vector, 1)
+    pub fn insert(
+        &mut self,
+        key: VectorOffsetType,
+        vector: &[T],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.insert_many(key, vector, 1, hw_counter)
     }
 
     #[inline]
@@ -200,6 +201,7 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         start_key: VectorOffsetType,
         vectors: &[T],
         count: usize,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         assert_eq!(
             vectors.len(),
@@ -227,6 +229,10 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
 
         chunk.as_mut_slice()[chunk_offset..chunk_offset + vectors.len()].copy_from_slice(vectors);
 
+        hw_counter
+            .vector_io_write_counter()
+            .incr_delta(size_of_val(vectors));
+
         let new_len = max(self.status.len, start_key + count);
 
         if new_len > self.status.len {
@@ -242,19 +248,19 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         self.config.chunk_size_vectors - chunk_vector_idx
     }
 
-    pub fn push(&mut self, vector: &[T]) -> OperationResult<VectorOffsetType> {
+    pub fn push(
+        &mut self,
+        vector: &[T],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<VectorOffsetType> {
         let new_id = self.status.len;
-        self.insert(new_id, vector)?;
+        self.insert(new_id, vector, hw_counter)?;
         Ok(new_id)
-    }
-
-    fn get(&self, key: VectorOffsetType, force_sequential: bool) -> Option<&[T]> {
-        self.get_many(key, 1, force_sequential)
     }
 
     // returns count flattened vectors starting from key. if chunk boundary is crossed, returns None
     #[inline]
-    fn get_many(
+    fn get_many_impl(
         &self,
         start_key: VectorOffsetType,
         count: usize,
@@ -279,15 +285,25 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         }
     }
 
-    pub fn get_batch<'a>(&'a self, keys: &[VectorOffsetType], vectors: &mut [&'a [T]]) {
-        debug_assert!(keys.len() == vectors.len());
+    pub fn for_each_in_batch<F: FnMut(usize, &[T]), O: VectorOffset>(&self, keys: &[O], mut f: F) {
         debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
-        let do_sequential_read = is_read_with_prefetch_efficient_vectors(keys);
+        let do_sequential_read = is_read_with_prefetch_efficient(keys);
 
-        for (i, key) in keys.iter().enumerate() {
-            vectors[i] = self
-                .get(*key, do_sequential_read)
-                .unwrap_or_else(|| panic!("Vector {key} not found"));
+        // The `f` is most likely a scorer function.
+        // Fetching all vectors first then scoring them is more cache friendly
+        // then fetching and scoring in a single loop.
+        let mut vectors_buffer = [MaybeUninit::uninit(); VECTOR_READ_BATCH_SIZE];
+        let vectors = maybe_uninit_fill_from(
+            &mut vectors_buffer,
+            keys.iter().map(|&key| {
+                self.get_many_impl(key.offset(), 1, do_sequential_read)
+                    .unwrap_or_else(|| panic!("Vector {key} not found"))
+            }),
+        )
+        .0;
+
+        for (i, vec) in vectors.iter().enumerate() {
+            f(i, vec);
         }
     }
 
@@ -314,76 +330,38 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
         }
         files
     }
-}
 
-impl<T: Sized + Copy + 'static> ChunkedVectorStorage<T> for ChunkedMmapVectors<T> {
-    #[inline]
-    fn len(&self) -> usize {
-        ChunkedMmapVectors::len(self)
+    pub fn immutable_files(&self) -> Vec<PathBuf> {
+        vec![Self::config_file(&self.directory)] // TODO: Is config immutable?
     }
 
     #[inline]
-    fn dim(&self) -> usize {
-        ChunkedMmapVectors::dim(self)
+    pub fn get<P: AccessPattern>(&self, key: VectorOffsetType) -> Option<&[T]> {
+        self.get_many_impl(key, 1, P::IS_SEQUENTIAL)
     }
 
     #[inline]
-    fn get(&self, key: VectorOffsetType) -> Option<&[T]> {
-        ChunkedMmapVectors::get(self, key, false)
+    pub fn get_many<P: AccessPattern>(&self, key: VectorOffsetType, count: usize) -> Option<&[T]> {
+        self.get_many_impl(key, count, P::IS_SEQUENTIAL)
     }
 
-    #[inline]
-    fn files(&self) -> Vec<PathBuf> {
-        ChunkedMmapVectors::files(self)
+    pub fn is_on_disk(&self) -> bool {
+        !self.config.populate.unwrap_or(false)
     }
 
-    #[inline]
-    fn flusher(&self) -> Flusher {
-        ChunkedMmapVectors::flusher(self)
+    pub fn populate(&self) -> OperationResult<()> {
+        for chunk in &self.chunks {
+            chunk.populate()?;
+        }
+        Ok(())
     }
 
-    #[inline]
-    fn push(&mut self, vector: &[T]) -> OperationResult<VectorOffsetType> {
-        ChunkedMmapVectors::push(self, vector)
-    }
-
-    #[inline]
-    fn insert(&mut self, key: VectorOffsetType, vector: &[T]) -> OperationResult<()> {
-        ChunkedMmapVectors::insert(self, key, vector)
-    }
-
-    #[inline]
-    fn insert_many(
-        &mut self,
-        start_key: VectorOffsetType,
-        vectors: &[T],
-        count: usize,
-    ) -> OperationResult<()> {
-        ChunkedMmapVectors::insert_many(self, start_key, vectors, count)
-    }
-
-    #[inline]
-    fn get_many(&self, key: VectorOffsetType, count: usize) -> Option<&[T]> {
-        ChunkedMmapVectors::get_many(self, key, count, false)
-    }
-
-    #[inline]
-    fn get_batch<'a>(&'a self, keys: &[VectorOffsetType], vectors: &mut [&'a [T]]) {
-        ChunkedMmapVectors::get_batch(self, keys, vectors)
-    }
-
-    #[inline]
-    fn get_remaining_chunk_keys(&self, start_key: VectorOffsetType) -> usize {
-        ChunkedMmapVectors::get_remaining_chunk_keys(self, start_key)
-    }
-
-    #[inline]
-    fn max_vector_size_bytes(&self) -> usize {
-        ChunkedMmapVectors::max_vector_size_bytes(self)
-    }
-
-    fn is_on_disk(&self) -> bool {
-        true
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        for chunk_idx in 0..self.chunks.len() {
+            let file_path = chunk_name(&self.directory, chunk_idx);
+            clear_disk_cache(&file_path)?;
+        }
+        Ok(())
     }
 }
 
@@ -391,8 +369,8 @@ impl<T: Sized + Copy + 'static> ChunkedVectorStorage<T> for ChunkedMmapVectors<T
 mod tests {
     use std::iter::zip;
 
-    use rand::prelude::StdRng;
     use rand::SeedableRng;
+    use rand::prelude::StdRng;
     use tempfile::Builder;
 
     use super::*;
@@ -406,36 +384,30 @@ mod tests {
         let num_vectors = 1000;
         let mut rng = StdRng::seed_from_u64(42);
 
+        let hw_counter = HardwareCounterCell::new();
+
         let mut vectors: Vec<_> = (0..num_vectors)
             .map(|_| random_vector(&mut rng, dim))
             .collect();
 
         {
-            let mut chunked_mmap: ChunkedMmapVectors<VectorElementType> = ChunkedMmapVectors::open(
-                dir.path(),
-                dim,
-                Some(false),
-                AdviceSetting::Global,
-                Some(true),
-            )
-            .unwrap();
+            let mut chunked_mmap: ChunkedMmapVectors<VectorElementType> =
+                ChunkedMmapVectors::open(dir.path(), dim, AdviceSetting::Global, Some(true))
+                    .unwrap();
 
             for vec in &vectors {
-                chunked_mmap.push(vec).unwrap();
+                chunked_mmap.push(vec, &hw_counter).unwrap();
             }
-
-            let mut vectors_buffer = Vec::with_capacity(VECTOR_READ_BATCH_SIZE);
-
-            vectors_buffer.resize_with(VECTOR_READ_BATCH_SIZE, Default::default);
 
             let random_offset = 666;
             let batch_size = 10;
 
-            assert!(random_offset + batch_size < num_vectors);
-            assert!(batch_size <= VECTOR_READ_BATCH_SIZE);
-
             let batch_ids = (random_offset..random_offset + batch_size).collect::<Vec<_>>();
-            chunked_mmap.get_batch(&batch_ids, &mut vectors_buffer[..batch_size]);
+            let mut vectors_buffer = Vec::with_capacity(batch_size);
+            chunked_mmap.for_each_in_batch(&batch_ids, |i, vec| {
+                assert_eq!(i, vectors_buffer.len());
+                vectors_buffer.push(vec.to_vec());
+            });
 
             for (i, (vec, loaded_vec)) in zip(
                 &vectors[random_offset..random_offset + batch_size],
@@ -454,10 +426,14 @@ mod tests {
             vectors[44] = random_vector(&mut rng, dim);
             vectors[999] = random_vector(&mut rng, dim);
 
-            chunked_mmap.insert(0, &vectors[0]).unwrap();
-            chunked_mmap.insert(150, &vectors[150]).unwrap();
-            chunked_mmap.insert(44, &vectors[44]).unwrap();
-            chunked_mmap.insert(999, &vectors[999]).unwrap();
+            chunked_mmap.insert(0, &vectors[0], &hw_counter).unwrap();
+            chunked_mmap
+                .insert(150, &vectors[150], &hw_counter)
+                .unwrap();
+            chunked_mmap.insert(44, &vectors[44], &hw_counter).unwrap();
+            chunked_mmap
+                .insert(999, &vectors[999], &hw_counter)
+                .unwrap();
 
             assert!(
                 chunked_mmap.chunks.len() > 1,

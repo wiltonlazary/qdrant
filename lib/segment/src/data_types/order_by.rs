@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 use num_cmp::NumCmp;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
@@ -6,12 +8,10 @@ use validator::Validate;
 
 use crate::json_path::JsonPath;
 use crate::types::{
-    DateTimePayloadType, FloatPayloadType, IntPayloadType, Order, Payload, Range, RangeInterface,
+    DateTimePayloadType, FloatPayloadType, IntPayloadType, Order, Range, RangeInterface,
 };
 
-const INTERNAL_KEY_OF_ORDER_BY_VALUE: &str = "____ordered_with____";
-
-#[derive(Deserialize, Serialize, JsonSchema, Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Deserialize, Serialize, JsonSchema, Copy, Clone, Debug, Default, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     #[default]
@@ -47,7 +47,7 @@ impl From<Direction> for Order {
     }
 }
 
-#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum StartFrom {
     Integer(IntPayloadType),
@@ -57,7 +57,17 @@ pub enum StartFrom {
     Datetime(DateTimePayloadType),
 }
 
-#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq)]
+impl Hash for StartFrom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            StartFrom::Integer(i) => i.hash(state),
+            StartFrom::Float(f) => OrderedFloat(*f).hash(state),
+            StartFrom::Datetime(dt) => dt.hash(state),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct OrderBy {
     /// Payload key to order by
@@ -79,9 +89,11 @@ impl OrderBy {
                 // TODO: When we introduce integer ranges, we'll stop doing lossy conversion to f64 here
                 // Accepting an integer as start_from simplifies the client generation.
                 StartFrom::Integer(i) => {
-                    RangeInterface::Float(self.direction().as_range_from(*i as f64))
+                    RangeInterface::Float(self.direction().as_range_from(OrderedFloat(*i as f64)))
                 }
-                StartFrom::Float(f) => RangeInterface::Float(self.direction().as_range_from(*f)),
+                StartFrom::Float(f) => {
+                    RangeInterface::Float(self.direction().as_range_from(OrderedFloat(*f)))
+                }
                 StartFrom::Datetime(dt) => {
                     RangeInterface::DateTime(self.direction().as_range_from(*dt))
                 }
@@ -105,38 +117,6 @@ impl OrderBy {
                 Direction::Asc => OrderValue::MIN,
                 Direction::Desc => OrderValue::MAX,
             })
-    }
-
-    pub fn insert_order_value_in_payload(
-        payload: Option<Payload>,
-        value: impl Into<serde_json::Value>,
-    ) -> Payload {
-        let mut new_payload = payload.unwrap_or_default();
-        new_payload
-            .0
-            .insert(INTERNAL_KEY_OF_ORDER_BY_VALUE.to_string(), value.into());
-        new_payload
-    }
-
-    fn json_value_to_ordering_value(&self, value: Option<serde_json::Value>) -> OrderValue {
-        value
-            .and_then(|v| OrderValue::try_from(v).ok())
-            .unwrap_or_else(|| match self.direction() {
-                Direction::Asc => OrderValue::MAX,
-                Direction::Desc => OrderValue::MIN,
-            })
-    }
-
-    pub fn get_order_value_from_payload(&self, payload: Option<&Payload>) -> OrderValue {
-        self.json_value_to_ordering_value(
-            payload.and_then(|payload| payload.0.get(INTERNAL_KEY_OF_ORDER_BY_VALUE).cloned()),
-        )
-    }
-
-    pub fn remove_order_value_from_payload(&self, payload: Option<&mut Payload>) -> OrderValue {
-        self.json_value_to_ordering_value(
-            payload.and_then(|payload| payload.0.remove(INTERNAL_KEY_OF_ORDER_BY_VALUE)),
-        )
     }
 }
 

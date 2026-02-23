@@ -1,3 +1,4 @@
+use std::cmp;
 use std::fmt::Write as _;
 use std::ops::Deref as _;
 
@@ -11,7 +12,6 @@ use crate::operations::consistency_params::{ReadConsistency, ReadConsistencyType
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::resolve::{Resolve, ResolveCondition};
-use crate::shards::shard::Shard;
 use crate::shards::shard_trait::ShardOperation;
 
 impl ShardReplicaSet {
@@ -56,7 +56,8 @@ impl ShardReplicaSet {
         let read_consistency = read_consistency.unwrap_or_default();
 
         let local_count = usize::from(self.peer_state(self.this_peer_id()).is_some());
-        let active_local_count = usize::from(self.peer_is_active(self.this_peer_id()));
+        let active_local_count = usize::from(self.peer_is_readable(self.this_peer_id()));
+        let initializing_local_count = usize::from(self.peer_is_initializing(self.this_peer_id()));
 
         let remotes = self.remotes.read().await;
 
@@ -65,13 +66,18 @@ impl ShardReplicaSet {
         // TODO(resharding): Handle resharded shard?
         let active_remotes_count = remotes
             .iter()
-            .filter(|remote| self.peer_is_active(remote.peer_id))
+            .filter(|remote| self.peer_is_readable(remote.peer_id))
+            .count();
+        let initializing_remotes_count = remotes
+            .iter()
+            .filter(|remote| self.peer_is_initializing(remote.peer_id))
             .count();
 
         let total_count = local_count + remotes_count;
         let active_count = active_local_count + active_remotes_count;
+        let initializing_count = initializing_local_count + initializing_remotes_count;
 
-        let (required_successful_results, condition) = match read_consistency {
+        let (mut required_successful_results, condition) = match read_consistency {
             ReadConsistency::Type(ReadConsistencyType::All) => (total_count, ResolveCondition::All),
 
             ReadConsistency::Type(ReadConsistencyType::Majority) => {
@@ -87,12 +93,19 @@ impl ShardReplicaSet {
             }
         };
 
-        if active_count < required_successful_results {
+        if active_count + initializing_count < required_successful_results {
             return Err(CollectionError::service_error(format!(
                 "The replica set for shard {} on peer {} does not have enough active replicas",
                 self.shard_id,
                 self.this_peer_id(),
             )));
+        }
+
+        if active_count < required_successful_results {
+            required_successful_results = cmp::max(
+                required_successful_results.saturating_sub(initializing_count),
+                active_count,
+            );
         }
 
         let mut responses = self
@@ -103,7 +116,9 @@ impl ShardReplicaSet {
             )
             .await?;
 
-        if responses.len() == 1 {
+        if responses.is_empty() {
+            Ok(Res::default())
+        } else if responses.len() == 1 {
             Ok(responses.pop().unwrap())
         } else {
             Ok(Res::resolve(responses, condition))
@@ -114,6 +129,9 @@ impl ShardReplicaSet {
     where
         F: Fn(&(dyn ShardOperation + Send + Sync)) -> BoxFuture<'_, CollectionResult<Res>>,
     {
+        let _partial_snapshot_search_lock =
+            self.partial_snapshot_meta.try_take_search_read_lock()?;
+
         let local = self.local.read().await;
 
         let Some(local) = local.deref() else {
@@ -140,35 +158,33 @@ impl ShardReplicaSet {
             None => self.remotes.read().await,
         };
 
-        let (local, is_local_ready, update_watcher) = match self.local.try_read() {
-            Ok(local) => {
-                let update_watcher = local.deref().as_ref().map(Shard::watch_for_update);
+        // We don't need to explicitly check partial snapshot recovery lock, because
+        // - partial snapshot recovery *write-locks* `local` shard when applying partial snapshot
+        // - this method *tries* to read-lock `local` shard, and if it's unavailable, fan-out
+        //   request to other replicas
 
-                let is_local_ready = local
-                    .deref()
-                    .as_ref()
-                    .is_some_and(|local| !local.is_update_in_progress());
+        let local_read = self.local.try_read().ok();
+        let local_read = local_read.as_ref().and_then(|local| local.as_ref());
 
-                (
-                    future::ready(local).left_future(),
-                    is_local_ready,
-                    update_watcher,
-                )
+        let (local, is_local_ready, update_watcher) = match local_read {
+            Some(local) => {
+                let update_watcher = local.watch_for_update();
+                let is_local_ready = !local.is_update_in_progress();
+
+                (Some(local), is_local_ready, Some(update_watcher))
             }
 
-            Err(_) => (self.local.read().right_future(), false, None),
+            None => (None, false, None),
         };
 
-        let local_is_active = self.peer_is_active(self.this_peer_id());
+        let local_is_readable = self.peer_is_readable(self.this_peer_id());
 
-        let local_operation = if local_is_active {
+        let local_operation = if local_is_readable {
             let local_operation = async {
-                let local = local.await;
-
-                let Some(local) = local.deref() else {
+                let Some(local) = local else {
                     return Err(CollectionError::service_error(format!(
                         "Local shard {} not found",
-                        self.shard_id
+                        self.shard_id,
                     )));
                 };
 
@@ -181,14 +197,14 @@ impl ShardReplicaSet {
         };
 
         // TODO(resharding): Handle resharded shard?
-        let mut active_remotes: Vec<_> = remotes
+        let mut readable_remotes: Vec<_> = remotes
             .iter()
-            .filter(|remote| self.peer_is_active(remote.peer_id))
+            .filter(|remote| self.peer_is_readable(remote.peer_id))
             .collect();
 
-        active_remotes.shuffle(&mut rand::rng());
+        readable_remotes.shuffle(&mut rand::rng());
 
-        let remote_operations = active_remotes.into_iter().map(|remote| {
+        let remote_operations = readable_remotes.into_iter().map(|remote| {
             read_operation(remote)
                 .map(|result| (result, false))
                 .right_future()
@@ -202,21 +218,27 @@ impl ShardReplicaSet {
         // - Local is not available: default fan-out is 1
         // - There is no local: default fan-out is 1
 
-        let default_fan_out = if is_local_ready && local_is_active {
+        let default_fan_out = if is_local_ready && local_is_readable {
             0
         } else {
             1
         };
 
-        let read_fan_out_factor: usize = self
-            .collection_config
-            .read()
-            .await
-            .params
-            .read_fan_out_factor
-            .unwrap_or(default_fan_out)
-            .try_into()
-            .expect("u32 can be converted into usize");
+        let (read_fan_out_factor, fan_out_delay) = {
+            let guard = self.collection_config.read().await;
+            let params = &guard.params;
+
+            let read_fan_out_factor =
+                params.read_fan_out_factor.unwrap_or(default_fan_out) as usize;
+            let read_fan_out_delay = params.read_fan_out_delay_ms.and_then(|delay| {
+                if delay == 0 {
+                    None
+                } else {
+                    Some(tokio::time::Duration::from_millis(delay))
+                }
+            });
+            (read_fan_out_factor, read_fan_out_delay)
+        };
 
         let initial_concurrent_operations = required_successful_results + read_fan_out_factor;
 
@@ -241,6 +263,19 @@ impl ShardReplicaSet {
 
         tokio::pin!(update_watcher);
 
+        let fan_out_delay_sleep = async move {
+            match fan_out_delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => future::pending().await,
+            }
+        };
+
+        let fan_out_delay_sleep = fan_out_delay_sleep.fuse();
+
+        tokio::pin!(fan_out_delay_sleep);
+
+        let mut is_fan_out_delay_resolved = false;
+
         loop {
             let result;
 
@@ -259,7 +294,13 @@ impl ShardReplicaSet {
                     }
                 }
 
-                _ = &mut update_watcher, if local_is_active && !is_local_operation_resolved => {
+                _ = &mut update_watcher, if local_is_readable && !is_local_operation_resolved => {
+                    pending_operations.extend(operations.next());
+                    continue;
+                }
+
+                _ = &mut fan_out_delay_sleep, if !is_fan_out_delay_resolved => {
+                    is_fan_out_delay_resolved = true;
                     pending_operations.extend(operations.next());
                     continue;
                 }

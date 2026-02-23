@@ -7,7 +7,7 @@ use crate::config::ShardingMethod;
 use crate::hash_ring::HashRingRouter;
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::types::CollectionResult;
-use crate::shards::replica_set::ReplicaState;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::resharding::{ReshardKey, ReshardState};
 use crate::shards::transfer::ShardTransferConsensus;
 
@@ -22,6 +22,10 @@ impl Collection {
     }
 
     /// Start a new resharding operation
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancel safe.
     pub async fn start_resharding<T, F>(
         &self,
         resharding_key: ReshardKey,
@@ -54,7 +58,9 @@ impl Collection {
                 None
             };
 
-            shard_holder.start_resharding_unchecked(resharding_key.clone(), replica_set)?;
+            shard_holder
+                .start_resharding_unchecked(resharding_key.clone(), replica_set)
+                .await?;
 
             if resharding_key.direction == ReshardingDirection::Up {
                 let mut config = self.collection_config.write().await;
@@ -177,7 +183,11 @@ impl Collection {
         resharding_key: ReshardKey,
         force: bool,
     ) -> CollectionResult<()> {
-        let mut shard_holder = self.shards_holder.write().await;
+        log::warn!(
+            "Invalidating local cleanup tasks and aborting resharding {resharding_key} (force: {force})"
+        );
+
+        let shard_holder = self.shards_holder.read().await;
 
         if !force {
             shard_holder.check_abort_resharding(&resharding_key)?;
@@ -209,6 +219,16 @@ impl Collection {
                 }
             },
         }
+
+        // Abort all resharding transfer related to this specific resharding operation
+        let resharding_transfers =
+            shard_holder.get_transfers(|t| t.is_related_to_resharding(&resharding_key));
+        for transfer in resharding_transfers {
+            self.abort_shard_transfer(transfer, &shard_holder).await?;
+        }
+
+        drop(shard_holder); // drop the read lock before acquiring write lock
+        let mut shard_holder = self.shards_holder.write().await;
 
         shard_holder
             .abort_resharding(resharding_key.clone(), force)

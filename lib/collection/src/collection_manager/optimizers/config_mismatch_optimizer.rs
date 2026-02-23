@@ -1,16 +1,16 @@
-use std::borrow::Cow;
-use std::collections::HashSet;
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use itertools::Itertools;
 use parking_lot::Mutex;
 use segment::common::operation_time_statistics::OperationDurationsAggregator;
+use segment::entry::NonAppendableSegmentEntry;
 use segment::index::sparse_index::sparse_index_config::SparseIndexType;
-use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentType, VectorName};
+use segment::types::{HnswConfig, HnswGlobalConfig, Indexes, QuantizationConfig, VectorName};
 
-use crate::collection_manager::holders::segment_holder::{LockedSegmentHolder, SegmentId};
 use crate::collection_manager::optimizers::segment_optimizer::{
-    OptimizerThresholds, SegmentOptimizer,
+    OptimizationPlanner, OptimizerThresholds, SegmentOptimizer,
 };
 use crate::config::CollectionParams;
 use crate::operations::config_diff::DiffConfig;
@@ -26,6 +26,7 @@ pub struct ConfigMismatchOptimizer {
     collection_temp_dir: PathBuf,
     collection_params: CollectionParams,
     hnsw_config: HnswConfig,
+    hnsw_global_config: HnswGlobalConfig,
     quantization_config: Option<QuantizationConfig>,
     telemetry_durations_aggregator: Arc<Mutex<OperationDurationsAggregator>>,
 }
@@ -37,6 +38,7 @@ impl ConfigMismatchOptimizer {
         collection_temp_dir: PathBuf,
         collection_params: CollectionParams,
         hnsw_config: HnswConfig,
+        hnsw_global_config: HnswGlobalConfig,
         quantization_config: Option<QuantizationConfig>,
     ) -> Self {
         ConfigMismatchOptimizer {
@@ -45,6 +47,7 @@ impl ConfigMismatchOptimizer {
             collection_temp_dir,
             collection_params,
             hnsw_config,
+            hnsw_global_config,
             quantization_config,
             telemetry_durations_aggregator: OperationDurationsAggregator::new(),
         }
@@ -68,151 +71,108 @@ impl ConfigMismatchOptimizer {
             .and_then(|index| index.on_disk)
     }
 
-    /// Calculates and HNSW config that should be used for a given vector
-    /// with current configuration.
-    ///
-    /// Takes vector-specific HNSW config (if any) and merges it with the collection-wide config.
-    fn get_required_hnsw_config(&self, vector_name: &VectorName) -> Cow<HnswConfig> {
-        let target_hnsw_collection = &self.hnsw_config;
-        // Select vector specific target HNSW config
-        let target_hnsw_vector = self
-            .collection_params
-            .vectors
-            .get_params(vector_name)
-            .and_then(|vector_params| vector_params.hnsw_config)
-            .map(|vector_hnsw| vector_hnsw.update(target_hnsw_collection))
-            .and_then(|hnsw| match hnsw {
-                Ok(hnsw) => Some(hnsw),
-                Err(err) => {
-                    log::warn!(
-                        "Failed to merge collection and vector HNSW config, ignoring: {err}"
-                    );
-                    None
-                }
-            });
-        match target_hnsw_vector {
-            Some(target_hnsw) => Cow::Owned(target_hnsw),
-            None => Cow::Borrowed(target_hnsw_collection),
+    fn has_config_mismatch(&self, segment: &dyn NonAppendableSegmentEntry) -> bool {
+        let segment_config = segment.config();
+
+        if self.collection_params.on_disk_payload
+            != segment_config.payload_storage_type.is_on_disk()
+        {
+            return true; // Optimize segment due to payload storage mismatch
         }
-    }
 
-    fn worst_segment(
-        &self,
-        segments: LockedSegmentHolder,
-        excluded_ids: &HashSet<SegmentId>,
-    ) -> Vec<SegmentId> {
-        let segments_read_guard = segments.read();
-        let candidates: Vec<_> = segments_read_guard
-            .iter()
-            // Excluded externally, might already be scheduled for optimization
-            .filter(|(idx, _)| !excluded_ids.contains(idx))
-            .filter_map(|(idx, segment)| {
-                let segment_entry = segment.get();
-                let read_segment = segment_entry.read();
-                let vector_size = read_segment
-                    .max_available_vectors_size_in_bytes()
-                    .unwrap_or_default();
-
-                let segment_config = read_segment.config();
-
-                if read_segment.segment_type() == SegmentType::Special {
-                    return None; // Never optimize already optimized segment
-                }
-
-                if self.collection_params.on_disk_payload
-                    != segment_config.payload_storage_type.is_on_disk()
-                {
-                    return Some((*idx, vector_size)); // Skip segments with payload mismatch
-                }
-
-                // Determine whether dense data in segment has mismatch
-                let dense_has_mismatch =
-                    segment_config
-                        .vector_data
-                        .iter()
-                        .any(|(vector_name, vector_data)| {
-                            // Check HNSW mismatch
-                            match &vector_data.index {
-                                Indexes::Plain {} => {}
-                                Indexes::Hnsw(effective_hnsw) => {
-                                    // Select segment if we have an HNSW mismatch that requires rebuild
-                                    let target_hnsw = self.get_required_hnsw_config(vector_name);
-                                    if effective_hnsw.mismatch_requires_rebuild(&target_hnsw) {
-                                        return true;
-                                    }
-                                }
+        // Determine whether dense data in segment has mismatch
+        let dense_has_mismatch =
+            segment_config
+                .vector_data
+                .iter()
+                .any(|(vector_name, vector_data)| {
+                    // Check HNSW mismatch
+                    match &vector_data.index {
+                        Indexes::Plain {} => {}
+                        Indexes::Hnsw(effective_hnsw) => {
+                            // Select segment if we have an HNSW mismatch that requires rebuild
+                            let target_hnsw = self.hnsw_config.update_opt(
+                                self.collection_params
+                                    .vectors
+                                    .get_params(vector_name)
+                                    .and_then(|vector_params| vector_params.hnsw_config.as_ref()),
+                            );
+                            if effective_hnsw.mismatch_requires_rebuild(&target_hnsw) {
+                                return true;
                             }
+                        }
+                    }
 
-                            if let Some(is_required_on_disk) =
-                                self.check_if_vectors_on_disk(vector_name)
-                            {
-                                if is_required_on_disk != vector_data.storage_type.is_on_disk() {
-                                    return true;
-                                }
-                            }
+                    if let Some(is_required_on_disk) = self.check_if_vectors_on_disk(vector_name)
+                        && is_required_on_disk != vector_data.storage_type.is_on_disk()
+                    {
+                        return true;
+                    }
 
-                            // Check quantization mismatch
-                            let target_quantization_collection = self.quantization_config.as_ref();
-                            let target_quantization_vector = self
-                                .collection_params
-                                .vectors
-                                .get_params(vector_name)
-                                .and_then(|vector_params| {
-                                    vector_params.quantization_config.clone()
-                                });
-                            let target_quantization = target_quantization_vector
-                                .as_ref()
-                                .or(target_quantization_collection);
-                            let quantization_mismatch = vector_data
+                    // Check quantization mismatch
+                    let target_quantization_collection = self.quantization_config.as_ref();
+                    let target_quantization_vector = self
+                        .collection_params
+                        .vectors
+                        .get_params(vector_name)
+                        .and_then(|vector_params| vector_params.quantization_config.clone());
+                    let target_quantization = target_quantization_vector
+                        .as_ref()
+                        .or(target_quantization_collection);
+
+                    vector_data
+                        .quantization_config
+                        .as_ref()
+                        .zip(target_quantization)
+                        // Rebuild if current parameters differ from target parameters
+                        .map(|(current, target)| current.mismatch_requires_rebuild(target))
+                        // Or rebuild if we now change the enabled state on an indexed segment
+                        .unwrap_or_else(|| {
+                            let vector_data_quantization_appendable = vector_data
                                 .quantization_config
                                 .as_ref()
-                                .zip(target_quantization)
-                                // Rebuild if current parameters differ from target parameters
-                                .map(|(current, target)| current.mismatch_requires_rebuild(target))
-                                // Or rebuild if we now change the enabled state on an indexed segment
-                                .unwrap_or_else(|| {
-                                    vector_data.index.is_indexed()
-                                        && (vector_data.quantization_config.is_some()
-                                            != target_quantization.is_some())
-                                });
+                                .map(|q| q.supports_appendable())
+                                .unwrap_or(false);
+                            let target_quantization_appendable = target_quantization
+                                .map(|q| q.supports_appendable())
+                                .unwrap_or(false);
+                            // If segment is unindexed, only appendable quantization is applied.
+                            // So that we check if any config is appendable to avoid infinity loop here.
+                            let unindexed_changed = common::flags::feature_flags()
+                                .appendable_quantization
+                                && (vector_data_quantization_appendable
+                                    || target_quantization_appendable);
+                            (vector_data.quantization_config.is_some()
+                                != target_quantization.is_some())
+                                && (vector_data.index.is_indexed() || unindexed_changed)
+                        })
+                });
 
-                            quantization_mismatch
-                        });
+        // Determine whether sparse data in segment has mismatch
+        let sparse_has_mismatch =
+            segment_config
+                .sparse_vector_data
+                .iter()
+                .any(|(vector_name, vector_data)| {
+                    let Some(is_required_on_disk) =
+                        self.check_if_sparse_vectors_index_on_disk(vector_name)
+                    else {
+                        return false; // Do nothing if not specified
+                    };
 
-                // Determine whether dense data in segment has mismatch
-                let sparse_has_mismatch =
-                    segment_config
-                        .sparse_vector_data
-                        .iter()
-                        .any(|(vector_name, vector_data)| {
-                            let Some(is_required_on_disk) =
-                                self.check_if_sparse_vectors_index_on_disk(vector_name)
-                            else {
-                                return false; // Do nothing if not specified
-                            };
+                    match vector_data.index.index_type {
+                        SparseIndexType::MutableRam => false, // Do nothing for mutable RAM
+                        SparseIndexType::ImmutableRam => is_required_on_disk, // Rebuild if we require on disk
+                        SparseIndexType::Mmap => !is_required_on_disk, // Rebuild if we require in RAM
+                    }
+                });
 
-                            match vector_data.index.index_type {
-                                SparseIndexType::MutableRam => false, // Do nothing for mutable RAM
-                                SparseIndexType::ImmutableRam => is_required_on_disk, // Rebuild if we require on disk
-                                SparseIndexType::Mmap => !is_required_on_disk, // Rebuild if we require in RAM
-                            }
-                        });
-                (sparse_has_mismatch || dense_has_mismatch).then_some((*idx, vector_size))
-            })
-            .collect();
-
-        // Select segment with largest vector size
-        candidates
-            .into_iter()
-            .max_by_key(|(_, vector_size)| *vector_size)
-            .map(|(segment_id, _)| segment_id)
-            .into_iter()
-            .collect()
+        sparse_has_mismatch || dense_has_mismatch
     }
 }
 
 impl SegmentOptimizer for ConfigMismatchOptimizer {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "config mismatch"
     }
 
@@ -232,6 +192,10 @@ impl SegmentOptimizer for ConfigMismatchOptimizer {
         &self.hnsw_config
     }
 
+    fn hnsw_global_config(&self) -> &HnswGlobalConfig {
+        &self.hnsw_global_config
+    }
+
     fn quantization_config(&self) -> Option<QuantizationConfig> {
         self.quantization_config.clone()
     }
@@ -240,12 +204,25 @@ impl SegmentOptimizer for ConfigMismatchOptimizer {
         &self.thresholds_config
     }
 
-    fn check_condition(
-        &self,
-        segments: LockedSegmentHolder,
-        excluded_ids: &HashSet<SegmentId>,
-    ) -> Vec<SegmentId> {
-        self.worst_segment(segments, excluded_ids)
+    fn plan_optimizations(&self, planner: &mut OptimizationPlanner) {
+        let to_optimize = planner
+            .remaining()
+            .iter()
+            .filter_map(|(&segment_id, segment)| {
+                let segment = segment.read();
+                self.has_config_mismatch(&*segment).then(|| {
+                    let vector_size = segment
+                        .max_available_vectors_size_in_bytes()
+                        .unwrap_or_default();
+                    (segment_id, vector_size)
+                })
+            })
+            // Segments with largest vector size come first
+            .sorted_by_key(|(_segment_id, vector_size)| Reverse(*vector_size))
+            .collect_vec();
+        for (segment_id, _) in to_optimize {
+            planner.plan(vec![segment_id]);
+        }
     }
 
     fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator> {
@@ -256,22 +233,18 @@ impl SegmentOptimizer for ConfigMismatchOptimizer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
-    use common::cpu::CpuPermit;
-    use parking_lot::RwLock;
     use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
-    use segment::entry::entry_point::SegmentEntry;
-    use segment::index::hnsw_index::num_rayon_threads;
     use segment::types::{
         CompressionRatio, Distance, ProductQuantization, ProductQuantizationConfig,
         ScalarQuantizationConfig, ScalarType,
     };
+    use shard::segment_holder::locked::LockedSegmentHolder;
     use tempfile::Builder;
 
     use super::*;
     use crate::collection_manager::fixtures::{random_multi_vec_segment, random_segment};
-    use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder};
+    use crate::collection_manager::holders::segment_holder::SegmentHolder;
     use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
     use crate::operations::config_diff::HnswConfigDiff;
     use crate::operations::types::VectorsConfig;
@@ -318,7 +291,7 @@ mod tests {
         let segment = random_segment(dir.path(), 100, point_count, dim as usize);
 
         let segment_id = holder.add_new(segment);
-        let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
+        let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config = HnswConfig {
             m: 16,
@@ -327,6 +300,7 @@ mod tests {
             max_indexing_threads: 0,
             on_disk: None,
             payload_m: None,
+            inline_storage: None,
         };
 
         // Optimizers used in test
@@ -336,7 +310,8 @@ mod tests {
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
-            hnsw_config.clone(),
+            hnsw_config,
+            HnswGlobalConfig::default(),
             Default::default(),
         );
         let mut config_mismatch_optimizer = ConfigMismatchOptimizer::new(
@@ -344,22 +319,13 @@ mod tests {
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params,
-            hnsw_config.clone(),
+            hnsw_config,
+            HnswGlobalConfig::default(),
             Default::default(),
         );
 
-        let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
-
         // Use indexing optimizer to build index for HNSW mismatch test
-        let changed = index_optimizer
-            .optimize(
-                locked_holder.clone(),
-                vec![segment_id],
-                permit,
-                &false.into(),
-            )
-            .unwrap();
+        let changed = index_optimizer.optimize_for_test(locked_holder.clone(), vec![segment_id]);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
@@ -369,43 +335,34 @@ mod tests {
 
         // Mismatch optimizer should not optimize yet, HNSW config is not changed yet
         let suggested_to_optimize =
-            config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
+            config_mismatch_optimizer.plan_optimizations_for_test(&locked_holder);
         assert_eq!(suggested_to_optimize.len(), 0);
 
         // Create changed HNSW config with other m/ef_construct value, update it in the optimizer
         let mut changed_hnsw_config = hnsw_config;
         changed_hnsw_config.m /= 2;
         changed_hnsw_config.ef_construct /= 5;
-        config_mismatch_optimizer.hnsw_config = changed_hnsw_config.clone();
+        config_mismatch_optimizer.hnsw_config = changed_hnsw_config;
 
         // Run mismatch optimizer again, make sure it optimizes now
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
         let suggested_to_optimize =
-            config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
+            config_mismatch_optimizer.plan_optimizations_for_test(&locked_holder);
+        let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
         assert_eq!(suggested_to_optimize.len(), 1);
         let changed = config_mismatch_optimizer
-            .optimize(
-                locked_holder.clone(),
-                suggested_to_optimize,
-                permit,
-                &false.into(),
-            )
-            .unwrap();
+            .optimize_for_test(locked_holder.clone(), suggested_to_optimize);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure new segment has changed HNSW config
         locked_holder
             .read()
-            .iter()
-            .map(|(_, segment)| match segment {
-                LockedSegment::Original(s) => s.read(),
-                LockedSegment::Proxy(_) => unreachable!(),
-            })
+            .iter_original()
+            .map(|(_, segment)| segment.read())
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert_eq!(
                     segment.config().vector_data[DEFAULT_VECTOR_NAME].index,
-                    Indexes::Hnsw(changed_hnsw_config.clone()),
+                    Indexes::Hnsw(changed_hnsw_config),
                     "segment must be optimized with changed HNSW config",
                 );
             });
@@ -473,7 +430,7 @@ mod tests {
         );
 
         let segment_id = holder.add_new(segment);
-        let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
+        let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config_collection = HnswConfig {
             m: 16,
@@ -482,10 +439,8 @@ mod tests {
             max_indexing_threads: 0,
             on_disk: None,
             payload_m: None,
+            inline_storage: None,
         };
-
-        let permit_cpu_count = num_rayon_threads(hnsw_config_collection.max_indexing_threads);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
 
         // Optimizers used in test
         let index_optimizer = IndexingOptimizer::new(
@@ -494,7 +449,8 @@ mod tests {
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
-            hnsw_config_collection.clone(),
+            hnsw_config_collection,
+            HnswGlobalConfig::default(),
             Default::default(),
         );
         let mut config_mismatch_optimizer = ConfigMismatchOptimizer::new(
@@ -502,19 +458,13 @@ mod tests {
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params,
-            hnsw_config_collection.clone(),
+            hnsw_config_collection,
+            HnswGlobalConfig::default(),
             Default::default(),
         );
 
         // Use indexing optimizer to build index for HNSW mismatch test
-        let changed = index_optimizer
-            .optimize(
-                locked_holder.clone(),
-                vec![segment_id],
-                permit,
-                &false.into(),
-            )
-            .unwrap();
+        let changed = index_optimizer.optimize_for_test(locked_holder.clone(), vec![segment_id]);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
@@ -524,7 +474,7 @@ mod tests {
 
         // Mismatch optimizer should not optimize yet, HNSW config is not changed yet
         let suggested_to_optimize =
-            config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
+            config_mismatch_optimizer.plan_optimizations_for_test(&locked_holder);
         assert_eq!(suggested_to_optimize.len(), 0);
 
         // Create changed HNSW config for vector2, update it in the optimizer
@@ -542,38 +492,29 @@ mod tests {
         }
 
         // Run mismatch optimizer again, make sure it optimizes now
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
         let suggested_to_optimize =
-            config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
+            config_mismatch_optimizer.plan_optimizations_for_test(&locked_holder);
+        let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
         assert_eq!(suggested_to_optimize.len(), 1);
         let changed = config_mismatch_optimizer
-            .optimize(
-                locked_holder.clone(),
-                suggested_to_optimize,
-                permit,
-                &false.into(),
-            )
-            .unwrap();
+            .optimize_for_test(locked_holder.clone(), suggested_to_optimize);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure new segment has changed HNSW config
         locked_holder
             .read()
-            .iter()
-            .map(|(_, segment)| match segment {
-                LockedSegment::Original(s) => s.read(),
-                LockedSegment::Proxy(_) => unreachable!(),
-            })
+            .iter_original()
+            .map(|(_, segment)| segment.read())
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert_eq!(
                     segment.config().vector_data[VECTOR1_NAME].index,
-                    Indexes::Hnsw(hnsw_config_vector1.update(&hnsw_config_collection).unwrap()),
+                    Indexes::Hnsw(hnsw_config_collection.update(&hnsw_config_vector1)),
                     "HNSW config of vector1 is not what we expect",
                 );
                 assert_eq!(
                     segment.config().vector_data[VECTOR2_NAME].index,
-                    Indexes::Hnsw(hnsw_config_vector2.update(&hnsw_config_collection).unwrap()),
+                    Indexes::Hnsw(hnsw_config_collection.update(&hnsw_config_vector2)),
                     "HNSW config of vector2 is not what we expect",
                 );
             });
@@ -643,7 +584,7 @@ mod tests {
         );
 
         let segment_id = holder.add_new(segment);
-        let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
+        let locked_holder = LockedSegmentHolder::new(holder);
 
         let quantization_config_collection =
             QuantizationConfig::Scalar(segment::types::ScalarQuantization {
@@ -662,6 +603,7 @@ mod tests {
             temp_dir.path().to_owned(),
             collection_params.clone(),
             Default::default(),
+            HnswGlobalConfig::default(),
             Some(quantization_config_collection.clone()),
         );
         let mut config_mismatch_optimizer = ConfigMismatchOptimizer::new(
@@ -670,21 +612,12 @@ mod tests {
             temp_dir.path().to_owned(),
             collection_params,
             Default::default(),
+            HnswGlobalConfig::default(),
             Some(quantization_config_collection),
         );
 
-        let permit_cpu_count = num_rayon_threads(0);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
-
         // Use indexing optimizer to build index for quantization mismatch test
-        let changed = index_optimizer
-            .optimize(
-                locked_holder.clone(),
-                vec![segment_id],
-                permit,
-                &false.into(),
-            )
-            .unwrap();
+        let changed = index_optimizer.optimize_for_test(locked_holder.clone(), vec![segment_id]);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
@@ -694,7 +627,7 @@ mod tests {
 
         // Mismatch optimizer should not optimize yet, quantization config is not changed yet
         let suggested_to_optimize =
-            config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
+            config_mismatch_optimizer.plan_optimizations_for_test(&locked_holder);
         assert_eq!(suggested_to_optimize.len(), 0);
 
         // Create changed quantization config for vector2, update it in the optimizer
@@ -715,28 +648,19 @@ mod tests {
         }
 
         // Run mismatch optimizer again, make sure it optimizes now
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
         let suggested_to_optimize =
-            config_mismatch_optimizer.check_condition(locked_holder.clone(), &Default::default());
+            config_mismatch_optimizer.plan_optimizations_for_test(&locked_holder);
+        let suggested_to_optimize = suggested_to_optimize.into_iter().exactly_one().unwrap();
         assert_eq!(suggested_to_optimize.len(), 1);
         let changed = config_mismatch_optimizer
-            .optimize(
-                locked_holder.clone(),
-                suggested_to_optimize,
-                permit,
-                &false.into(),
-            )
-            .unwrap();
+            .optimize_for_test(locked_holder.clone(), suggested_to_optimize);
         assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure new segment has changed quantization config
         locked_holder
             .read()
-            .iter()
-            .map(|(_, segment)| match segment {
-                LockedSegment::Original(s) => s.read(),
-                LockedSegment::Proxy(_) => unreachable!(),
-            })
+            .iter_original()
+            .map(|(_, segment)| segment.read())
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert_eq!(

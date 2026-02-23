@@ -4,13 +4,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::data_types::facets::{FacetParams, FacetResponse};
-use segment::data_types::order_by::OrderBy;
 use segment::types::*;
+use shard::count::CountRequestInternal;
+use shard::retrieve::record_internal::RecordInternal;
+use shard::scroll::ScrollRequestInternal;
+use shard::search::CoreSearchRequestBatch;
 use tokio::runtime::Handle;
 
+use crate::operations::OperationWithClockTag;
 use crate::operations::types::*;
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
-use crate::operations::OperationWithClockTag;
 
 #[async_trait]
 pub trait ShardOperation {
@@ -18,11 +21,23 @@ pub trait ShardOperation {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
+        timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult>;
 
-    #[allow(clippy::too_many_arguments)]
     async fn scroll_by(
+        &self,
+        request: Arc<ScrollRequestInternal>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>>;
+
+    /// Scroll points ordered by their IDs.
+    /// Intended for internal use only.
+    /// This API is excluded from the rate limits and logging.
+    #[allow(clippy::too_many_arguments)]
+    async fn local_scroll_by_id(
         &self,
         offset: Option<ExtendedPointId>,
         limit: usize,
@@ -30,7 +45,6 @@ pub trait ShardOperation {
         with_vector: &WithVector,
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
-        order_by: Option<&OrderBy>,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>>;
@@ -78,6 +92,10 @@ pub trait ShardOperation {
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse>;
+
+    /// Signal `Stop` to all background operations gracefully
+    /// and wait till they are finished.
+    async fn stop_gracefully(self);
 }
 
 pub type ShardOperationSS = dyn ShardOperation + Send + Sync;

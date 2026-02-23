@@ -2,43 +2,48 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use api::conversions::json::{json_path_from_proto, proto_to_payloads};
+use api::grpc;
 use api::grpc::qdrant::payload_index_params::IndexParams;
 use api::grpc::qdrant::points_update_operation::{ClearPayload, Operation, PointStructList};
 use api::grpc::qdrant::{
-    points_update_operation, ClearPayloadPoints, CreateFieldIndexCollection,
-    DeleteFieldIndexCollection, DeletePayloadPoints, DeletePointVectors, DeletePoints, FieldType,
-    PayloadIndexParams, PointsOperationResponseInternal, PointsSelector, SetPayloadPoints,
-    SyncPoints, UpdateBatchPoints, UpdateBatchResponse, UpdatePointVectors, UpsertPoints,
+    ClearPayloadPoints, CreateFieldIndexCollection, DeleteFieldIndexCollection,
+    DeletePayloadPoints, DeletePointVectors, DeletePoints, FieldType, PayloadIndexParams,
+    PointsOperationResponseInternal, PointsSelector, SetPayloadPoints, SyncPoints,
+    UpdateBatchPoints, UpdateBatchResponse, UpdatePointVectors, UpsertPoints,
+    points_update_operation,
 };
+use api::grpc::{HardwareUsage, InferenceUsage, Usage};
 use api::rest::schema::{PointInsertOperations, PointsList};
 use api::rest::{PointStruct, PointVectors, ShardKeySelector, UpdateVectors, VectorStruct};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::conversions::try_points_selector_from_grpc;
 use collection::operations::payload_ops::DeletePayload;
 use collection::operations::point_ops::{self, PointOperations, PointSyncOperation};
-use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::vector_ops::DeleteVectors;
-use collection::operations::{CollectionUpdateOperations, OperationWithClockTag};
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::types::{
     ExtendedPointId, Filter, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType,
 };
 use storage::content_manager::toc::TableOfContent;
+use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::Access;
+use storage::rbac::Auth;
 use tonic::{Response, Status};
 
+use crate::common::inference::params::InferenceParams;
 use crate::common::inference::service::InferenceType;
 use crate::common::inference::update_requests::convert_point_struct;
-use crate::common::inference::InferenceToken;
+use crate::common::strict_mode::*;
 use crate::common::update::*;
-use crate::tonic::verification::{CheckedTocProvider, StrictModeCheckedTocProvider};
 
 pub async fn upsert(
     toc_provider: impl CheckedTocProvider,
     upsert_points: UpsertPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    inference_params: InferenceParams,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let UpsertPoints {
         collection_name,
@@ -46,41 +51,61 @@ pub async fn upsert(
         points,
         ordering,
         shard_key_selector,
+        update_filter,
+        timeout,
+        update_mode,
     } = upsert_points;
 
     let points: Result<_, _> = points.into_iter().map(PointStruct::try_from).collect();
 
     let operation = PointInsertOperations::PointsList(PointsList {
         points: points?,
-        shard_key: shard_key_selector.map(ShardKeySelector::from),
+        shard_key: shard_key_selector
+            .map(ShardKeySelector::try_from)
+            .transpose()?,
+        update_filter: update_filter
+            .map(segment::types::Filter::try_from)
+            .transpose()?,
+        update_mode: update_mode.map(grpc_update_mode_to_rest),
     });
 
-    let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
-        .await?;
-
     let timing = Instant::now();
-    let result = do_upsert_points(
-        toc.clone(),
+    let (result, inference_usage) = do_upsert_points(
+        toc_provider,
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
-        inference_token,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        inference_params,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response = points_operation_response_internal_with_inference_usage(
+        timing,
+        result,
+        request_hw_counter.to_grpc_api(),
+        inference_usage.map(grpc::InferenceUsage::from),
+    );
     Ok(Response::new(response))
+}
+
+/// Convert gRPC UpdateMode to REST UpdateMode
+fn grpc_update_mode_to_rest(mode: i32) -> api::rest::schema::UpdateMode {
+    match api::grpc::qdrant::UpdateMode::try_from(mode) {
+        Ok(api::grpc::qdrant::UpdateMode::InsertOnly) => api::rest::schema::UpdateMode::InsertOnly,
+        Ok(api::grpc::qdrant::UpdateMode::UpdateOnly) => api::rest::schema::UpdateMode::UpdateOnly,
+        Ok(api::grpc::qdrant::UpdateMode::Upsert) | Err(_) => api::rest::schema::UpdateMode::Upsert,
+    }
 }
 
 pub async fn delete(
     toc_provider: impl CheckedTocProvider,
     delete_points: DeletePoints,
     internal_params: InternalUpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeletePoints {
         collection_name,
@@ -88,6 +113,7 @@ pub async fn delete(
         points,
         ordering,
         shard_key_selector,
+        timeout,
     } = delete_points;
 
     let points_selector = match points {
@@ -95,23 +121,20 @@ pub async fn delete(
         Some(p) => try_points_selector_from_grpc(p, shard_key_selector)?,
     };
 
-    let toc = toc_provider
-        .check_strict_mode(&points_selector, &collection_name, None, &access)
-        .await?;
-
     let timing = Instant::now();
     let result = do_delete_points(
-        toc.clone(),
+        toc_provider,
         collection_name,
         points_selector,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
-        inference_token,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response =
+        points_operation_response_internal(timing, result, request_hw_counter.to_grpc_api());
     Ok(Response::new(response))
 }
 
@@ -119,8 +142,9 @@ pub async fn update_vectors(
     toc_provider: impl CheckedTocProvider,
     update_point_vectors: UpdatePointVectors,
     internal_params: InternalUpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    inference_params: InferenceParams,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let UpdatePointVectors {
         collection_name,
@@ -128,6 +152,8 @@ pub async fn update_vectors(
         points,
         ordering,
         shard_key_selector,
+        update_filter,
+        timeout,
     } = update_point_vectors;
 
     // Build list of operation points
@@ -146,26 +172,33 @@ pub async fn update_vectors(
 
     let operation = UpdateVectors {
         points: op_points,
-        shard_key: shard_key_selector.map(ShardKeySelector::from),
+        shard_key: shard_key_selector
+            .map(ShardKeySelector::try_from)
+            .transpose()?,
+        update_filter: update_filter
+            .map(segment::types::Filter::try_from)
+            .transpose()?,
     };
 
-    let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
-        .await?;
-
     let timing = Instant::now();
-    let result = do_update_vectors(
-        toc.clone(),
+    let (result, usage) = do_update_vectors(
+        toc_provider,
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
-        inference_token,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        inference_params,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response = points_operation_response_internal_with_inference_usage(
+        timing,
+        result,
+        request_hw_counter.to_grpc_api(),
+        usage.map(grpc::InferenceUsage::from),
+    );
     Ok(Response::new(response))
 }
 
@@ -173,7 +206,8 @@ pub async fn delete_vectors(
     toc_provider: impl CheckedTocProvider,
     delete_point_vectors: DeletePointVectors,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeletePointVectors {
         collection_name,
@@ -182,6 +216,7 @@ pub async fn delete_vectors(
         vectors,
         ordering,
         shard_key_selector,
+        timeout,
     } = delete_point_vectors;
 
     let (points, filter) = extract_points_selector(points_selector)?;
@@ -194,25 +229,25 @@ pub async fn delete_vectors(
         points,
         filter,
         vector: vector_names.into_iter().collect(),
-        shard_key: shard_key_selector.map(ShardKeySelector::from),
+        shard_key: shard_key_selector
+            .map(ShardKeySelector::try_from)
+            .transpose()?,
     };
-
-    let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
-        .await?;
 
     let timing = Instant::now();
     let result = do_delete_vectors(
-        toc.clone(),
+        toc_provider,
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response =
+        points_operation_response_internal(timing, result, request_hw_counter.to_grpc_api());
     Ok(Response::new(response))
 }
 
@@ -220,7 +255,8 @@ pub async fn set_payload(
     toc_provider: impl CheckedTocProvider,
     set_payload_points: SetPayloadPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let SetPayloadPoints {
         collection_name,
@@ -230,6 +266,7 @@ pub async fn set_payload(
         ordering,
         shard_key_selector,
         key,
+        timeout,
     } = set_payload_points;
     let key = key.map(|k| json_path_from_proto(&k)).transpose()?;
 
@@ -238,26 +275,26 @@ pub async fn set_payload(
         payload: proto_to_payloads(payload)?,
         points,
         filter,
-        shard_key: shard_key_selector.map(ShardKeySelector::from),
+        shard_key: shard_key_selector
+            .map(ShardKeySelector::try_from)
+            .transpose()?,
         key,
     };
 
-    let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
-        .await?;
-
     let timing = Instant::now();
     let result = do_set_payload(
-        toc.clone(),
+        toc_provider,
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response =
+        points_operation_response_internal(timing, result, request_hw_counter.to_grpc_api());
     Ok(Response::new(response))
 }
 
@@ -265,7 +302,8 @@ pub async fn overwrite_payload(
     toc_provider: impl CheckedTocProvider,
     set_payload_points: SetPayloadPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let SetPayloadPoints {
         collection_name,
@@ -274,6 +312,7 @@ pub async fn overwrite_payload(
         points_selector,
         ordering,
         shard_key_selector,
+        timeout,
         ..
     } = set_payload_points;
 
@@ -282,27 +321,27 @@ pub async fn overwrite_payload(
         payload: proto_to_payloads(payload)?,
         points,
         filter,
-        shard_key: shard_key_selector.map(ShardKeySelector::from),
+        shard_key: shard_key_selector
+            .map(ShardKeySelector::try_from)
+            .transpose()?,
         // overwrite operation don't support indicate path of property
         key: None,
     };
 
-    let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
-        .await?;
-
     let timing = Instant::now();
     let result = do_overwrite_payload(
-        toc.clone(),
+        toc_provider,
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response =
+        points_operation_response_internal(timing, result, request_hw_counter.to_grpc_api());
     Ok(Response::new(response))
 }
 
@@ -310,7 +349,8 @@ pub async fn delete_payload(
     toc_provider: impl CheckedTocProvider,
     delete_payload_points: DeletePayloadPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeletePayloadPoints {
         collection_name,
@@ -319,6 +359,7 @@ pub async fn delete_payload(
         points_selector,
         ordering,
         shard_key_selector,
+        timeout,
     } = delete_payload_points;
     let keys = keys.iter().map(|k| json_path_from_proto(k)).try_collect()?;
 
@@ -327,25 +368,25 @@ pub async fn delete_payload(
         keys,
         points,
         filter,
-        shard_key: shard_key_selector.map(ShardKeySelector::from),
+        shard_key: shard_key_selector
+            .map(ShardKeySelector::try_from)
+            .transpose()?,
     };
-
-    let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
-        .await?;
 
     let timing = Instant::now();
     let result = do_delete_payload(
-        toc.clone(),
+        toc_provider,
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response =
+        points_operation_response_internal(timing, result, request_hw_counter.to_grpc_api());
     Ok(Response::new(response))
 }
 
@@ -353,7 +394,8 @@ pub async fn clear_payload(
     toc_provider: impl CheckedTocProvider,
     clear_payload_points: ClearPayloadPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let ClearPayloadPoints {
         collection_name,
@@ -361,6 +403,7 @@ pub async fn clear_payload(
         points,
         ordering,
         shard_key_selector,
+        timeout,
     } = clear_payload_points;
 
     let points_selector = match points {
@@ -368,22 +411,20 @@ pub async fn clear_payload(
         Some(p) => try_points_selector_from_grpc(p, shard_key_selector)?,
     };
 
-    let toc = toc_provider
-        .check_strict_mode(&points_selector, &collection_name, None, &access)
-        .await?;
-
     let timing = Instant::now();
     let result = do_clear_payload(
-        toc.clone(),
+        toc_provider,
         collection_name,
         points_selector,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response =
+        points_operation_response_internal(timing, result, request_hw_counter.to_grpc_api());
     Ok(Response::new(response))
 }
 
@@ -391,28 +432,34 @@ pub async fn update_batch(
     dispatcher: &Dispatcher,
     update_batch_points: UpdateBatchPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    inference_params: InferenceParams,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<UpdateBatchResponse>, Status> {
     let UpdateBatchPoints {
         collection_name,
         wait,
         operations,
         ordering,
+        timeout,
     } = update_batch_points;
 
     let timing = Instant::now();
     let mut results = Vec::with_capacity(operations.len());
+    let mut total_inference_usage = InferenceUsage::default();
+
     for op in operations {
         let operation = op
             .operation
             .ok_or_else(|| Status::invalid_argument("Operation is missing"))?;
         let collection_name = collection_name.clone();
         let ordering = ordering.clone();
-        let result = match operation {
+        let mut result = match operation {
             points_update_operation::Operation::Upsert(PointStructList {
                 points,
                 shard_key_selector,
+                update_filter,
+                update_mode,
             }) => {
                 upsert(
                     StrictModeCheckedTocProvider::new(dispatcher),
@@ -422,10 +469,14 @@ pub async fn update_batch(
                         points,
                         ordering,
                         shard_key_selector,
+                        update_filter,
+                        timeout,
+                        update_mode,
                     },
                     internal_params,
-                    access.clone(),
-                    inference_token.clone(),
+                    auth.clone(),
+                    inference_params.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -438,10 +489,11 @@ pub async fn update_batch(
                         points: Some(points),
                         ordering,
                         shard_key_selector: None,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
-                    inference_token.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -463,9 +515,11 @@ pub async fn update_batch(
                         ordering,
                         shard_key_selector,
                         key,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -486,11 +540,13 @@ pub async fn update_batch(
                         points_selector,
                         ordering,
                         shard_key_selector,
-                        // overwrite operation don't support it
+                        // overwrite operation doesn't support it
                         key: None,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -510,9 +566,11 @@ pub async fn update_batch(
                         points_selector,
                         ordering,
                         shard_key_selector,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -528,9 +586,11 @@ pub async fn update_batch(
                         points,
                         ordering,
                         shard_key_selector,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -538,6 +598,7 @@ pub async fn update_batch(
                 points_update_operation::UpdateVectors {
                     points,
                     shard_key_selector,
+                    update_filter,
                 },
             ) => {
                 update_vectors(
@@ -548,10 +609,13 @@ pub async fn update_batch(
                         points,
                         ordering,
                         shard_key_selector,
+                        update_filter,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
-                    inference_token.clone(),
+                    auth.clone(),
+                    inference_params.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -571,9 +635,11 @@ pub async fn update_batch(
                         vectors,
                         ordering,
                         shard_key_selector,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -586,9 +652,11 @@ pub async fn update_batch(
                         points: Some(selector),
                         ordering,
                         shard_key_selector: None,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
@@ -604,22 +672,30 @@ pub async fn update_batch(
                         points,
                         ordering,
                         shard_key_selector,
+                        timeout,
                     },
                     internal_params,
-                    access.clone(),
-                    inference_token.clone(),
+                    auth.clone(),
+                    request_hw_counter.clone(),
                 )
                 .await
             }
         }?;
+
+        total_inference_usage.merge_opt(result.get_mut().inference_usage.take());
         results.push(result);
     }
     Ok(Response::new(UpdateBatchResponse {
         result: results
             .into_iter()
-            .map(|response| response.into_inner().result.unwrap().into())
+            .map(|response| grpc::UpdateResult::from(response.into_inner().result.unwrap()))
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: Usage::new(
+            request_hw_counter.to_grpc_api(),
+            total_inference_usage.into_non_empty(),
+        )
+        .into_non_empty(),
     }))
 }
 
@@ -627,7 +703,8 @@ pub async fn create_field_index(
     dispatcher: Arc<Dispatcher>,
     create_field_index_collection: CreateFieldIndexCollection,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let CreateFieldIndexCollection {
         collection_name,
@@ -636,6 +713,7 @@ pub async fn create_field_index(
         field_type,
         field_index_params,
         ordering,
+        timeout,
     } = create_field_index_collection;
 
     let field_name = json_path_from_proto(&field_name)?;
@@ -652,12 +730,16 @@ pub async fn create_field_index(
         collection_name,
         operation,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response = points_operation_response_internal(
+        timing, result,
+        None, // Do not measure API usage for this operation, as it might be inaccurate due to consensus involvement
+    );
     Ok(Response::new(response))
 }
 
@@ -673,6 +755,7 @@ pub async fn create_field_index_internal(
         field_type,
         field_index_params,
         ordering,
+        timeout,
     } = create_field_index_collection;
 
     let field_name = json_path_from_proto(&field_name)?;
@@ -685,11 +768,12 @@ pub async fn create_field_index_internal(
         field_name,
         field_schema,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        HwMeasurementAcc::disposable(), // API unmeasured
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response = points_operation_response_internal(timing, result, None);
     Ok(Response::new(response))
 }
 
@@ -697,13 +781,14 @@ pub async fn delete_field_index(
     dispatcher: Arc<Dispatcher>,
     delete_field_index_collection: DeleteFieldIndexCollection,
     internal_params: InternalUpdateParams,
-    access: Access,
+    auth: Auth,
 ) -> Result<Response<PointsOperationResponseInternal>, Status> {
     let DeleteFieldIndexCollection {
         collection_name,
         wait,
         field_name,
         ordering,
+        timeout,
     } = delete_field_index_collection;
 
     let field_name = json_path_from_proto(&field_name)?;
@@ -714,12 +799,13 @@ pub async fn delete_field_index(
         collection_name,
         field_name,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
-        access,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        auth,
+        HwMeasurementAcc::disposable(), // API unmeasured
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response = points_operation_response_internal(timing, result, None);
     Ok(Response::new(response))
 }
 
@@ -733,6 +819,7 @@ pub async fn delete_field_index_internal(
         wait,
         field_name,
         ordering,
+        timeout,
     } = delete_field_index_collection;
 
     let field_name = json_path_from_proto(&field_name)?;
@@ -743,11 +830,12 @@ pub async fn delete_field_index_internal(
         collection_name,
         field_name,
         internal_params,
-        UpdateParams::from_grpc(wait, ordering)?,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        HwMeasurementAcc::disposable(), // API unmeasured
     )
     .await?;
 
-    let response = points_operation_response_internal(timing, result);
+    let response = points_operation_response_internal(timing, result, None);
     Ok(Response::new(response))
 }
 
@@ -755,9 +843,9 @@ pub async fn sync(
     toc: Arc<TableOfContent>,
     sync_points: SyncPoints,
     internal_params: InternalUpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
-) -> Result<Response<PointsOperationResponseInternal>, Status> {
+    auth: Auth,
+    inference_params: InferenceParams,
+) -> Result<Response<(PointsOperationResponseInternal, InferenceUsage)>, Status> {
     let SyncPoints {
         collection_name,
         wait,
@@ -765,6 +853,7 @@ pub async fn sync(
         from_id,
         to_id,
         ordering,
+        timeout,
     } = sync_points;
 
     let timing = Instant::now();
@@ -772,55 +861,60 @@ pub async fn sync(
     let point_structs: Result<_, _> = points.into_iter().map(PointStruct::try_from).collect();
 
     // No actual inference should happen here, as we are just syncing existing points
-    // So this function is used for consistency only
-    let points =
-        convert_point_struct(point_structs?, InferenceType::Update, inference_token).await?;
+    // So, this function is used for consistency only
+    let (points, usage) =
+        convert_point_struct(point_structs?, InferenceType::Update, inference_params).await?;
 
     let operation = PointSyncOperation {
         points,
         from_id: from_id.map(|x| x.try_into()).transpose()?,
         to_id: to_id.map(|x| x.try_into()).transpose()?,
     };
-    let collection_operation =
+
+    let operation =
         CollectionUpdateOperations::PointOperation(PointOperations::SyncPoints(operation));
 
-    let InternalUpdateParams {
-        shard_id,
-        clock_tag,
-    } = internal_params;
+    let result = update(
+        &toc,
+        &collection_name,
+        operation,
+        internal_params,
+        UpdateParams::from_grpc(wait, ordering, timeout)?,
+        None,
+        auth,
+        HwMeasurementAcc::disposable(), // API unmeasured
+    )
+    .await?;
 
-    let shard_selector = if let Some(shard_selection) = shard_id {
-        ShardSelectorInternal::ShardId(shard_selection)
-    } else {
-        debug_assert!(false, "Sync operation is supposed to select shard directly");
-        ShardSelectorInternal::Empty
-    };
+    let response = points_operation_response_internal(timing, result, None);
+    Ok(Response::new((response, usage.unwrap_or_default().into())))
+}
 
-    let UpdateParams { wait, ordering } = UpdateParams::from_grpc(wait, ordering)?;
-
-    let result = toc
-        .update(
-            &collection_name,
-            OperationWithClockTag::new(collection_operation, clock_tag),
-            wait,
-            ordering,
-            shard_selector,
-            access,
-        )
-        .await?;
-
-    let response = points_operation_response_internal(timing, result);
-    Ok(Response::new(response))
+pub fn points_operation_response_internal_with_inference_usage(
+    timing: Instant,
+    update_result: collection::operations::types::UpdateResult,
+    hardware_usage: Option<HardwareUsage>,
+    inference_usage: Option<InferenceUsage>,
+) -> PointsOperationResponseInternal {
+    PointsOperationResponseInternal {
+        result: Some(update_result.into()),
+        time: timing.elapsed().as_secs_f64(),
+        hardware_usage,
+        inference_usage,
+    }
 }
 
 pub fn points_operation_response_internal(
     timing: Instant,
     update_result: collection::operations::types::UpdateResult,
+    hardware_usage: Option<HardwareUsage>,
 ) -> PointsOperationResponseInternal {
-    PointsOperationResponseInternal {
-        result: Some(update_result.into()),
-        time: timing.elapsed().as_secs_f64(),
-    }
+    points_operation_response_internal_with_inference_usage(
+        timing,
+        update_result,
+        hardware_usage,
+        None, // No inference usage for this operation
+    )
 }
 
 fn extract_points_selector(

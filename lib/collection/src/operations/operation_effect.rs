@@ -4,7 +4,7 @@ use segment::types::{Filter, PointIdType};
 
 use super::vector_ops;
 use crate::operations::payload_ops::PayloadOps;
-use crate::operations::{point_ops, CollectionUpdateOperations};
+use crate::operations::{CollectionUpdateOperations, point_ops};
 
 /// Structure to define what part of the shard are affected by the operation
 pub enum OperationEffectArea<'a> {
@@ -24,11 +24,11 @@ pub enum PointsOperationEffect {
 }
 
 pub trait EstimateOperationEffectArea {
-    fn estimate_effect_area(&self) -> OperationEffectArea;
+    fn estimate_effect_area(&self) -> OperationEffectArea<'_>;
 }
 
 impl EstimateOperationEffectArea for CollectionUpdateOperations {
-    fn estimate_effect_area(&self) -> OperationEffectArea {
+    fn estimate_effect_area(&self) -> OperationEffectArea<'_> {
         match self {
             CollectionUpdateOperations::PointOperation(point_operation) => {
                 point_operation.estimate_effect_area()
@@ -40,15 +40,20 @@ impl EstimateOperationEffectArea for CollectionUpdateOperations {
                 payload_operation.estimate_effect_area()
             }
             CollectionUpdateOperations::FieldIndexOperation(_) => OperationEffectArea::Empty,
+            #[cfg(feature = "staging")]
+            CollectionUpdateOperations::StagingOperation(_) => OperationEffectArea::Empty,
         }
     }
 }
 
 impl EstimateOperationEffectArea for point_ops::PointOperations {
-    fn estimate_effect_area(&self) -> OperationEffectArea {
+    fn estimate_effect_area(&self) -> OperationEffectArea<'_> {
         match self {
             point_ops::PointOperations::UpsertPoints(insert_operations) => {
                 insert_operations.estimate_effect_area()
+            }
+            point_ops::PointOperations::UpsertPointsConditional(conditional_upsert) => {
+                conditional_upsert.points_op.estimate_effect_area()
             }
             point_ops::PointOperations::DeletePoints { ids } => {
                 OperationEffectArea::Points(Cow::Borrowed(ids))
@@ -70,7 +75,7 @@ impl EstimateOperationEffectArea for point_ops::PointOperations {
 }
 
 impl EstimateOperationEffectArea for vector_ops::VectorOperations {
-    fn estimate_effect_area(&self) -> OperationEffectArea {
+    fn estimate_effect_area(&self) -> OperationEffectArea<'_> {
         match self {
             vector_ops::VectorOperations::UpdateVectors(update_operation) => {
                 let ids = update_operation.points.iter().map(|p| p.id).collect();
@@ -87,7 +92,7 @@ impl EstimateOperationEffectArea for vector_ops::VectorOperations {
 }
 
 impl EstimateOperationEffectArea for point_ops::PointInsertOperationsInternal {
-    fn estimate_effect_area(&self) -> OperationEffectArea {
+    fn estimate_effect_area(&self) -> OperationEffectArea<'_> {
         match self {
             point_ops::PointInsertOperationsInternal::PointsBatch(batch) => {
                 OperationEffectArea::Points(Cow::Borrowed(&batch.ids))
@@ -100,7 +105,7 @@ impl EstimateOperationEffectArea for point_ops::PointInsertOperationsInternal {
 }
 
 impl EstimateOperationEffectArea for PayloadOps {
-    fn estimate_effect_area(&self) -> OperationEffectArea {
+    fn estimate_effect_area(&self) -> OperationEffectArea<'_> {
         match self {
             PayloadOps::SetPayload(set_payload) => {
                 if let Some(points) = &set_payload.points {

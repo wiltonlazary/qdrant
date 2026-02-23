@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,22 +7,22 @@ use atomic_refcell::AtomicRefCell;
 use bitvec::prelude::{BitSlice, BitVec};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use rand::prelude::StdRng;
 use rand::SeedableRng;
+use rand::prelude::StdRng;
 
 use super::payload_fixtures::BOOL_KEY;
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::fixtures::payload_fixtures::{
-    generate_diverse_payload, FLT_KEY, GEO_KEY, INT_KEY, STR_KEY, TEXT_KEY,
+    FLT_KEY, GEO_KEY, INT_KEY, STR_KEY, TEXT_KEY, generate_diverse_payload,
 };
 use crate::id_tracker::IdTracker;
+use crate::index::PayloadIndex;
 use crate::index::plain_payload_index::PlainPayloadIndex;
 use crate::index::struct_payload_index::StructPayloadIndex;
-use crate::index::PayloadIndex;
+use crate::payload_storage::PayloadStorage;
 use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use crate::payload_storage::query_checker::SimpleConditionChecker;
-use crate::payload_storage::PayloadStorage;
 use crate::types::{PayloadSchemaType, PointIdType, SeqNumberType};
 
 /// Warn: Use for tests only
@@ -83,10 +84,15 @@ impl IdTracker for FixtureIdTracker {
     }
 
     fn drop(&mut self, external_id: PointIdType) -> OperationResult<()> {
-        let internal_id = self.internal_id(external_id).unwrap() as usize;
-        if !self.deleted.replace(internal_id, true) {
+        let internal_id = self.internal_id(external_id).unwrap();
+        self.drop_internal(internal_id)
+    }
+
+    fn drop_internal(&mut self, internal_id: PointOffsetType) -> OperationResult<()> {
+        if !self.deleted.replace(internal_id as usize, true) {
             self.deleted_count += 1;
         }
+        self.set_internal_version(internal_id, 0)?;
         Ok(())
     }
 
@@ -143,15 +149,6 @@ impl IdTracker for FixtureIdTracker {
         self.deleted_count
     }
 
-    fn iter_ids(&self) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        Box::new(
-            self.ids
-                .iter()
-                .copied()
-                .filter(|id| !self.is_deleted_point(*id)),
-        )
-    }
-
     fn mapping_flusher(&self) -> Flusher {
         Box::new(|| Ok(()))
     }
@@ -172,8 +169,15 @@ impl IdTracker for FixtureIdTracker {
         &self.deleted
     }
 
-    fn cleanup_versions(&mut self) -> OperationResult<()> {
-        Ok(())
+    fn iter_internal_versions(
+        &self,
+    ) -> Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_> {
+        Box::new(iter::empty())
+    }
+
+    fn fix_inconsistencies(&mut self) -> OperationResult<Vec<PointOffsetType>> {
+        // This structure does not support cleaning up orphan versions
+        Ok(vec![])
     }
 
     fn name(&self) -> &'static str {
@@ -263,26 +267,53 @@ pub fn create_struct_payload_index(
         std::collections::HashMap::new(),
         path,
         true,
+        true,
     )
     .unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     index
-        .set_indexed(&STR_KEY.parse().unwrap(), PayloadSchemaType::Keyword)
+        .set_indexed(
+            &STR_KEY.parse().unwrap(),
+            PayloadSchemaType::Keyword,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&INT_KEY.parse().unwrap(), PayloadSchemaType::Integer)
+        .set_indexed(
+            &INT_KEY.parse().unwrap(),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&FLT_KEY.parse().unwrap(), PayloadSchemaType::Float)
+        .set_indexed(
+            &FLT_KEY.parse().unwrap(),
+            PayloadSchemaType::Float,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&GEO_KEY.parse().unwrap(), PayloadSchemaType::Geo)
+        .set_indexed(
+            &GEO_KEY.parse().unwrap(),
+            PayloadSchemaType::Geo,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&TEXT_KEY.parse().unwrap(), PayloadSchemaType::Text)
+        .set_indexed(
+            &TEXT_KEY.parse().unwrap(),
+            PayloadSchemaType::Text,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&BOOL_KEY.parse().unwrap(), PayloadSchemaType::Bool)
+        .set_indexed(
+            &BOOL_KEY.parse().unwrap(),
+            PayloadSchemaType::Bool,
+            &hw_counter,
+        )
         .unwrap();
 
     index

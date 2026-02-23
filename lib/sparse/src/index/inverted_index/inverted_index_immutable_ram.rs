@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 
+use super::InvertedIndex;
 use super::inverted_index_mmap::InvertedIndexMmap;
 use super::inverted_index_ram::InvertedIndexRam;
-use super::InvertedIndex;
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset};
 use crate::index::posting_list::{PostingList, PostingListIterator};
@@ -22,6 +23,10 @@ impl InvertedIndex for InvertedIndexImmutableRam {
     type Iter<'a> = PostingListIterator<'a>;
 
     type Version = <InvertedIndexMmap as InvertedIndex>::Version;
+
+    fn is_on_disk(&self) -> bool {
+        false
+    }
 
     fn open(path: &Path) -> std::io::Result<Self> {
         let mmap_inverted_index = InvertedIndexMmap::load(path)?;
@@ -56,20 +61,29 @@ impl InvertedIndex for InvertedIndexImmutableRam {
         Ok(())
     }
 
-    fn get(&self, id: &DimOffset) -> Option<PostingListIterator> {
-        InvertedIndex::get(&self.inner, id)
+    fn get<'a>(
+        &'a self,
+        id: DimOffset,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<PostingListIterator<'a>> {
+        InvertedIndex::get(&self.inner, id, hw_counter)
     }
 
     fn len(&self) -> usize {
         self.inner.len()
     }
 
-    fn posting_list_len(&self, id: &DimOffset) -> Option<usize> {
-        self.inner.posting_list_len(id)
+    fn posting_list_len(&self, id: &DimOffset, hw_counter: &HardwareCounterCell) -> Option<usize> {
+        self.inner.posting_list_len(id, hw_counter)
     }
 
     fn files(path: &Path) -> Vec<std::path::PathBuf> {
         InvertedIndexMmap::files(path)
+    }
+
+    fn immutable_files(path: &Path) -> Vec<std::path::PathBuf> {
+        // `InvertedIndexImmutableRam` is always immutable
+        InvertedIndexMmap::immutable_files(path)
     }
 
     fn remove(&mut self, _id: PointOffsetType, _old_vector: RemappedSparseVector) {

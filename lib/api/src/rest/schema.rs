@@ -1,20 +1,25 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use common::types::ScoreType;
 use common::validation::validate_multi_vector;
+use ordered_float::NotNan;
 use schemars::JsonSchema;
 use segment::common::utils::MaybeOneOrMany;
+use segment::data_types::index::{StemmingAlgorithm, StopwordsInterface, TokenizerType};
 use segment::data_types::order_by::OrderBy;
 use segment::json_path::JsonPath;
 use segment::types::{
-    Filter, IntPayloadType, Payload, PointIdType, SearchParams, ShardKey, VectorNameBuf,
-    WithPayloadInterface, WithVector,
+    Condition, Filter, GeoPoint, IntPayloadType, Payload, PointIdType, SearchParams, ShardKey,
+    VectorNameBuf, WithPayloadInterface, WithVector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sparse::common::sparse_vector::SparseVector;
 use validator::{Validate, ValidationErrors};
+
+use crate::rest::validate::validate_relevance_feedback_input;
 
 /// Type for dense vector
 pub type DenseVector = Vec<segment::data_types::vectors::VectorElementType>;
@@ -161,22 +166,181 @@ impl Hash for Options {
     }
 }
 
+/// Configuration of the local bm25 models.
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq, Eq)]
+pub struct Bm25Config {
+    /// Controls term frequency saturation. Higher values mean term frequency has more impact.
+    /// Default is 1.2
+    #[serde(default = "default_k")]
+    pub k: NotNan<f64>,
+    #[serde(default = "default_b")]
+    /// Controls document length normalization. Ranges from 0 (no normalization) to 1 (full normalization).
+    /// Higher values mean longer documents have less impact.
+    /// Default is 0.75.
+    pub b: NotNan<f64>,
+    #[serde(default = "default_avg_len")]
+    /// Expected average document length in the collection. Default is 256.
+    pub avg_len: NotNan<f64>,
+    /// Tokenizer type to use for text preprocessing.
+    #[serde(default)]
+    pub tokenizer: TokenizerType,
+    #[serde(default, flatten)]
+    pub text_preprocessing_config: TextPreprocessingConfig,
+}
+
+impl Default for Bm25Config {
+    fn default() -> Self {
+        Self {
+            k: default_k(),
+            b: default_b(),
+            avg_len: default_avg_len(),
+            tokenizer: TokenizerType::default(),
+            text_preprocessing_config: TextPreprocessingConfig::default(),
+        }
+    }
+}
+
+const fn default_k() -> NotNan<f64> {
+    unsafe { NotNan::new_unchecked(1.2) }
+}
+
+const fn default_b() -> NotNan<f64> {
+    unsafe { NotNan::new_unchecked(0.75) }
+}
+
+const fn default_avg_len() -> NotNan<f64> {
+    unsafe { NotNan::new_unchecked(256.0) }
+}
+
+/// Bm25 tokenizer configurations.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema, PartialEq, Eq)]
+pub struct TextPreprocessingConfig {
+    /// Defines which language to use for text preprocessing.
+    /// This parameter is used to construct default stopwords filter and stemmer.
+    /// To disable language-specific processing, set this to `"language": "none"`.
+    /// If not specified, English is assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Lowercase the text before tokenization.
+    /// Default is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lowercase: Option<bool>,
+    /// If true, normalize tokens by folding accented characters to ASCII (e.g., "ação" -> "acao").
+    /// Default is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii_folding: Option<bool>,
+    /// Configuration of the stopwords filter. Supports list of pre-defined languages and custom stopwords.
+    /// Default: initialized for specified `language` or English if not specified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopwords: Option<StopwordsInterface>,
+    /// Configuration of the stemmer. Processes tokens to their root form.
+    /// Default: initialized Snowball stemmer for specified `language` or English if not specified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stemmer: Option<StemmingAlgorithm>,
+    /// Minimum token length to keep. If token is shorter than this, it will be discarded.
+    /// Default is `None`, which means no minimum length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_token_len: Option<usize>,
+    /// Maximum token length to keep. If token is longer than this, it will be discarded.
+    /// Default is `None`, which means no maximum length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_token_len: Option<usize>,
+}
+
+impl Bm25Config {
+    pub fn to_options(&self) -> HashMap<String, Value> {
+        debug_assert!(
+            false,
+            "this code should never be called, it is only for schema generation",
+        );
+
+        let value = serde_json::to_value(self)
+            .expect("conversion of internal structure to JSON should never fail");
+
+        match value {
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => HashMap::default(), // not expected
+            Value::Object(map) => map.into_iter().collect(),
+        }
+    }
+}
+
+/// Option variants for text documents.
+/// Ether general-purpose options or BM25-specific options.
+/// BM25-specific will only take effect if the `qdrant/bm25` is specified as a model.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged, rename_all = "snake_case")]
+pub enum DocumentOptions {
+    // This option should go first
+    Common(HashMap<String, Value>),
+    // This should never be deserialized into, but we keep it for schema generation
+    Bm25(Bm25Config),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_document_options_should_deserialize_into_common() {
+        let json = Bm25Config {
+            tokenizer: TokenizerType::Word,
+            ..Default::default()
+        };
+        let valid_bm25_config = serde_json::to_string(&json).unwrap();
+        let options: DocumentOptions = serde_json::from_str(&valid_bm25_config).unwrap();
+        // Bm25 option is used only for schema, actual deserialization will happen in specialized code
+        assert!(matches!(options, DocumentOptions::Common(_)));
+    }
+}
+
+impl DocumentOptions {
+    pub fn into_options(self) -> HashMap<String, Value> {
+        match self {
+            DocumentOptions::Common(options) => options,
+            DocumentOptions::Bm25(bm25) => bm25.to_options(),
+        }
+    }
+}
+
+impl Hash for DocumentOptions {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let options = match self {
+            DocumentOptions::Common(options) => Cow::Borrowed(options),
+            DocumentOptions::Bm25(bm25) => Cow::Owned(bm25.to_options()),
+        };
+
+        // Order of keys in the map should not affect the hash
+        let mut keys: Vec<_> = options.keys().collect();
+        keys.sort();
+        for key in keys {
+            key.hash(state);
+            options.get(key).unwrap().hash(state);
+        }
+    }
+}
+
 /// WARN: Work-in-progress, unimplemented
 ///
 /// Text document for embedding. Requires inference infrastructure, unimplemented.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Hash, Validate)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, Hash, Validate)]
 pub struct Document {
-    /// Text of the document
-    /// This field will be used as input for the embedding model
+    /// Text of the document.
+    /// This field will be used as input for the embedding model.
     #[schemars(example = "document_text_example")]
     pub text: String,
-    /// Name of the model used to generate the vector
-    /// List of available models depends on a provider
+    /// Name of the model used to generate the vector.
+    /// List of available models depends on a provider.
     #[validate(length(min = 1))]
     #[schemars(length(min = 1), example = "model_example")]
     pub model: String,
-    #[serde(flatten)]
-    pub options: Options,
+    /// Additional options for the model, will be passed to the inference service as-is.
+    /// See model cards for available options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<DocumentOptions>,
 }
 
 /// WARN: Work-in-progress, unimplemented
@@ -187,13 +351,13 @@ pub struct Image {
     /// Image data: base64 encoded image or an URL
     #[schemars(example = "image_value_example")]
     pub image: Value,
-    /// Name of the model used to generate the vector
-    /// List of available models depends on a provider
+    /// Name of the model used to generate the vector.
+    /// List of available models depends on a provider.
     #[validate(length(min = 1))]
     #[schemars(length(min = 1), example = "image_model_example")]
     pub model: String,
-    /// Parameters for the model
-    /// Values of the parameters are model-specific
+    /// Parameters for the model.
+    /// Values of the parameters are model-specific.
     #[serde(flatten)]
     pub options: Options,
 }
@@ -203,16 +367,16 @@ pub struct Image {
 /// Custom object for embedding. Requires inference infrastructure, unimplemented.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Hash, Validate)]
 pub struct InferenceObject {
-    /// Arbitrary data, used as input for the embedding model
-    /// Used if the model requires more than one input or a custom input
+    /// Arbitrary data, used as input for the embedding model.
+    /// Used if the model requires more than one input or a custom input.
     pub object: Value,
-    /// Name of the model used to generate the vector
-    /// List of available models depends on a provider
+    /// Name of the model used to generate the vector.
+    /// List of available models depends on a provider.
     #[validate(length(min = 1))]
     #[schemars(length(min = 1), example = "model_example")]
     pub model: String,
-    /// Parameters for the model
-    /// Values of the parameters are model-specific
+    /// Parameters for the model.
+    /// Values of the parameters are model-specific.
     #[serde(flatten)]
     pub options: Options,
 }
@@ -236,12 +400,20 @@ pub struct Batch {
     pub payloads: Option<Vec<Option<Payload>>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
+pub struct ShardKeyWithFallback {
+    pub target: ShardKey,
+    /// Fallback shard key will be used if target shard key is not created or active
+    pub fallback: ShardKey,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq, Hash)]
 #[serde(untagged)]
 #[serde(expecting = "Expected a string or an integer")]
 pub enum ShardKeySelector {
     ShardKey(ShardKey),
     ShardKeys(Vec<ShardKey>),
+    ShardKeyWithFallback(ShardKeyWithFallback),
     // ToDo: select by pattern
 }
 
@@ -338,7 +510,7 @@ pub enum NamedVectorStruct {
     // No support for multi-dense vectors in search
 }
 
-#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Hash)]
 #[serde(untagged)]
 #[serde(expecting = "Expected a string, or an object with a key, direction and/or start_from")]
 pub enum OrderByInterface {
@@ -350,13 +522,29 @@ pub enum OrderByInterface {
 ///
 /// Available fusion algorithms:
 ///
-/// * `rrf` - Reciprocal Rank Fusion
+/// * `rrf` - Reciprocal Rank Fusion (with default parameters)
 /// * `dbsf` - Distribution-Based Score Fusion
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Fusion {
     Rrf,
     Dbsf,
+}
+
+/// Parameters for Reciprocal Rank Fusion
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct Rrf {
+    /// K parameter for reciprocal rank fusion
+    #[validate(range(min = 1))]
+    #[serde(default)]
+    pub k: Option<usize>,
+
+    /// Weights for each prefetch source. Higher weight gives more influence on the final ranking.
+    /// If not specified, all prefetches are weighted equally.
+    /// The number of weights should match the number of prefetches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -465,50 +653,116 @@ pub enum Query {
     /// Fuse the results of multiple prefetches.
     Fusion(FusionQuery),
 
+    /// Apply reciprocal rank fusion to multiple prefetches
+    Rrf(RrfQuery),
+
+    /// Score boosting via an arbitrary formula
+    Formula(FormulaQuery),
+
     /// Sample points from the collection, non-deterministically.
     Sample(SampleQuery),
+
+    /// Use feedback from an oracle to improve the results
+    RelevanceFeedback(RelevanceFeedbackQuery),
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct NearestQuery {
+    /// The vector to search for nearest neighbors.
+    #[validate(nested)]
     pub nearest: VectorInput,
+
+    /// Perform MMR (Maximal Marginal Relevance) reranking after search,
+    /// using the same vector in this query to calculate relevance.
+    #[validate(nested)]
+    pub mmr: Option<Mmr>,
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct RecommendQuery {
+    #[validate(nested)]
     pub recommend: RecommendInput,
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct DiscoverQuery {
+    #[validate(nested)]
     pub discover: DiscoverInput,
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct ContextQuery {
+    #[validate(nested)]
     pub context: ContextInput,
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct OrderByQuery {
+    #[validate(nested)]
     pub order_by: OrderByInterface,
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct FusionQuery {
+    #[validate(nested)]
     pub fusion: Fusion,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct RrfQuery {
+    #[validate(nested)]
+    pub rrf: Rrf,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FormulaQuery {
+    pub formula: Expression,
+
+    #[serde(default)]
+    pub defaults: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct SampleQuery {
+    #[validate(nested)]
     pub sample: Sample,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct RelevanceFeedbackQuery {
+    #[validate(nested)]
+    pub relevance_feedback: RelevanceFeedbackInput,
+}
+
+/// Maximal Marginal Relevance (MMR) algorithm for re-ranking the points.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct Mmr {
+    /// Tunable parameter for the MMR algorithm.
+    /// Determines the balance between diversity and relevance.
+    ///
+    /// A higher value favors diversity (dissimilarity to selected results),
+    /// while a lower value favors relevance (similarity to the query vector).
+    ///
+    /// Must be in the range [0, 1].
+    /// Default value is 0.5.
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub diversity: Option<f32>,
+
+    /// The maximum number of candidates to consider for re-ranking.
+    ///
+    /// If not specified, the `limit` value is used.
+    #[validate(range(max = 16_384))] // artificial maximum, to avoid too expensive query.
+    pub candidates_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -556,12 +810,16 @@ pub struct Prefetch {
 ///   examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`.
 ///   If the `max_neg_score` is chosen then it is squared and negated, otherwise it is just
 ///   the `max_pos_score`.
+///
+/// * `sum_scores` - Uses custom search objective. Compares against all inputs, sums all the scores.
+///   Scores against positive vectors are added, against negatives are subtracted.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendStrategy {
     #[default]
     AverageVector,
     BestScore,
+    SumScores,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -621,6 +879,199 @@ impl ContextPair {
     pub fn iter(&self) -> impl Iterator<Item = &VectorInput> {
         std::iter::once(&self.positive).chain(std::iter::once(&self.negative))
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+#[validate(schema(function = "validate_relevance_feedback_input"))]
+pub struct RelevanceFeedbackInput {
+    #[validate(nested)]
+    pub target: VectorInput,
+    #[validate(nested)]
+    pub feedback: Vec<FeedbackItem>,
+    #[validate(nested)]
+    pub strategy: FeedbackStrategy,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct FeedbackItem {
+    #[validate(nested)]
+    pub example: VectorInput,
+    pub score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum FeedbackStrategy {
+    Naive(NaiveFeedbackStrategy),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct NaiveFeedbackStrategy {
+    #[validate(nested)]
+    pub naive: NaiveFeedbackStrategyParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct NaiveFeedbackStrategyParams {
+    pub a: f32,
+    #[validate(range(min = 0.0))]
+    pub b: f32,
+    pub c: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Expression {
+    Constant(f32),
+    Variable(String),
+    Condition(Box<Condition>),
+    GeoDistance(GeoDistance),
+    Datetime(DatetimeExpression),
+    DatetimeKey(DatetimeKeyExpression),
+    Mult(MultExpression),
+    Sum(SumExpression),
+    Neg(NegExpression),
+    Abs(AbsExpression),
+    Div(DivExpression),
+    Sqrt(SqrtExpression),
+    Pow(PowExpression),
+    Exp(ExpExpression),
+    Log10(Log10Expression),
+    Ln(LnExpression),
+    LinDecay(LinDecayExpression),
+    ExpDecay(ExpDecayExpression),
+    GaussDecay(GaussDecayExpression),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeoDistance {
+    pub geo_distance: GeoDistanceParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeoDistanceParams {
+    /// The origin geo point to measure from
+    pub origin: GeoPoint,
+    /// Payload field with the destination geo point
+    pub to: JsonPath,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DatetimeExpression {
+    pub datetime: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DatetimeKeyExpression {
+    pub datetime_key: JsonPath,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct MultExpression {
+    #[validate(nested)]
+    pub mult: Vec<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct SumExpression {
+    #[validate(nested)]
+    pub sum: Vec<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct NegExpression {
+    #[validate(nested)]
+    pub neg: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct AbsExpression {
+    #[validate(nested)]
+    pub abs: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct DivExpression {
+    #[validate(nested)]
+    pub div: DivParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct DivParams {
+    #[validate(nested)]
+    pub left: Box<Expression>,
+    #[validate(nested)]
+    pub right: Box<Expression>,
+    pub by_zero_default: Option<ScoreType>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct SqrtExpression {
+    #[validate(nested)]
+    pub sqrt: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct PowExpression {
+    pub pow: PowParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct PowParams {
+    #[validate(nested)]
+    pub base: Box<Expression>,
+    #[validate(nested)]
+    pub exponent: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct ExpExpression {
+    #[validate(nested)]
+    pub exp: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct Log10Expression {
+    #[validate(nested)]
+    pub log10: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct LnExpression {
+    #[validate(nested)]
+    pub ln: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct LinDecayExpression {
+    #[validate(nested)]
+    pub lin_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct ExpDecayExpression {
+    #[validate(nested)]
+    pub exp_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct GaussDecayExpression {
+    #[validate(nested)]
+    pub gauss_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct DecayParamsExpression {
+    /// The variable to decay.
+    #[validate(nested)]
+    pub x: Box<Expression>,
+    /// The target value to start decaying from. Defaults to 0.
+    #[validate(nested)]
+    pub target: Option<Box<Expression>>,
+    /// The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.
+    pub scale: Option<f32>,
+    /// The midpoint of the decay. Should be between 0 and 1.Defaults to 0.5. Output will be this value when `|x - target| == scale`.
+    pub midpoint: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -908,6 +1359,7 @@ pub struct FacetRequestInternal {
     pub limit: Option<usize>,
 
     /// Filter conditions - only consider points that satisfy these conditions.
+    #[validate(nested)]
     pub filter: Option<Filter>,
 
     /// Whether to do a more expensive exact count for each of the values in the facet. Default is false.
@@ -955,12 +1407,39 @@ pub struct PointStruct {
     pub payload: Option<Payload>,
 }
 
+/// Defines the mode of the upsert operation
+///
+/// * `upsert` - default mode, insert new points, update existing points
+/// * `insert_only` - only insert new points, do not update existing points
+/// * `update_only` - only update existing points, do not insert new points
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    // Default mode - insert new points, update existing points
+    #[default]
+    Upsert,
+    // Only insert new points, do not update existing points
+    InsertOnly,
+    // Only update existing points, do not insert new points
+    UpdateOnly,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, JsonSchema)]
 pub struct PointsBatch {
     #[validate(nested)]
     pub batch: Batch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
+
+    /// Filter to apply when updating existing points. Only points matching this filter will be updated.
+    /// Points that don't match will keep their current state. New points will be inserted regardless of the filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub update_filter: Option<Filter>,
+
+    /// Mode of the upsert operation: insert_only, upsert (default), update_only
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<UpdateMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -980,6 +1459,9 @@ pub struct UpdateVectors {
     pub points: Vec<PointVectors>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub update_filter: Option<Filter>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, Validate)]
@@ -988,6 +1470,14 @@ pub struct PointsList {
     pub points: Vec<PointStruct>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
+    /// Filter to apply when updating existing points. Only points matching this filter will be updated.
+    /// Points that don't match will keep their current state. New points will be inserted regardless of the filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub update_filter: Option<Filter>,
+    /// Mode of the upsert operation: insert_only, upsert (default), update_only
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<UpdateMode>,
 }
 
 impl<'de> serde::Deserialize<'de> for PointInsertOperations {
@@ -1051,14 +1541,14 @@ impl PointInsertOperations {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, Default, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MaxOptimizationThreadsSetting {
     #[default]
     Auto,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(untagged)]
 pub enum MaxOptimizationThreads {
     Setting(MaxOptimizationThreadsSetting),

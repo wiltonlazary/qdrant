@@ -12,7 +12,11 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} tonistiigi/xx AS xx
 # Utilizing Docker layer caching with `cargo-chef`.
 #
 # https://www.lpalmieri.com/posts/fast-rust-docker-builds/
-FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.84.1 AS chef
+
+# Note: using bookworm base image to match GPU runtime image, otherwise we're
+# seeing runtime errors due to libc version mismatch.
+# See: <https://github.com/qdrant/qdrant/pull/7334>
+FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.93.1-bookworm  AS chef
 
 
 FROM chef AS planner
@@ -37,7 +41,8 @@ COPY --from=xx / /
 
 RUN apt-get update \
     && apt-get install -y clang lld cmake protobuf-compiler jq \
-    && rustup component add rustfmt
+    && rustup component add rustfmt \
+    && cargo install cargo-sbom
 
 # `ARG`/`ENV` pair is a workaround for `docker build` backward-compatibility.
 #
@@ -45,7 +50,7 @@ RUN apt-get update \
 ARG BUILDPLATFORM
 ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
 
-ARG MOLD_VERSION=2.36.0
+ARG MOLD_VERSION=2.40.4
 
 RUN case "$BUILDPLATFORM" in \
         */amd64 ) PLATFORM=x86_64 ;; \
@@ -81,6 +86,20 @@ ARG RUSTFLAGS
 # Select linker (e.g., `mold`, `lld` or an empty string for the default linker)
 ARG LINKER=mold
 
+# Select target CPU; use `rustc --print target-cpus` to see available values
+ARG TARGET_CPU
+
+# Select jemalloc's allocator page size
+#
+# Specified as base 2 log, e.g.:
+# 12 = 2^12 = 4k
+# 14 = 2^14 = 16k
+# 16 = 2^16 = 64k
+#
+# https://github.com/tikv/jemallocator/tree/main/jemalloc-sys#environment-variables
+# https://github.com/jemalloc/jemalloc/blob/dev/INSTALL.md?plain=1#L225-L232
+ARG JEMALLOC_SYS_WITH_LG_PAGE
+
 # Enable GPU support
 ARG GPU
 
@@ -91,7 +110,8 @@ COPY --from=planner /qdrant/recipe.json recipe.json
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
-    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER $RUSTFLAGS" \
+    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
+    ${JEMALLOC_SYS_WITH_LG_PAGE:+env JEMALLOC_SYS_WITH_LG_PAGE="${JEMALLOC_SYS_WITH_LG_PAGE}"} \
     xx-cargo chef cook --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --recipe-path recipe.json
 
 COPY . .
@@ -103,7 +123,8 @@ ARG GIT_COMMIT_ID
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
-    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER $RUSTFLAGS" \
+    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
+    ${JEMALLOC_SYS_WITH_LG_PAGE:+env JEMALLOC_SYS_WITH_LG_PAGE="${JEMALLOC_SYS_WITH_LG_PAGE}"} \
     xx-cargo build --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant \
     && PROFILE_DIR=$(if [ "$PROFILE" = dev ]; then echo debug; else echo $PROFILE; fi) \
     && mv target/$(xx-cargo --print-target-triple)/$PROFILE_DIR/qdrant /qdrant/qdrant
@@ -111,12 +132,15 @@ RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
 # Download and extract web UI
 RUN mkdir /static && STATIC_DIR=/static ./tools/sync-web-ui.sh
 
+# Generate SBOM
+RUN cargo sbom > qdrant.spdx.json
+
 
 # Dockerfile does not support conditional `FROM` directly.
 # To workaround this limitation, we use a multi-stage build with a different base images which have equal name to ARG value.
 
 # Base image for Qdrant.
-FROM debian:12-slim AS qdrant-cpu
+FROM debian:13-slim AS qdrant-cpu
 
 
 # Base images for Qdrant with nvidia GPU support.
@@ -128,7 +152,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES compute,graphics,utility
 # Copy Nvidia ICD loader file into the container.
 COPY --from=builder /qdrant/lib/gpu/nvidia_icd.json /etc/vulkan/icd.d/
 # Override maintainer label. Nvidia base image have it's own maintainer label.
-LABEL maintainer "Qdrant Team <info@qdrant.tech>"
+LABEL maintainer="Qdrant Team <info@qdrant.tech>"
 
 
 # Base images for Qdrant with amd GPU support.
@@ -136,18 +160,17 @@ FROM rocm/dev-ubuntu-22.04 AS qdrant-gpu-amd
 # Set non-interactive mode for apt-get.
 ENV DEBIAN_FRONTEND=noninteractive
 # Override maintainer label. AMD base image have it's own maintainer label.
-LABEL maintainer "Qdrant Team <info@qdrant.tech>"
+LABEL maintainer="Qdrant Team <info@qdrant.tech>"
 
 
 FROM qdrant-${GPU:+gpu-}${GPU:-cpu} AS qdrant
-
-RUN apt-get update
 
 # Install GPU dependencies
 ARG GPU
 
 RUN if [ -n "$GPU" ]; then \
-    apt-get install -y \
+    apt-get update \
+    && apt-get install -y \
     libvulkan1 \
     libvulkan-dev \
     vulkan-tools \
@@ -157,8 +180,10 @@ RUN if [ -n "$GPU" ]; then \
 # E.g., the debugger of choice: gdb/gdbserver/lldb.
 ARG PACKAGES
 
-RUN apt-get install -y --no-install-recommends ca-certificates tzdata libunwind8 $PACKAGES \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata libunwind8 $PACKAGES \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/debconf/* /var/lib/dpkg/status-old
 
 # Copy Qdrant source files into the container. Useful for debugging.
 #
@@ -182,16 +207,9 @@ COPY --from=builder ${DIR:-/null?} $DIR/
 ENV DIR=${SOURCES:+/usr/local/cargo/git/checkouts}
 COPY --from=builder ${DIR:-/null?} $DIR/
 
-ENV DIR=
+ENV DIR=""
 
 ARG APP=/qdrant
-
-COPY --from=builder /qdrant/qdrant "$APP"/qdrant
-COPY --from=builder /qdrant/config "$APP"/config
-COPY --from=builder /qdrant/tools/entrypoint.sh "$APP"/entrypoint.sh
-COPY --from=builder /static "$APP"/static
-
-WORKDIR "$APP"
 
 ARG USER_ID=0
 
@@ -201,6 +219,14 @@ RUN if [ "$USER_ID" != 0 ]; then \
         mkdir -p "$APP"/storage "$APP"/snapshots; \
         chown -R "$USER_ID:$USER_ID" "$APP"; \
     fi
+
+COPY --from=builder --chown=$USER_ID:$USER_ID /qdrant/qdrant "$APP"/qdrant
+COPY --from=builder --chown=$USER_ID:$USER_ID /qdrant/qdrant.spdx.json "$APP"/qdrant.spdx.json
+COPY --from=builder --chown=$USER_ID:$USER_ID /qdrant/config "$APP"/config
+COPY --from=builder --chown=$USER_ID:$USER_ID /qdrant/tools/entrypoint.sh "$APP"/entrypoint.sh
+COPY --from=builder --chown=$USER_ID:$USER_ID /static "$APP"/static
+
+WORKDIR "$APP"
 
 USER "$USER_ID:$USER_ID"
 

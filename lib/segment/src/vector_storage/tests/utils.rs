@@ -1,11 +1,11 @@
 use std::{error, result};
 
-use common::types::{PointOffsetType, ScoredPointOffset};
+use common::counter::hardware_counter::HardwareCounterCell;
 use rand::seq::IteratorRandom;
 
 use crate::data_types::vectors::VectorElementType;
 use crate::id_tracker::IdTracker;
-use crate::vector_storage::{RawScorer, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 pub type Result<T, E = Error> = result::Result<T, E>;
 pub type Error = Box<dyn error::Error>;
@@ -25,12 +25,14 @@ pub fn insert_distributed_vectors(
 
     let mut vector = vec![0.; dim];
 
+    let hw_counter = HardwareCounterCell::new();
+
     for offset in start..end {
         for (item, value) in vector.iter_mut().zip(&mut *sampler) {
             *item = value;
         }
 
-        storage.insert_vector(offset, vector.as_slice().into())?;
+        storage.insert_vector(offset, vector.as_slice().into(), &hw_counter)?;
     }
 
     Ok(())
@@ -50,11 +52,4 @@ pub fn delete_random_vectors(
     }
 
     Ok(())
-}
-
-pub fn score(scorer: &dyn RawScorer, points: &[PointOffsetType]) -> Vec<ScoredPointOffset> {
-    let mut scores = vec![Default::default(); points.len()];
-    let scored = scorer.score_points(points, &mut scores);
-    scores.resize_with(scored, Default::default);
-    scores
 }

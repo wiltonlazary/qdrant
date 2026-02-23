@@ -1,26 +1,27 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::tar_ext;
 use segment::data_types::facets::{FacetParams, FacetResponse};
-use segment::data_types::order_by::OrderBy;
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, SnapshotFormat, WithPayload, WithPayloadInterface,
-    WithVector,
+    ExtendedPointId, Filter, ScoredPoint, SizeStats, WithPayload, WithPayloadInterface, WithVector,
 };
+use shard::count::CountRequestInternal;
+use shard::operations::CollectionUpdateOperations;
+use shard::retrieve::record_internal::RecordInternal;
+use shard::scroll::ScrollRequestInternal;
+use shard::search::CoreSearchRequestBatch;
+use shard::snapshots::snapshot_manifest::SnapshotManifest;
 use tokio::runtime::Handle;
 
+use crate::operations::OperationWithClockTag;
 use crate::operations::types::{
-    CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, PointRequestInternal, RecordInternal, ShardStatus,
-    UpdateResult,
+    CollectionError, CollectionInfo, CollectionResult, CountResult, OptimizersStatus,
+    PointRequestInternal, ShardStatus, UpdateResult, UpdateStatus,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
-use crate::operations::OperationWithClockTag;
 use crate::shards::shard_trait::ShardOperation;
 use crate::shards::telemetry::LocalShardTelemetry;
 
@@ -36,31 +37,40 @@ impl DummyShard {
         }
     }
 
-    pub async fn create_snapshot(
-        &self,
-        _temp_path: &Path,
-        _tar: &tar_ext::BuilderExt,
-        _format: SnapshotFormat,
-        _save_wal: bool,
-    ) -> CollectionResult<()> {
+    pub fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
+        Ok(SnapshotManifest::default())
+    }
+
+    pub fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         self.dummy()
     }
 
-    pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
-        self.dummy()
-    }
-
-    pub async fn on_strict_mode_config_update(&mut self) {}
+    pub fn on_strict_mode_config_update(&mut self) {}
 
     pub fn get_telemetry_data(&self) -> LocalShardTelemetry {
         LocalShardTelemetry {
             variant_name: Some("dummy shard".into()),
             status: Some(ShardStatus::Green),
             total_optimized_points: 0,
-            segments: vec![],
+            vectors_size_bytes: None,
+            payloads_size_bytes: None,
+            num_points: None,
+            num_vectors: None,
+            num_vectors_by_name: None,
+            segments: None,
             optimizations: Default::default(),
             async_scorer: None,
+            indexed_only_excluded_vectors: None,
+            update_queue: None,
         }
+    }
+
+    pub fn get_optimization_status(&self) -> OptimizersStatus {
+        OptimizersStatus::Ok
+    }
+
+    pub fn get_size_stats(&self) -> SizeStats {
+        SizeStats::default()
     }
 
     pub fn estimate_cardinality(
@@ -70,8 +80,12 @@ impl DummyShard {
         self.dummy()
     }
 
+    pub fn dummy_error(&self) -> CollectionError {
+        CollectionError::service_error(self.message.clone())
+    }
+
     fn dummy<T>(&self) -> CollectionResult<T> {
-        Err(CollectionError::service_error(self.message.to_string()))
+        Err(self.dummy_error())
     }
 }
 
@@ -79,15 +93,45 @@ impl DummyShard {
 impl ShardOperation for DummyShard {
     async fn update(
         &self,
-        _: OperationWithClockTag,
+        op: OperationWithClockTag,
         _: bool,
+        _: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
-        self.dummy()
+        match &op.operation {
+            CollectionUpdateOperations::PointOperation(_) => self.dummy(),
+            CollectionUpdateOperations::VectorOperation(_) => self.dummy(),
+            CollectionUpdateOperations::PayloadOperation(_) => self.dummy(),
+
+            // Allow (and ignore) field index operations. Field index schema is stored in collection
+            // config, and indices will be created (if needed) when dummy shard is recovered.
+            CollectionUpdateOperations::FieldIndexOperation(_) => Ok(UpdateResult {
+                operation_id: None,
+                status: UpdateStatus::Acknowledged,
+                clock_tag: None,
+            }),
+            // Allow (and ignore) staging operations on dummy shards
+            #[cfg(feature = "staging")]
+            CollectionUpdateOperations::StagingOperation(_) => Ok(UpdateResult {
+                operation_id: None,
+                status: UpdateStatus::Acknowledged,
+                clock_tag: None,
+            }),
+        }
     }
 
     /// Forward read-only `scroll_by` to `wrapped_shard`
     async fn scroll_by(
+        &self,
+        _: Arc<ScrollRequestInternal>,
+        _: &Handle,
+        _: Option<Duration>,
+        _: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
+        self.dummy()
+    }
+
+    async fn local_scroll_by_id(
         &self,
         _: Option<ExtendedPointId>,
         _: usize,
@@ -95,7 +139,6 @@ impl ShardOperation for DummyShard {
         _: &WithVector,
         _: Option<&Filter>,
         _: &Handle,
-        _: Option<&OrderBy>,
         _: Option<Duration>,
         _: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
@@ -157,4 +200,6 @@ impl ShardOperation for DummyShard {
     ) -> CollectionResult<FacetResponse> {
         self.dummy()
     }
+
+    async fn stop_gracefully(self) {}
 }

@@ -1,30 +1,22 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use api::rest::schema::ShardKeySelector;
-use api::rest::PointVectors;
+use ahash::AHashMap;
+use api::rest::{PointVectors, ShardKeySelector};
 use schemars::JsonSchema;
 use segment::types::{Filter, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
-use strum::{EnumDiscriminants, EnumIter};
+pub use shard::operations::vector_ops::*;
 use validator::Validate;
 
-use super::point_ops::{PointIdsList, VectorStructPersisted};
-use super::{point_to_shards, split_iter_by_shard, OperationToShard, SplitByShard};
+use super::{OperationToShard, SplitByShard, point_to_shards, split_iter_by_shard};
 use crate::hash_ring::HashRingRouter;
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct PointVectorsPersisted {
-    /// Point id
-    pub id: PointIdType,
-    /// Vectors
-    pub vector: VectorStructPersisted,
-}
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate)]
 pub struct DeleteVectors {
     /// Deletes values from each point in this list
     pub points: Option<Vec<PointIdType>>,
     /// Deletes values from points that satisfy this filter condition
+    #[validate(nested)]
     pub filter: Option<Filter>,
     /// Vector names
     #[serde(alias = "vectors")]
@@ -32,53 +24,6 @@ pub struct DeleteVectors {
     pub vector: HashSet<VectorNameBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct UpdateVectorsOp {
-    /// Points with named vectors
-    pub points: Vec<PointVectorsPersisted>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, EnumDiscriminants)]
-#[strum_discriminants(derive(EnumIter))]
-#[serde(rename_all = "snake_case")]
-pub enum VectorOperations {
-    /// Update vectors
-    UpdateVectors(UpdateVectorsOp),
-    /// Delete vectors if exists
-    DeleteVectors(PointIdsList, Vec<VectorNameBuf>),
-    /// Delete vectors by given filter criteria
-    DeleteVectorsByFilter(Filter, Vec<VectorNameBuf>),
-}
-
-impl VectorOperations {
-    pub fn is_write_operation(&self) -> bool {
-        match self {
-            VectorOperations::UpdateVectors(_) => true,
-            VectorOperations::DeleteVectors(..) => false,
-            VectorOperations::DeleteVectorsByFilter(..) => false,
-        }
-    }
-
-    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
-        match self {
-            Self::UpdateVectors(op) => Some(op.points.iter().map(|point| point.id).collect()),
-            Self::DeleteVectors(points, _) => Some(points.points.clone()),
-            Self::DeleteVectorsByFilter(_, _) => None,
-        }
-    }
-
-    pub fn retain_point_ids<F>(&mut self, filter: F)
-    where
-        F: Fn(&PointIdType) -> bool,
-    {
-        match self {
-            Self::UpdateVectors(op) => op.points.retain(|point| filter(&point.id)),
-            Self::DeleteVectors(points, _) => points.points.retain(filter),
-            Self::DeleteVectorsByFilter(_, _) => (),
-        }
-    }
 }
 
 impl SplitByShard for Vec<PointVectors> {
@@ -90,9 +35,11 @@ impl SplitByShard for Vec<PointVectors> {
 impl SplitByShard for VectorOperations {
     fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match self {
-            VectorOperations::UpdateVectors(update_vectors) => {
-                let shard_points = update_vectors
-                    .points
+            VectorOperations::UpdateVectors(UpdateVectorsOp {
+                points,
+                update_filter,
+            }) => {
+                let shard_points = points
                     .into_iter()
                     .flat_map(|point| {
                         point_to_shards(&point.id, ring)
@@ -100,8 +47,8 @@ impl SplitByShard for VectorOperations {
                             .map(move |shard_id| (shard_id, point.clone()))
                     })
                     .fold(
-                        HashMap::new(),
-                        |mut map: HashMap<u32, Vec<PointVectorsPersisted>>, (shard_id, points)| {
+                        AHashMap::new(),
+                        |mut map: AHashMap<u32, Vec<PointVectorsPersisted>>, (shard_id, points)| {
                             map.entry(shard_id).or_default().push(points);
                             map
                         },
@@ -109,7 +56,10 @@ impl SplitByShard for VectorOperations {
                 let shard_ops = shard_points.into_iter().map(|(shard_id, points)| {
                     (
                         shard_id,
-                        VectorOperations::UpdateVectors(UpdateVectorsOp { points }),
+                        VectorOperations::UpdateVectors(UpdateVectorsOp {
+                            points,
+                            update_filter: update_filter.clone(),
+                        }),
                     )
                 });
                 OperationToShard::by_shard(shard_ops)

@@ -39,6 +39,14 @@ paths:
           schema:
             type: integer
             minimum: 0
+        - name: timeout
+          in: query
+          description: "Timeout for this request"
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 60 #! Keep in sync with DEFAULT_TELEMETRY_TIMEOUT
       responses: #@ response(reference("TelemetryData"))
 
   /metrics:
@@ -55,6 +63,14 @@ paths:
           required: false
           schema:
             type: boolean
+        - name: timeout
+          in: query
+          description: "Timeout for this request"
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 60 #! Keep in sync with DEFAULT_TELEMETRY_TIMEOUT
       responses:
         "200":
           description: Metrics data in Prometheus format
@@ -74,29 +90,6 @@ paths:
                   collections_total 1
         "4XX":
           description: error
-
-  /locks:
-    post:
-      summary: Set lock options
-      description: Set lock options. If write is locked, all write operations and collection creation are forbidden. Returns previous lock options
-      operationId: post_locks
-      tags:
-        - Service
-      requestBody:
-        description: Lock options and optional error message
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/LocksOption"
-      responses: #@ response(reference("LocksOption"))
-
-    get:
-      summary: Get lock options
-      description: Get lock options. If write is locked, all write operations and collection creation are forbidden
-      operationId: get_locks
-      tags:
-        - Service
-      responses: #@ response(reference("LocksOption"))
 
   /healthz:
     get:
@@ -174,12 +167,4 @@ paths:
       operationId: clear_issues
       tags:
         - Beta
-      responses:
-        "200":
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: boolean
-        "4XX":
-          description: error
+      responses: #@ response(type("boolean"))

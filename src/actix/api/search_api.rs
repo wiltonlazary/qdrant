@@ -1,4 +1,4 @@
-use actix_web::{post, web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use api::rest::{SearchMatrixOffsetsResponse, SearchMatrixPairsResponse, SearchMatrixRequest};
 use collection::collection::distance_matrix::CollectionSearchMatrixRequest;
@@ -13,9 +13,9 @@ use storage::content_manager::collection_verification::{
 use storage::dispatcher::Dispatcher;
 use tokio::time::Instant;
 
-use super::read_params::ReadParams;
 use super::CollectionPath;
-use crate::actix::auth::ActixAccess;
+use super::read_params::ReadParams;
+use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{
     get_request_hardware_counter, process_response, process_response_error,
 };
@@ -31,7 +31,7 @@ async fn search_points(
     request: Json<SearchRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let SearchRequest {
         search_request,
@@ -43,7 +43,7 @@ async fn search_points(
         params.timeout_as_secs(),
         &collection.name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -60,17 +60,18 @@ async fn search_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
 
     let timing = Instant::now();
 
     let result = do_core_search_points(
-        dispatcher.toc(&access, &pass),
+        dispatcher.toc(&auth, &pass),
         &collection.name,
         search_request.into(),
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -92,7 +93,7 @@ async fn batch_search_points(
     request: Json<SearchRequestBatch>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let requests = request
         .into_inner()
@@ -118,7 +119,7 @@ async fn batch_search_points(
         params.timeout_as_secs(),
         &collection.name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -130,16 +131,17 @@ async fn batch_search_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
 
     let timing = Instant::now();
 
     let result = do_search_batch_points(
-        dispatcher.toc(&access, &pass),
+        dispatcher.toc(&auth, &pass),
         &collection.name,
         requests,
         params.consistency,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -166,7 +168,7 @@ async fn search_point_groups(
     request: Json<SearchGroupsRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let SearchGroupsRequest {
         search_group_request,
@@ -178,7 +180,7 @@ async fn search_point_groups(
         params.timeout_as_secs(),
         &collection.name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -195,16 +197,17 @@ async fn search_point_groups(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
     let result = do_search_point_groups(
-        dispatcher.toc(&access, &pass),
+        dispatcher.toc(&auth, &pass),
         &collection.name,
         search_group_request,
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -220,7 +223,7 @@ async fn search_points_matrix_pairs(
     request: Json<SearchMatrixRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let SearchMatrixRequest {
         search_request,
@@ -232,7 +235,7 @@ async fn search_points_matrix_pairs(
         params.timeout_as_secs(),
         &collection.name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -249,16 +252,17 @@ async fn search_points_matrix_pairs(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
     let response = do_search_points_matrix(
-        dispatcher.toc(&access, &pass),
+        dispatcher.toc(&auth, &pass),
         &collection.name,
         CollectionSearchMatrixRequest::from(search_request),
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )
@@ -275,7 +279,7 @@ async fn search_points_matrix_offsets(
     request: Json<SearchMatrixRequest>,
     params: Query<ReadParams>,
     service_config: web::Data<ServiceConfig>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let SearchMatrixRequest {
         search_request,
@@ -287,7 +291,7 @@ async fn search_points_matrix_offsets(
         params.timeout_as_secs(),
         &collection.name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await
     {
@@ -304,16 +308,17 @@ async fn search_points_matrix_offsets(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
     let response = do_search_points_matrix(
-        dispatcher.toc(&access, &pass),
+        dispatcher.toc(&auth, &pass),
         &collection.name,
         CollectionSearchMatrixRequest::from(search_request),
         params.consistency,
         shard_selection,
-        access,
+        auth,
         params.timeout(),
         request_hw_counter.get_counter(),
     )

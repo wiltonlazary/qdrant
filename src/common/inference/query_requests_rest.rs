@@ -1,26 +1,41 @@
+use api::rest::models::InferenceUsage;
 use api::rest::schema as rest;
 use collection::lookup::WithLookup;
 use collection::operations::universal_query::collection_query::{
-    CollectionPrefetch, CollectionQueryGroupsRequest, CollectionQueryRequest, Query,
-    VectorInputInternal, VectorQuery,
+    CollectionPrefetch, CollectionQueryGroupsRequest, CollectionQueryRequest, FeedbackInternal,
+    FeedbackStrategy, Mmr, NearestWithMmr, Query, VectorInputInternal, VectorQuery,
 };
+use collection::operations::universal_query::formula::FormulaInternal;
 use collection::operations::universal_query::shard_query::{FusionInternal, SampleInternal};
+use ordered_float::OrderedFloat;
 use segment::data_types::order_by::OrderBy;
-use segment::data_types::vectors::{MultiDenseVectorInternal, VectorInternal, DEFAULT_VECTOR_NAME};
-use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
-use storage::content_manager::errors::StorageError;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal};
+use segment::vector_storage::query::{
+    ContextPair, ContextQuery, DiscoveryQuery, FeedbackItem, RecoQuery,
+};
+use storage::content_manager::errors::{StorageError, StorageResult};
 
 use crate::common::inference::batch_processing::{
     collect_query_groups_request, collect_query_request,
 };
 use crate::common::inference::infer_processing::BatchAccumInferred;
+use crate::common::inference::params::InferenceParams;
 use crate::common::inference::service::{InferenceData, InferenceType};
-use crate::common::inference::InferenceToken;
+
+pub struct CollectionQueryRequestWithUsage {
+    pub request: CollectionQueryRequest,
+    pub usage: Option<InferenceUsage>,
+}
+
+pub struct CollectionQueryGroupsRequestWithUsage {
+    pub request: CollectionQueryGroupsRequest,
+    pub usage: Option<InferenceUsage>,
+}
 
 pub async fn convert_query_groups_request_from_rest(
     request: rest::QueryGroupsRequestInternal,
-    inference_token: InferenceToken,
-) -> Result<CollectionQueryGroupsRequest, StorageError> {
+    inference_params: InferenceParams,
+) -> Result<CollectionQueryGroupsRequestWithUsage, StorageError> {
     let batch = collect_query_groups_request(&request);
     let rest::QueryGroupsRequestInternal {
         prefetch,
@@ -35,8 +50,8 @@ pub async fn convert_query_groups_request_from_rest(
         group_request,
     } = request;
 
-    let inferred =
-        BatchAccumInferred::from_batch_accum(batch, InferenceType::Search, &inference_token)
+    let (inferred, usage) =
+        BatchAccumInferred::from_batch_accum(batch, InferenceType::Search, &inference_params)
             .await?;
     let query = query
         .map(|q| convert_query_with_inferred(q, &inferred))
@@ -52,10 +67,10 @@ pub async fn convert_query_groups_request_from_rest(
         .transpose()?
         .unwrap_or_default();
 
-    Ok(CollectionQueryGroupsRequest {
+    let collection_query_groups_request = CollectionQueryGroupsRequest {
         prefetch,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
+        using: using.unwrap_or_else(|| DEFAULT_VECTOR_NAME.to_owned()),
         filter,
         score_threshold,
         params,
@@ -70,16 +85,23 @@ pub async fn convert_query_groups_request_from_rest(
             .group_size
             .unwrap_or(CollectionQueryRequest::DEFAULT_GROUP_SIZE),
         with_lookup: group_request.with_lookup.map(WithLookup::from),
+    };
+
+    Ok(CollectionQueryGroupsRequestWithUsage {
+        request: collection_query_groups_request,
+        usage,
     })
 }
 
 pub async fn convert_query_request_from_rest(
     request: rest::QueryRequestInternal,
-    inference_token: &InferenceToken,
-) -> Result<CollectionQueryRequest, StorageError> {
+    inference_params: &InferenceParams,
+) -> Result<CollectionQueryRequestWithUsage, StorageError> {
     let batch = collect_query_request(&request);
-    let inferred =
-        BatchAccumInferred::from_batch_accum(batch, InferenceType::Search, inference_token).await?;
+    let (inferred, usage) =
+        BatchAccumInferred::from_batch_accum(batch, InferenceType::Search, inference_params)
+            .await?;
+
     let rest::QueryRequestInternal {
         prefetch,
         query,
@@ -108,10 +130,10 @@ pub async fn convert_query_request_from_rest(
         .map(|q| convert_query_with_inferred(q, &inferred))
         .transpose()?;
 
-    Ok(CollectionQueryRequest {
+    let collection_query_request = CollectionQueryRequest {
         prefetch,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
+        using: using.unwrap_or_else(|| DEFAULT_VECTOR_NAME.to_owned()),
         filter,
         score_threshold,
         limit: limit.unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
@@ -120,6 +142,10 @@ pub async fn convert_query_request_from_rest(
         with_vector: with_vector.unwrap_or(CollectionQueryRequest::DEFAULT_WITH_VECTOR),
         with_payload: with_payload.unwrap_or(CollectionQueryRequest::DEFAULT_WITH_PAYLOAD),
         lookup_from,
+    };
+    Ok(CollectionQueryRequestWithUsage {
+        request: collection_query_request,
+        usage,
     })
 }
 
@@ -171,12 +197,24 @@ fn convert_vector_input_with_inferred(
 fn convert_query_with_inferred(
     query: rest::QueryInterface,
     inferred: &BatchAccumInferred,
-) -> Result<Query, StorageError> {
+) -> StorageResult<Query> {
     let query = rest::Query::from(query);
     match query {
-        rest::Query::Nearest(nearest) => {
-            let vector = convert_vector_input_with_inferred(nearest.nearest, inferred)?;
-            Ok(Query::Vector(VectorQuery::Nearest(vector)))
+        rest::Query::Nearest(rest::NearestQuery { nearest, mmr }) => {
+            let vector = convert_vector_input_with_inferred(nearest, inferred)?;
+
+            if let Some(mmr) = mmr {
+                let mmr = Mmr {
+                    diversity: mmr.diversity,
+                    candidates_limit: mmr.candidates_limit,
+                };
+                Ok(Query::Vector(VectorQuery::NearestWithMmr(NearestWithMmr {
+                    nearest: vector,
+                    mmr,
+                })))
+            } else {
+                Ok(Query::Vector(VectorQuery::Nearest(vector)))
+            }
         }
         rest::Query::Recommend(recommend) => {
             let rest::RecommendInput {
@@ -201,6 +239,9 @@ fn convert_query_with_inferred(
                 )),
                 rest::RecommendStrategy::BestScore => {
                     Ok(Query::Vector(VectorQuery::RecommendBestScore(reco_query)))
+                }
+                rest::RecommendStrategy::SumScores => {
+                    Ok(Query::Vector(VectorQuery::RecommendSumScores(reco_query)))
                 }
             }
         }
@@ -229,7 +270,35 @@ fn convert_query_with_inferred(
         }
         rest::Query::OrderBy(order_by) => Ok(Query::OrderBy(OrderBy::from(order_by.order_by))),
         rest::Query::Fusion(fusion) => Ok(Query::Fusion(FusionInternal::from(fusion.fusion))),
+        rest::Query::Rrf(rrf) => Ok(Query::Fusion(FusionInternal::from(rrf.rrf))),
+        rest::Query::Formula(formula) => Ok(Query::Formula(FormulaInternal::from(formula))),
         rest::Query::Sample(sample) => Ok(Query::Sample(SampleInternal::from(sample.sample))),
+        rest::Query::RelevanceFeedback(relevance_feedback) => {
+            let rest::RelevanceFeedbackInput {
+                target,
+                feedback,
+                strategy,
+            } = relevance_feedback.relevance_feedback;
+
+            let target = convert_vector_input_with_inferred(target, inferred)?;
+            let feedback = feedback
+                .into_iter()
+                .map(|item| {
+                    Ok(FeedbackItem {
+                        vector: convert_vector_input_with_inferred(item.example, inferred)?,
+                        score: item.score.into(),
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+
+            let strategy = FeedbackStrategy::from(strategy);
+
+            Ok(Query::Vector(VectorQuery::Feedback(FeedbackInternal {
+                target,
+                feedback,
+                strategy,
+            })))
+        }
     }
 }
 
@@ -264,9 +333,9 @@ fn convert_prefetch_with_inferred(
     Ok(CollectionPrefetch {
         prefetch: nested_prefetches,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
+        using: using.unwrap_or_else(|| DEFAULT_VECTOR_NAME.to_owned()),
         filter,
-        score_threshold,
+        score_threshold: score_threshold.map(OrderedFloat),
         limit: limit.unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
         params,
         lookup_from,
@@ -372,10 +441,12 @@ mod tests {
 
         let result = convert_vector_input_with_inferred(vector, &inferred);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Missing inferred vector"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing inferred vector"),
+        );
     }
 
     #[test]
@@ -404,6 +475,7 @@ mod tests {
         let inferred = create_test_inferred_batch();
         let nearest = NearestQuery {
             nearest: rest::VectorInput::Document(create_test_document("test")),
+            mmr: None,
         };
         let query = rest::QueryInterface::Query(rest::Query::Nearest(nearest));
 

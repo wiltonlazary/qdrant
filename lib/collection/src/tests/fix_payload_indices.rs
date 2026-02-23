@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
+use common::save_on_disk::SaveOnDisk;
 use segment::types::{PayloadFieldSchema, PayloadSchemaType};
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-use crate::save_on_disk::SaveOnDisk;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::ShardOperation;
 use crate::tests::fixtures::*;
@@ -36,7 +36,7 @@ async fn test_fix_payload_indices() {
         payload_index_schema.clone(),
         current_runtime.clone(),
         current_runtime.clone(),
-        CpuBudget::default(),
+        ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
     .await
@@ -46,26 +46,26 @@ async fn test_fix_payload_indices() {
 
     let upsert_ops = upsert_operation();
     shard
-        .update(upsert_ops.into(), true, hw_acc.clone())
+        .update(upsert_ops.into(), true, None, hw_acc.clone())
         .await
         .unwrap();
 
     // Create payload index in shard locally, not in global collection configuration
     let index_op = create_payload_index_operation();
     shard
-        .update(index_op.into(), true, hw_acc.clone())
+        .update(index_op.into(), true, None, hw_acc.clone())
         .await
         .unwrap();
 
     let delete_point_op = delete_point_operation(4);
     shard
-        .update(delete_point_op.into(), true, hw_acc.clone())
+        .update(delete_point_op.into(), true, None, hw_acc.clone())
         .await
         .unwrap();
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
-    drop(shard);
+    shard.stop_gracefully().await;
 
     payload_index_schema
         .write(|schema| {
@@ -88,9 +88,10 @@ async fn test_fix_payload_indices() {
         config.optimizer_config.clone(),
         Arc::new(Default::default()),
         payload_index_schema,
+        true,
         current_runtime.clone(),
         current_runtime,
-        CpuBudget::default(),
+        ResourceBudget::default(),
     )
     .await
     .unwrap();

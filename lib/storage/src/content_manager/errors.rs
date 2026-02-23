@@ -3,7 +3,8 @@ use std::io::Error as IoError;
 use std::time::Duration;
 
 use collection::operations::types::CollectionError;
-use io::file_operations::FileStorageError;
+use collection::shards::shard::ShardId;
+use common::fs::FileStorageError;
 use tempfile::PersistError;
 use thiserror::Error;
 
@@ -42,56 +43,79 @@ pub enum StorageError {
         description: String,
         retry_after: Option<Duration>,
     },
+    #[error("Shard temporarily unavailable: {description}")]
+    ShardUnavailable { description: String },
+    #[error("Partial snapshot for shard {shard_id} contains no changes")]
+    EmptyPartialSnapshot { shard_id: ShardId },
 }
 
 impl StorageError {
-    pub fn inference_error(description: impl Into<String>) -> StorageError {
-        StorageError::InferenceError {
+    pub fn inference_error(description: impl Into<String>) -> Self {
+        Self::InferenceError {
             description: description.into(),
         }
     }
 
-    pub fn service_error(description: impl Into<String>) -> StorageError {
-        StorageError::ServiceError {
+    pub fn service_error(description: impl Into<String>) -> Self {
+        Self::ServiceError {
             description: description.into(),
             backtrace: Some(Backtrace::force_capture().to_string()),
         }
     }
 
-    pub fn bad_request(description: impl Into<String>) -> StorageError {
-        StorageError::BadRequest {
+    pub fn bad_request(description: impl Into<String>) -> Self {
+        Self::BadRequest {
             description: description.into(),
         }
     }
 
-    pub fn bad_input(description: impl Into<String>) -> StorageError {
-        StorageError::BadInput {
+    pub fn bad_input(description: impl Into<String>) -> Self {
+        Self::BadInput {
             description: description.into(),
         }
     }
 
-    pub fn already_exists(description: impl Into<String>) -> StorageError {
-        StorageError::AlreadyExists {
+    pub fn already_exists(description: impl Into<String>) -> Self {
+        Self::AlreadyExists {
             description: description.into(),
         }
     }
 
-    pub fn not_found(description: impl Into<String>) -> StorageError {
-        StorageError::NotFound {
+    pub fn not_found(description: impl Into<String>) -> Self {
+        Self::NotFound {
             description: description.into(),
         }
     }
 
     pub fn checksum_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
-        StorageError::ChecksumMismatch {
+        Self::ChecksumMismatch {
             expected: expected.into(),
             actual: actual.into(),
         }
     }
 
-    pub fn forbidden(description: impl Into<String>) -> StorageError {
-        StorageError::Forbidden {
+    pub fn forbidden(description: impl Into<String>) -> Self {
+        Self::Forbidden {
             description: description.into(),
+        }
+    }
+
+    pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
+        Self::Timeout {
+            description: format!(
+                "Operation '{}' timed out after {timeout:?}",
+                operation.into(),
+            ),
+        }
+    }
+
+    pub fn rate_limit_exceeded(
+        description: impl Into<String>,
+        retry_after: Option<Duration>,
+    ) -> StorageError {
+        StorageError::RateLimitExceeded {
+            description: description.into(),
+            retry_after,
         }
     }
 
@@ -147,7 +171,7 @@ impl StorageError {
                 description: overriding_description,
                 backtrace: None,
             },
-            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::StrictMode { description } => StorageError::BadRequest { description },
             CollectionError::InferenceError { description } => {
                 StorageError::InferenceError { description }
             }
@@ -157,6 +181,9 @@ impl StorageError {
             } => StorageError::RateLimitExceeded {
                 description,
                 retry_after,
+            },
+            CollectionError::ShardUnavailable { .. } => StorageError::ShardUnavailable {
+                description: overriding_description,
             },
         }
     }
@@ -206,7 +233,7 @@ impl From<CollectionError> for StorageError {
                 description: format!("{err}"),
                 backtrace: None,
             },
-            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::StrictMode { description } => StorageError::BadRequest { description },
             CollectionError::InferenceError { description } => {
                 StorageError::InferenceError { description }
             }
@@ -217,6 +244,9 @@ impl From<CollectionError> for StorageError {
                 description,
                 retry_after,
             },
+            CollectionError::ShardUnavailable { description } => {
+                StorageError::ShardUnavailable { description }
+            }
         }
     }
 }

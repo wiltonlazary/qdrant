@@ -3,40 +3,45 @@ pub mod fixtures;
 mod hw_metrics;
 mod payload;
 mod points_dedup;
+mod query_prefetch_offset_limit;
 mod sha_256_test;
 mod shard_query;
+mod shard_telemetry;
 mod snapshot_test;
 mod sparse_vectors_validation_tests;
 mod wal_recovery_test;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::budget::ResourceBudget;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cpu::CpuBudget;
+use common::save_on_disk::SaveOnDisk;
 use futures::future::join_all;
 use itertools::Itertools;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::Rng;
 use segment::data_types::vectors::only_default_vector;
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::types::{Distance, PointIdType};
+use shard::segment_holder::locked::LockedSegmentHolder;
 use tempfile::Builder;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
-use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection::Collection;
+use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection_manager::fixtures::{
-    get_indexing_optimizer, get_merge_optimizer, random_segment, PointIdGenerator,
+    PointIdGenerator, get_indexing_optimizer, get_merge_optimizer, random_segment,
 };
 use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder, SegmentId};
-use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::collection_manager::optimizers::TrackerStatus;
+use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::config::CollectionParams;
 use crate::operations::types::VectorsConfig;
 use crate::operations::vector_params_builder::VectorParamsBuilder;
-use crate::update_handler::{Optimizer, UpdateHandler};
+use crate::update_handler::Optimizer;
+use crate::update_workers::UpdateWorkers;
 
 #[tokio::test]
 async fn test_optimization_process() {
@@ -68,14 +73,14 @@ async fn test_optimization_process() {
 
     let optimizers_log = Arc::new(Mutex::new(Default::default()));
     let total_optimized_points = Arc::new(AtomicUsize::new(0));
-    let segments: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
-    let handles = UpdateHandler::launch_optimization(
+    let segments = LockedSegmentHolder::new(holder);
+    let handles = UpdateWorkers::launch_optimization(
         optimizers.clone(),
         optimizers_log.clone(),
         total_optimized_points.clone(),
-        &CpuBudget::default(),
+        &ResourceBudget::default(),
         segments.clone(),
-        |_| {},
+        || {},
         None,
     );
 
@@ -102,7 +107,7 @@ async fn test_optimization_process() {
         let log = optimizers_log.lock().to_telemetry();
         assert_eq!(log.len(), expected_optimization_count);
         log.iter().for_each(|entry| {
-            assert!(["indexing", "merge"].contains(&entry.name.as_str()));
+            assert!(["indexing", "merge"].contains(&entry.name));
             assert_eq!(entry.status, TrackerStatus::Done);
         });
     }
@@ -112,13 +117,13 @@ async fn test_optimization_process() {
         assert_eq!(res.unwrap(), Some(true));
     }
 
-    let handles = UpdateHandler::launch_optimization(
+    let handles = UpdateWorkers::launch_optimization(
         optimizers.clone(),
         optimizers_log.clone(),
         total_optimized_points.clone(),
-        &CpuBudget::default(),
+        &ResourceBudget::default(),
         segments.clone(),
-        |_| {},
+        || {},
         None,
     );
 
@@ -168,14 +173,14 @@ async fn test_cancel_optimization() {
 
     let optimizers_log = Arc::new(Mutex::new(Default::default()));
     let total_optimized_points = Arc::new(AtomicUsize::new(0));
-    let segments: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
-    let handles = UpdateHandler::launch_optimization(
+    let segments = LockedSegmentHolder::new(holder);
+    let handles = UpdateWorkers::launch_optimization(
         optimizers.clone(),
         optimizers_log.clone(),
         total_optimized_points.clone(),
-        &CpuBudget::default(),
+        &ResourceBudget::default(),
         segments.clone(),
-        |_| {},
+        || {},
         None,
     );
 
@@ -206,7 +211,7 @@ async fn test_cancel_optimization() {
         };
 
         let log = optimizers_log.lock().to_telemetry();
-        assert_eq!(log.len(), expected_optimization_count);
+        assert!(log.len() <= expected_optimization_count);
         for status in log {
             assert_eq!(status.name, "indexing");
             assert!(matches!(status.status, TrackerStatus::Cancelled(_)));
@@ -237,7 +242,11 @@ async fn test_new_segment_when_all_over_capacity() {
         memmap_threshold_kb: 1_000_000,
         indexing_threshold_kb: 1_000_000,
     };
-    let payload_index_schema = PayloadIndexSchema::default();
+
+    let payload_schema_file = dir.path().join("payload.schema");
+    let payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>> =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_schema_file).unwrap());
+
     let mut holder = SegmentHolder::default();
 
     holder.add_new(random_segment(dir.path(), 100, 3, dim));
@@ -246,29 +255,31 @@ async fn test_new_segment_when_all_over_capacity() {
     holder.add_new(random_segment(dir.path(), 100, 3, dim));
     holder.add_new(random_segment(dir.path(), 100, 3, dim));
 
-    let segments: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
+    let segments = LockedSegmentHolder::new(holder);
 
     // Expect our 5 created segments now
     assert_eq!(segments.read().len(), 5);
 
     // On optimization we expect one new segment to be created, all are over capacity
-    UpdateHandler::ensure_appendable_segment_with_capacity(
+    UpdateWorkers::ensure_appendable_segment_with_capacity(
         &segments,
         dir.path(),
         &collection_params,
+        None,
         &optimizer_thresholds,
-        &payload_index_schema,
+        payload_index_schema.clone(),
     )
     .unwrap();
     assert_eq!(segments.read().len(), 6);
 
     // On reoptimization we don't expect another segment, we have one segment with capacity
-    UpdateHandler::ensure_appendable_segment_with_capacity(
+    UpdateWorkers::ensure_appendable_segment_with_capacity(
         &segments,
         dir.path(),
         &collection_params,
+        None,
         &optimizer_thresholds,
-        &payload_index_schema,
+        payload_index_schema.clone(),
     )
     .unwrap();
 
@@ -308,12 +319,13 @@ async fn test_new_segment_when_all_over_capacity() {
     }
 
     // On reoptimization we expect one more segment to be created, all are over capacity
-    UpdateHandler::ensure_appendable_segment_with_capacity(
+    UpdateWorkers::ensure_appendable_segment_with_capacity(
         &segments,
         dir.path(),
         &collection_params,
+        None,
         &optimizer_thresholds,
-        &payload_index_schema,
+        payload_index_schema,
     )
     .unwrap();
     assert_eq!(segments.read().len(), 7);

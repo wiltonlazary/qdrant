@@ -1,46 +1,38 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use ahash::AHashMap;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
-use segment::entry::entry_point::SegmentEntry;
+use segment::data_types::vectors::{VectorStructInternal, only_default_vector};
+use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
 use segment::json_path::JsonPath;
 use segment::payload_json;
 use segment::types::{ExtendedPointId, PayloadContainer, PointIdType, WithPayload, WithVector};
+use shard::retrieve::record_internal::RecordInternal;
+use shard::retrieve::retrieve_blocking::retrieve_blocking;
+use shard::segment_holder::locked::LockedSegmentHolder;
+use shard::update::{delete_points, set_payload, upsert_points};
 use tempfile::Builder;
 
-use super::holders::proxy_segment;
-use super::segments_updater::delete_points;
-use crate::collection_manager::fixtures::{build_segment_1, build_segment_2, empty_segment};
-use crate::collection_manager::holders::proxy_segment::ProxySegment;
-use crate::collection_manager::holders::segment_holder::{
-    LockedSegment, LockedSegmentHolder, SegmentHolder, SegmentId,
+use crate::collection_manager::fixtures::{
+    TEST_TIMEOUT, build_segment_1, build_segment_2, empty_segment,
 };
-use crate::collection_manager::segments_searcher::SegmentsSearcher;
-use crate::collection_manager::segments_updater::{set_payload, upsert_points};
+use crate::collection_manager::holders::proxy_segment::ProxySegment;
+use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder, SegmentId};
 use crate::operations::point_ops::{PointStructPersisted, VectorStructPersisted};
-use crate::operations::types::RecordInternal;
 
 mod test_search_aggregation;
 
-fn wrap_proxy(segments: LockedSegmentHolder, sid: SegmentId, path: &Path) -> SegmentId {
+fn wrap_proxy(segments: LockedSegmentHolder, sid: SegmentId) -> SegmentId {
     let mut write_segments = segments.write();
-
-    let temp_segment: LockedSegment = empty_segment(path).into();
 
     let optimizing_segment = write_segments.get(sid).unwrap().clone();
 
-    let proxy = ProxySegment::new(
-        optimizing_segment,
-        temp_segment,
-        proxy_segment::LockedRmSet::default(),
-        proxy_segment::LockedIndexChanges::default(),
-    );
+    let proxy = ProxySegment::new(optimizing_segment);
 
     let (new_id, _replaced_segments) = write_segments.swap_new(proxy, &[sid]);
     new_id
@@ -59,11 +51,11 @@ fn test_update_proxy_segments() {
     let sid1 = holder.add_new(segment1);
     let _sid2 = holder.add_new(segment2);
 
-    let segments = Arc::new(RwLock::new(holder));
+    let segments = LockedSegmentHolder::new(holder);
 
-    let _proxy_id = wrap_proxy(segments.clone(), sid1, dir.path());
+    let _proxy_id = wrap_proxy(segments.clone(), sid1);
 
-    let vectors = vec![
+    let vectors = [
         only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
         only_default_vector(&[0.0, 0.0, 0.0, 0.0]),
     ];
@@ -114,11 +106,11 @@ fn test_move_points_to_copy_on_write() {
     let mut holder = SegmentHolder::default();
 
     let sid1 = holder.add_new(segment1);
-    let _sid2 = holder.add_new(segment2);
+    let sid2 = holder.add_new(segment2);
 
-    let segments = Arc::new(RwLock::new(holder));
+    let segments = LockedSegmentHolder::new(holder);
 
-    let proxy_id = wrap_proxy(segments.clone(), sid1, dir.path());
+    let proxy_id = wrap_proxy(segments.clone(), sid1);
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -135,6 +127,8 @@ fn test_move_points_to_copy_on_write() {
         },
     ];
 
+    // Points should be marked as deleted in proxy segment
+    // and moved to another appendable segment (segment2)
     upsert_points(&segments.read(), 1001, &points, &hw_counter).unwrap();
 
     let points = vec![
@@ -161,33 +155,33 @@ fn test_move_points_to_copy_on_write() {
 
     let read_proxy = locked_proxy.read();
 
-    let copy_on_write_segment = match read_proxy.write_segment.clone() {
-        LockedSegment::Original(locked_segment) => locked_segment,
-        LockedSegment::Proxy(_) => panic!("wrong type"),
-    };
+    let num_deleted_points_in_proxy = read_proxy.deleted_point_count();
 
-    let copy_on_write_segment_read = copy_on_write_segment.read();
+    assert_eq!(
+        num_deleted_points_in_proxy, 3,
+        "3 points should be deleted in proxy"
+    );
 
-    let copy_on_write_points = copy_on_write_segment_read.iter_points().collect_vec();
+    // Copy-on-write segment should contain all 3 points
 
-    let id_mapper = copy_on_write_segment_read.id_tracker.clone();
+    let cow_segment = segments_write.get(sid2).unwrap();
 
-    eprintln!("copy_on_write_points = {copy_on_write_points:#?}");
+    let cow_segment_read = cow_segment.get().read();
 
-    for idx in copy_on_write_points {
-        let internal = id_mapper.borrow().internal_id(idx).unwrap();
-        eprintln!("{idx} -> {internal}");
-    }
+    let cow_points: HashSet<_> = cow_segment_read.iter_points().collect();
 
-    let id_tracker = copy_on_write_segment_read.id_tracker.clone();
-    let internal_ids = id_tracker.borrow().iter_ids().collect_vec();
-
-    eprintln!("internal_ids = {internal_ids:#?}");
-
-    for idx in internal_ids {
-        let external = id_mapper.borrow().external_id(idx).unwrap();
-        eprintln!("{idx} -> {external}");
-    }
+    assert!(
+        cow_points.contains(&1.into()),
+        "Point 1 should be in copy-on-write segment"
+    );
+    assert!(
+        cow_points.contains(&2.into()),
+        "Point 2 should be in copy-on-write segment"
+    );
+    assert!(
+        cow_points.contains(&3.into()),
+        "Point 3 should be in copy-on-write segment"
+    );
 }
 
 #[test]
@@ -241,8 +235,8 @@ fn test_upsert_points_in_smallest_segment() {
 
     // Segment 1 and 2 are over capacity, we expect to have the new points in segment 3
     {
-        let segment3 = segments.read().get(sid3).unwrap().get();
-        let segment3_read = segment3.read();
+        let segment3 = segments.read();
+        let segment3_read = segment3.get(sid3).unwrap().get().read();
         for point_id in 1000..1010 {
             assert!(segment3_read.has_point(point_id.into()));
         }
@@ -289,21 +283,22 @@ fn test_delete_all_point_versions() {
     let mut holder = SegmentHolder::default();
     let sid1 = holder.add_new(segment1);
     let sid2 = holder.add_new(segment2);
-    let segments = Arc::new(RwLock::new(holder));
+    let segments = LockedSegmentHolder::new(holder);
 
     // We should be able to retrieve point 123
-    let retrieved = SegmentsSearcher::retrieve_blocking(
+    let retrieved = retrieve_blocking(
         segments.clone(),
         &[point_id],
         &WithPayload::from(false),
         &WithVector::from(true),
+        TEST_TIMEOUT,
         &AtomicBool::new(false),
         HwMeasurementAcc::new(),
     )
     .unwrap();
     assert_eq!(
         retrieved,
-        HashMap::from([(
+        AHashMap::from([(
             point_id,
             RecordInternal {
                 id: point_id,
@@ -337,11 +332,12 @@ fn test_delete_all_point_versions() {
 
     // We must not be able to retrieve point 123
     // Note: before the bug fix we could retrieve the point again from segment 1
-    let retrieved = SegmentsSearcher::retrieve_blocking(
+    let retrieved = retrieve_blocking(
         segments.clone(),
         &[point_id],
         &WithPayload::from(false),
         &WithVector::from(false),
+        TEST_TIMEOUT,
         &AtomicBool::new(false),
         HwMeasurementAcc::new(),
     )
@@ -365,6 +361,7 @@ fn test_proxy_shared_updates() {
     let old_payload = payload_json! {"size": vec!["small"]};
     let new_payload = payload_json! {"size": vec!["big"]};
 
+    // Appendable segment that should serve as a copy-on-write segment for both proxies
     let write_segment = LockedSegment::new(empty_segment(dir.path()));
 
     let idx1 = PointIdType::from(1);
@@ -398,30 +395,18 @@ fn test_proxy_shared_updates() {
         .set_payload(10, idx2, &old_payload, &None, &hw_counter)
         .unwrap();
 
-    let deleted_points = proxy_segment::LockedRmSet::default();
-    let changed_indexes = proxy_segment::LockedIndexChanges::default();
-
     let locked_segment_1 = LockedSegment::new(segment1);
     let locked_segment_2 = LockedSegment::new(segment2);
 
-    let proxy_segment_1 = ProxySegment::new(
-        locked_segment_1,
-        write_segment.clone(),
-        Arc::clone(&deleted_points),
-        Arc::clone(&changed_indexes),
-    );
+    let proxy_segment_1 = ProxySegment::new(locked_segment_1);
 
-    let proxy_segment_2 = ProxySegment::new(
-        locked_segment_2,
-        write_segment.clone(),
-        deleted_points,
-        changed_indexes,
-    );
+    let proxy_segment_2 = ProxySegment::new(locked_segment_2);
 
     let mut holder = SegmentHolder::default();
 
     let proxy_1_id = holder.add_new(proxy_segment_1);
     let proxy_2_id = holder.add_new(proxy_segment_2);
+    let write_segment_id = holder.add_new(write_segment);
 
     let payload = payload_json! {"color": vec!["yellow"]};
 
@@ -431,32 +416,45 @@ fn test_proxy_shared_updates() {
 
     // Points should still be accessible in both proxies through write segment
     for &point_id in &ids {
-        assert!(holder
-            .get(proxy_1_id)
-            .unwrap()
-            .get()
-            .read()
-            .has_point(point_id));
-        assert!(holder
-            .get(proxy_2_id)
-            .unwrap()
-            .get()
-            .read()
-            .has_point(point_id));
+        assert!(
+            !holder
+                .get(proxy_1_id)
+                .unwrap()
+                .get()
+                .read()
+                .has_point(point_id),
+        );
+        assert!(
+            !holder
+                .get(proxy_2_id)
+                .unwrap()
+                .get()
+                .read()
+                .has_point(point_id),
+        );
+        assert!(
+            holder
+                .get(write_segment_id)
+                .unwrap()
+                .get()
+                .read()
+                .has_point(point_id),
+        );
     }
 
-    let locked_holder = Arc::new(RwLock::new(holder));
+    let locked_holder = LockedSegmentHolder::new(holder);
 
     let is_stopped = AtomicBool::new(false);
 
     let with_payload = WithPayload::from(true);
     let with_vector = WithVector::from(true);
 
-    let result = SegmentsSearcher::retrieve_blocking(
+    let result = retrieve_blocking(
         locked_holder.clone(),
         &ids,
         &with_payload,
         &with_vector,
+        TEST_TIMEOUT,
         &is_stopped,
         HwMeasurementAcc::new(),
     )
@@ -533,30 +531,18 @@ fn test_proxy_shared_updates_same_version() {
         .set_payload(10, idx2, &old_payload, &None, &hw_counter)
         .unwrap();
 
-    let deleted_points = proxy_segment::LockedRmSet::default();
-    let changed_indexes = proxy_segment::LockedIndexChanges::default();
-
     let locked_segment_1 = LockedSegment::new(segment1);
     let locked_segment_2 = LockedSegment::new(segment2);
 
-    let proxy_segment_1 = ProxySegment::new(
-        locked_segment_1,
-        write_segment.clone(),
-        Arc::clone(&deleted_points),
-        Arc::clone(&changed_indexes),
-    );
+    let proxy_segment_1 = ProxySegment::new(locked_segment_1);
 
-    let proxy_segment_2 = ProxySegment::new(
-        locked_segment_2,
-        write_segment.clone(),
-        deleted_points,
-        changed_indexes,
-    );
+    let proxy_segment_2 = ProxySegment::new(locked_segment_2);
 
     let mut holder = SegmentHolder::default();
 
     let proxy_1_id = holder.add_new(proxy_segment_1);
     let proxy_2_id = holder.add_new(proxy_segment_2);
+    let write_segment_id = holder.add_new(write_segment);
 
     let payload = payload_json! {"color": "yellow"};
 
@@ -566,32 +552,45 @@ fn test_proxy_shared_updates_same_version() {
 
     // Points should still be accessible in both proxies through write segment
     for &point_id in &ids {
-        assert!(holder
-            .get(proxy_1_id)
-            .unwrap()
-            .get()
-            .read()
-            .has_point(point_id));
-        assert!(holder
-            .get(proxy_2_id)
-            .unwrap()
-            .get()
-            .read()
-            .has_point(point_id));
+        assert!(
+            !holder
+                .get(proxy_1_id)
+                .unwrap()
+                .get()
+                .read()
+                .has_point(point_id),
+        );
+        assert!(
+            !holder
+                .get(proxy_2_id)
+                .unwrap()
+                .get()
+                .read()
+                .has_point(point_id),
+        );
+        assert!(
+            holder
+                .get(write_segment_id)
+                .unwrap()
+                .get()
+                .read()
+                .has_point(point_id),
+        );
     }
 
-    let locked_holder = Arc::new(RwLock::new(holder));
+    let locked_holder = LockedSegmentHolder::new(holder);
 
     let is_stopped = AtomicBool::new(false);
 
     let with_payload = WithPayload::from(true);
     let with_vector = WithVector::from(true);
 
-    let result = SegmentsSearcher::retrieve_blocking(
+    let result = retrieve_blocking(
         locked_holder.clone(),
         &ids,
         &with_payload,
         &with_vector,
+        TEST_TIMEOUT,
         &is_stopped,
         HwMeasurementAcc::new(),
     )

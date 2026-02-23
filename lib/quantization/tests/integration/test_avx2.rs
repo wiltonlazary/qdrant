@@ -3,14 +3,17 @@
 mod tests {
     use std::sync::atomic::AtomicBool;
 
+    use quantization::encoded_storage::{TestEncodedStorage, TestEncodedStorageBuilder};
     use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-    use quantization::encoded_vectors_u8::EncodedVectorsU8;
+    use quantization::encoded_vectors_u8::{EncodedVectorsU8, ScalarQuantizationMethod};
     use rand::{Rng, SeedableRng};
+    use rstest::rstest;
 
     use crate::metrics::{dot_similarity, l1_similarity, l2_similarity};
 
-    #[test]
-    fn test_dot_avx() {
+    #[rstest]
+    #[case(ScalarQuantizationMethod::Int8)]
+    fn test_dot_avx(#[case] method: ScalarQuantizationMethod) {
         let vectors_count = 129;
         let vector_dim = 65;
         let error = vector_dim as f32 * 0.1;
@@ -23,15 +26,21 @@ mod tests {
         }
         let query: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
 
+        let vector_parameters = VectorParameters {
+            dim: vector_dim,
+            deprecated_count: None,
+            distance_type: DistanceType::Dot,
+            invert: false,
+        };
+        let quantized_vector_size =
+            EncodedVectorsU8::<TestEncodedStorage>::get_quantized_vector_size(&vector_parameters);
         let encoded = EncodedVectorsU8::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
-            &VectorParameters {
-                dim: vector_dim,
-                count: vectors_count,
-                distance_type: DistanceType::Dot,
-                invert: false,
-            },
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
+            &vector_parameters,
+            vectors_count,
+            None,
+            method,
             None,
             &AtomicBool::new(false),
         )
@@ -39,14 +48,16 @@ mod tests {
         let query_u8 = encoded.encode_query(&query);
 
         for (index, vector) in vector_data.iter().enumerate() {
-            let score = encoded.score_point_avx(&query_u8, index as u32);
+            let quantized_vector = encoded.get_quantized_vector(index as u32);
+            let score = encoded.score_point_avx(&query_u8, quantized_vector);
             let orginal_score = dot_similarity(&query, vector);
             assert!((score - orginal_score).abs() < error);
         }
     }
 
-    #[test]
-    fn test_l2_avx() {
+    #[rstest]
+    #[case(ScalarQuantizationMethod::Int8)]
+    fn test_l2_avx(#[case] method: ScalarQuantizationMethod) {
         let vectors_count = 129;
         let vector_dim = 65;
         let error = vector_dim as f32 * 0.1;
@@ -59,15 +70,21 @@ mod tests {
         }
         let query: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
 
+        let vector_parameters = VectorParameters {
+            dim: vector_dim,
+            deprecated_count: None,
+            distance_type: DistanceType::L2,
+            invert: false,
+        };
+        let quantized_vector_size =
+            EncodedVectorsU8::<TestEncodedStorage>::get_quantized_vector_size(&vector_parameters);
         let encoded = EncodedVectorsU8::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
-            &VectorParameters {
-                dim: vector_dim,
-                count: vectors_count,
-                distance_type: DistanceType::L2,
-                invert: false,
-            },
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
+            &vector_parameters,
+            vectors_count,
+            None,
+            method,
             None,
             &AtomicBool::new(false),
         )
@@ -75,14 +92,16 @@ mod tests {
         let query_u8 = encoded.encode_query(&query);
 
         for (index, vector) in vector_data.iter().enumerate() {
-            let score = encoded.score_point_avx(&query_u8, index as u32);
+            let quantized_vector = encoded.get_quantized_vector(index as u32);
+            let score = encoded.score_point_avx(&query_u8, quantized_vector);
             let orginal_score = l2_similarity(&query, vector);
             assert!((score - orginal_score).abs() < error);
         }
     }
 
-    #[test]
-    fn test_l1_avx() {
+    #[rstest]
+    #[case(ScalarQuantizationMethod::Int8)]
+    fn test_l1_avx(#[case] method: ScalarQuantizationMethod) {
         let vectors_count = 129;
         let vector_dim = 65;
         let error = vector_dim as f32 * 0.1;
@@ -99,15 +118,21 @@ mod tests {
             .map(|_| rng.random_range(-1.0..=1.0))
             .collect();
 
+        let vector_parameters = VectorParameters {
+            dim: vector_dim,
+            deprecated_count: None,
+            distance_type: DistanceType::L1,
+            invert: false,
+        };
+        let quantized_vector_size =
+            EncodedVectorsU8::<TestEncodedStorage>::get_quantized_vector_size(&vector_parameters);
         let encoded = EncodedVectorsU8::encode(
             vector_data.iter(),
-            Vec::<u8>::new(),
-            &VectorParameters {
-                dim: vector_dim,
-                count: vectors_count,
-                distance_type: DistanceType::L1,
-                invert: false,
-            },
+            TestEncodedStorageBuilder::new(None, quantized_vector_size),
+            &vector_parameters,
+            vectors_count,
+            None,
+            method,
             None,
             &AtomicBool::new(false),
         )
@@ -115,7 +140,8 @@ mod tests {
         let query_u8 = encoded.encode_query(&query);
 
         for (index, vector) in vector_data.iter().enumerate() {
-            let score = encoded.score_point_avx(&query_u8, index as u32);
+            let quantized_vector = encoded.get_quantized_vector(index as u32);
+            let score = encoded.score_point_avx(&query_u8, quantized_vector);
             let orginal_score = l1_similarity(&query, vector);
             assert!((score - orginal_score).abs() < error);
         }

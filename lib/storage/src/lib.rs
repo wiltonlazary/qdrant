@@ -10,6 +10,8 @@ use content_manager::errors::StorageError;
 use content_manager::toc::TableOfContent;
 use types::ClusterStatus;
 
+pub mod audit;
+mod common;
 pub mod content_manager;
 pub mod dispatcher;
 pub mod issues_subscribers;
@@ -20,7 +22,7 @@ pub mod serialize_peer_addresses {
     use std::collections::HashMap;
 
     use itertools::Itertools;
-    use serde::{self, de, Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{self, Deserialize, Deserializer, Serialize, Serializer, de};
 
     use crate::types::PeerAddressById;
 

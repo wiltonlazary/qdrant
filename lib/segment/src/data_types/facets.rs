@@ -1,6 +1,8 @@
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::hash::Hash;
 
+use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -9,12 +11,13 @@ use validator::Validate;
 use crate::json_path::JsonPath;
 use crate::types::{Filter, IntPayloadType, UuidIntType, ValueVariants};
 
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize, Validate)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize, Validate, Hash)]
 pub struct FacetParams {
     pub key: JsonPath,
 
     #[validate(range(min = 1))]
     pub limit: usize,
+    #[validate(nested)]
     pub filter: Option<Filter>,
     #[serde(default)]
     pub exact: bool,
@@ -86,8 +89,24 @@ pub struct FacetHit<T: FacetValueTrait> {
     pub count: usize,
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct FacetResponse {
     pub hits: Vec<FacetValueHit>,
+}
+
+impl FacetResponse {
+    /// Convert a count map to top `limit` hits sorted by count descending.
+    ///
+    /// Shared utility used by Edge and Collection facet implementations.
+    pub fn top_hits(counts: HashMap<FacetValue, usize>, limit: usize) -> Self {
+        let hits = counts
+            .into_iter()
+            .map(|(value, count)| FacetValueHit { value, count })
+            .k_largest(limit)
+            .collect();
+
+        Self { hits }
+    }
 }
 
 impl<T: FacetValueTrait> Ord for FacetHit<T> {

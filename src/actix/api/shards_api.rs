@@ -1,19 +1,35 @@
-use actix_web::{post, put, web, Responder};
+use actix_web::{Responder, get, post, put, web};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::cluster_ops::{
     ClusterOperations, CreateShardingKey, CreateShardingKeyOperation, DropShardingKey,
     DropShardingKeyOperation,
 };
+use collection::operations::verification::new_unchecked_verification_pass;
 use storage::dispatcher::Dispatcher;
 use tokio::time::Instant;
 
-use crate::actix::api::collections_api::WaitTimeout;
 use crate::actix::api::CollectionPath;
-use crate::actix::auth::ActixAccess;
-use crate::actix::helpers::process_response;
-use crate::common::collections::do_update_collection_cluster;
+use crate::actix::api::collections_api::WaitTimeout;
+use crate::actix::auth::ActixAuth;
+use crate::actix::helpers::{self, process_response};
+use crate::common::collections::{do_get_collection_shard_keys, do_update_collection_cluster};
 
-// ToDo: introduce API for listing shard keys
+#[get("/collections/{name}/shards")]
+async fn list_shard_keys(
+    dispatcher: web::Data<Dispatcher>,
+    collection: Path<CollectionPath>,
+    ActixAuth(auth): ActixAuth,
+) -> impl Responder {
+    // No strict-mode checks to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_get_collection_shard_keys(
+        dispatcher.toc(&auth, &pass),
+        &auth,
+        &collection.name,
+    ))
+    .await
+}
 
 #[put("/collections/{name}/shards")]
 async fn create_shard_key(
@@ -21,7 +37,7 @@ async fn create_shard_key(
     collection: Path<CollectionPath>,
     request: Json<CreateShardingKey>,
     Query(query): Query<WaitTimeout>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let timing = Instant::now();
     let wait_timeout = query.timeout();
@@ -37,7 +53,7 @@ async fn create_shard_key(
         &dispatcher,
         collection.name.clone(),
         operation,
-        access,
+        auth,
         wait_timeout,
     )
     .await;
@@ -51,7 +67,7 @@ async fn delete_shard_key(
     collection: Path<CollectionPath>,
     request: Json<DropShardingKey>,
     Query(query): Query<WaitTimeout>,
-    ActixAccess(access): ActixAccess,
+    ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
     let timing = Instant::now();
     let wait_timeout = query.timeout();
@@ -67,7 +83,7 @@ async fn delete_shard_key(
         &dispatcher,
         collection.name.clone(),
         operation,
-        access,
+        auth,
         wait_timeout,
     )
     .await;
@@ -76,5 +92,7 @@ async fn delete_shard_key(
 }
 
 pub fn config_shards_api(cfg: &mut web::ServiceConfig) {
-    cfg.service(create_shard_key).service(delete_shard_key);
+    cfg.service(list_shard_keys)
+        .service(create_shard_key)
+        .service(delete_shard_key);
 }

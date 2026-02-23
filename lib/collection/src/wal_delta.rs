@@ -1,15 +1,14 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use parking_lot::{Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
+use shard::wal::{SerdeWal, WalRawRecord};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::operations::{ClockTag, OperationWithClockTag};
 use crate::shards::local_shard::clock_map::{ClockMap, RecoveryPoint};
-use crate::wal::SerdeWal;
 
-pub type LockedWal = Arc<ParkingMutex<SerdeWal<OperationWithClockTag>>>;
+pub(crate) type LockedWal = Arc<Mutex<SerdeWal<OperationWithClockTag>>>;
 
 /// A WAL that is recoverable, with operations having clock tags and a corresponding clock map.
 pub struct RecoverableWal {
@@ -33,27 +32,25 @@ pub struct RecoverableWal {
 impl RecoverableWal {
     pub fn new(
         wal: LockedWal,
-        highest_clocks: Arc<Mutex<ClockMap>>,
-        cutoff_clocks: Arc<Mutex<ClockMap>>,
+        newest_clocks: Arc<Mutex<ClockMap>>,
+        oldest_clocks: Arc<Mutex<ClockMap>>,
     ) -> Self {
         Self {
             wal,
-            newest_clocks: highest_clocks,
-            oldest_clocks: cutoff_clocks,
+            newest_clocks,
+            oldest_clocks,
         }
     }
 
-    // TODO: More meaningful method name and documentation
-    //
     /// Write a record to the WAL, guarantee durability.
     ///
     /// On success, this returns the WAL record number of the written operation along with a WAL
     /// lock guard.
     #[must_use = "returned record number and WAL lock must be used carefully"]
-    pub async fn lock_and_write<'a>(
-        &'a self,
+    pub async fn lock_and_write(
+        &self,
         operation: &mut OperationWithClockTag,
-    ) -> crate::wal::Result<(u64, ParkingMutexGuard<'a, SerdeWal<OperationWithClockTag>>)> {
+    ) -> shard::wal::Result<(u64, OwnedMutexGuard<SerdeWal<OperationWithClockTag>>)> {
         // Update last seen clock map and correct clock tag if necessary
         if let Some(clock_tag) = &mut operation.clock_tag {
             let operation_accepted = self
@@ -63,13 +60,41 @@ impl RecoverableWal {
                 .advance_clock_and_correct_tag(clock_tag);
 
             if !operation_accepted {
-                return Err(crate::wal::WalError::ClockRejected);
+                return Err(shard::wal::WalError::ClockRejected);
             }
         }
 
+        let record = WalRawRecord::new(operation)?;
+
         // Write operation to WAL
-        let mut wal_lock = self.wal.lock();
-        wal_lock.write(operation).map(|op_num| (op_num, wal_lock))
+        let mut wal_lock = Mutex::lock_owned(self.wal.clone()).await;
+        wal_lock.write(&record).map(|op_num| (op_num, wal_lock))
+    }
+
+    /// Take clocks snapshot because we deactivated our replica
+    ///
+    /// Does nothing if a snapshot already existed. Returns `true` if a snapshot was taken.
+    ///
+    /// When doing a WAL delta recovery transfer, the recovery point is sourced from the latest
+    /// seen snapshot if it exists. This way we prevent skipping operations if the regular latest
+    /// clock tags were bumped during a different transfer that was not finished.
+    ///
+    /// See: <https://github.com/qdrant/qdrant/pull/7787>
+    pub async fn take_newest_clocks_snapshot(&self) -> bool {
+        self.newest_clocks.lock().await.take_snapshot()
+    }
+
+    /// Clear any clocks snapshot because we activated our replica
+    ///
+    /// Returns `true` if a snapshot was cleared.
+    ///
+    /// When doing a WAL delta recovery transfer, the recovery point is sourced from the latest
+    /// seen snapshot if it exists. This way we prevent skipping operations if the regular latest
+    /// clock tags were bumped during a different transfer that was not finished.
+    ///
+    /// See: <https://github.com/qdrant/qdrant/pull/7787>
+    pub async fn clear_newest_clocks_snapshot(&self) -> bool {
+        self.newest_clocks.lock().await.clear_snapshot()
     }
 
     /// Update the cutoff clock map based on the given recovery point
@@ -96,7 +121,9 @@ impl RecoverableWal {
         }
     }
 
-    /// Get a recovery point for this WAL.
+    /// Get a recovery point for this WAL
+    ///
+    /// Uses newest clocks snapshot if set, otherwise uses newest clocks.
     pub async fn recovery_point(&self) -> RecoveryPoint {
         self.newest_clocks.lock().await.to_recovery_point()
     }
@@ -112,6 +139,7 @@ impl RecoverableWal {
         resolve_wal_delta(
             self.wal
                 .lock()
+                .await
                 .read_all(true)
                 .map(|(op_num, op)| (op_num, op.clock_tag)),
             recovery_point,
@@ -120,8 +148,8 @@ impl RecoverableWal {
         )
     }
 
-    pub fn wal_version(&self) -> Result<Option<u64>, WalDeltaError> {
-        let wal = self.wal.lock();
+    pub async fn wal_version(&self) -> Result<Option<u64>, WalDeltaError> {
+        let wal = self.wal.lock().await;
         if wal.is_empty() {
             Ok(None)
         } else {
@@ -131,10 +159,11 @@ impl RecoverableWal {
 
     /// Append records to this WAL from `other`, starting at operation `append_from` in `other`.
     #[cfg(test)]
-    pub async fn append_from(&self, other: &Self, append_from: u64) -> crate::wal::Result<()> {
+    pub async fn append_from(&self, other: &Self, append_from: u64) -> shard::wal::Result<()> {
         let mut operations = other
             .wal
             .lock()
+            .await
             .read(append_from)
             .map(|(_, op)| op)
             .collect::<Vec<_>>();
@@ -142,6 +171,14 @@ impl RecoverableWal {
             let (_, _) = self.lock_and_write(update).await?;
         }
         Ok(())
+    }
+
+    pub async fn set_extended_retention(&self) {
+        self.wal.lock().await.set_extended_retention();
+    }
+
+    pub async fn set_normal_retention(&self) {
+        self.wal.lock().await.set_normal_retention();
     }
 }
 
@@ -260,16 +297,17 @@ pub enum WalDeltaError {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::num::NonZeroUsize;
     use std::ops::Range;
     use std::sync::Arc;
 
-    use parking_lot::Mutex as ParkingMutex;
     use rand::prelude::SliceRandom;
     use rand::rngs::StdRng;
     use rand::seq::IndexedRandom;
     use rand::{Rng, SeedableRng};
     use rstest::rstest;
     use segment::data_types::vectors::VectorStructInternal;
+    use shard::wal::SerdeWal;
     use tempfile::{Builder, TempDir};
     use wal::WalOptions;
 
@@ -280,18 +318,18 @@ mod tests {
     use crate::operations::{ClockTag, CollectionUpdateOperations, OperationWithClockTag};
     use crate::shards::local_shard::clock_map::{ClockMap, RecoveryPoint};
     use crate::shards::replica_set::clock_set::ClockSet;
-    use crate::wal::SerdeWal;
 
     fn fixture_empty_wal() -> (RecoverableWal, TempDir) {
         let dir = Builder::new().prefix("wal_test").tempdir().unwrap();
         let options = WalOptions {
             segment_capacity: 1024 * 1024,
             segment_queue_len: 0,
+            retain_closed: NonZeroUsize::new(1).unwrap(),
         };
-        let wal = SerdeWal::new(dir.path().to_str().unwrap(), options).unwrap();
+        let wal = SerdeWal::new(dir.path(), options).unwrap();
         (
             RecoverableWal::new(
-                Arc::new(ParkingMutex::new(wal)),
+                Arc::new(Mutex::new(wal)),
                 Arc::new(Mutex::new(ClockMap::default())),
                 Arc::new(Mutex::new(ClockMap::default())),
             ),
@@ -321,10 +359,10 @@ mod tests {
 
         // Create clock set for peer A, start first clock from 1
         let mut a_clock_set = ClockSet::new();
-        a_clock_set.get_clock().advance_to(0);
+        a_clock_set.get_clock().unwrap().advance_to(0);
 
         // Create operation on peer A
-        let mut a_clock_0 = a_clock_set.get_clock();
+        let mut a_clock_0 = a_clock_set.get_clock().unwrap();
         let clock_tick = a_clock_0.tick_once();
         let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
         let bare_operation = mock_operation(1);
@@ -343,7 +381,7 @@ mod tests {
         drop(a_clock_0);
 
         // Create operation on peer A
-        let mut a_clock_0 = a_clock_set.get_clock();
+        let mut a_clock_0 = a_clock_set.get_clock().unwrap();
         let clock_tick = a_clock_0.tick_once();
         let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
         let bare_operation = mock_operation(2);
@@ -377,7 +415,7 @@ mod tests {
         assert_eq!(delta_from, 1);
 
         // Diff should have 1 operation, as C missed just one
-        assert_eq!(b_wal.wal.lock().read(delta_from).count(), 1);
+        assert_eq!(b_wal.wal.lock().await.read(delta_from).count(), 1);
 
         // Recover WAL on node C by writing delta from node B to it
         c_wal.append_from(&b_wal, delta_from).await.unwrap();
@@ -386,9 +424,10 @@ mod tests {
         a_wal
             .wal
             .lock()
+            .await
             .read(0)
-            .zip(b_wal.wal.lock().read(0))
-            .zip(c_wal.wal.lock().read(0))
+            .zip(b_wal.wal.lock().await.read(0))
+            .zip(c_wal.wal.lock().await.read(0))
             .for_each(|((a, b), c)| {
                 assert_eq!(a, b);
                 assert_eq!(b, c);
@@ -418,11 +457,11 @@ mod tests {
 
         // Create clock set for peer A, start first clock from 1
         let mut a_clock_set = ClockSet::new();
-        a_clock_set.get_clock().advance_to(0);
+        a_clock_set.get_clock().unwrap().advance_to(0);
 
         // Create N operations on peer A
         for n in 0..N {
-            let mut a_clock_0 = a_clock_set.get_clock();
+            let mut a_clock_0 = a_clock_set.get_clock().unwrap();
             let clock_tick = a_clock_0.tick_once();
             let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
             let bare_operation = mock_operation((1 + n) as u64);
@@ -443,7 +482,7 @@ mod tests {
         // Introduce a gap in the clocks on A
         if with_gap {
             for _ in 0..GAP_SIZE {
-                let mut a_clock_0 = a_clock_set.get_clock();
+                let mut a_clock_0 = a_clock_set.get_clock().unwrap();
                 let clock_tick = a_clock_0.tick_once();
                 a_clock_0.advance_to(clock_tick);
             }
@@ -451,7 +490,7 @@ mod tests {
 
         // Create N operations on peer A, which are missed on node C
         for n in 0..N {
-            let mut a_clock_0 = a_clock_set.get_clock();
+            let mut a_clock_0 = a_clock_set.get_clock().unwrap();
             let clock_tick = a_clock_0.tick_once();
             let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
             let bare_operation = mock_operation((1 + N + n) as u64);
@@ -485,7 +524,7 @@ mod tests {
         assert_eq!(delta_from, N as u64);
 
         // Diff should have N operation, as C missed just N of them
-        assert_eq!(b_wal.wal.lock().read(delta_from).count(), N);
+        assert_eq!(b_wal.wal.lock().await.read(delta_from).count(), N);
 
         // Recover WAL on node C by writing delta from node B to it
         c_wal.append_from(&b_wal, delta_from).await.unwrap();
@@ -494,9 +533,10 @@ mod tests {
         a_wal
             .wal
             .lock()
+            .await
             .read(0)
-            .zip(b_wal.wal.lock().read(0))
-            .zip(c_wal.wal.lock().read(0))
+            .zip(b_wal.wal.lock().await.read(0))
+            .zip(c_wal.wal.lock().await.read(0))
             .for_each(|((a, b), c)| {
                 assert_eq!(a, b);
                 assert_eq!(b, c);
@@ -522,11 +562,11 @@ mod tests {
 
         // Create clock set for peer A, start first clock from 1
         let mut a_clock_set = ClockSet::new();
-        a_clock_set.get_clock().advance_to(0);
+        a_clock_set.get_clock().unwrap().advance_to(0);
 
         // Create N operations on peer A
         for i in 0..N {
-            let mut a_clock_0 = a_clock_set.get_clock();
+            let mut a_clock_0 = a_clock_set.get_clock().unwrap();
             let clock_tick = a_clock_0.tick_once();
             let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
             let bare_operation = mock_operation(i as u64);
@@ -546,7 +586,7 @@ mod tests {
 
         // Create M operations on peer A, which are missed on node C
         for i in N..N + M {
-            let mut a_clock_0 = a_clock_set.get_clock();
+            let mut a_clock_0 = a_clock_set.get_clock().unwrap();
             let clock_tick = a_clock_0.tick_once();
             let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
             let bare_operation = mock_operation(i as u64);
@@ -580,7 +620,7 @@ mod tests {
         assert_eq!(delta_from, N as u64);
 
         // Diff should have M operations, as node C missed M operations
-        assert_eq!(b_wal.wal.lock().read(delta_from).count(), M);
+        assert_eq!(b_wal.wal.lock().await.read(delta_from).count(), M);
 
         // Recover WAL on node C by writing delta from node B to it
         c_wal.append_from(&b_wal, delta_from).await.unwrap();
@@ -589,9 +629,10 @@ mod tests {
         a_wal
             .wal
             .lock()
+            .await
             .read(0)
-            .zip(b_wal.wal.lock().read(0))
-            .zip(c_wal.wal.lock().read(0))
+            .zip(b_wal.wal.lock().await.read(0))
+            .zip(c_wal.wal.lock().await.read(0))
             .for_each(|((a, b), c)| {
                 assert_eq!(a, b);
                 assert_eq!(b, c);
@@ -622,7 +663,7 @@ mod tests {
 
         // Create N operations on peer A
         for i in 0..N {
-            let mut a_clock_0 = a_clock_set.get_clock();
+            let mut a_clock_0 = a_clock_set.get_clock().unwrap();
             a_clock_0.advance_to(0);
             let clock_tick = a_clock_0.tick_once();
             let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
@@ -647,9 +688,9 @@ mod tests {
             let peer_id = if is_node_a { 1 } else { 2 };
 
             let mut clock = if is_node_a {
-                a_clock_set.get_clock()
+                a_clock_set.get_clock().unwrap()
             } else {
-                b_clock_set.get_clock()
+                b_clock_set.get_clock().unwrap()
             };
             clock.advance_to(0);
             let clock_tick = clock.tick_once();
@@ -685,7 +726,7 @@ mod tests {
         assert_eq!(delta_from, N as u64);
 
         // Diff should have M operations, as node C missed M operations
-        assert_eq!(b_wal.wal.lock().read(delta_from).count(), M);
+        assert_eq!(b_wal.wal.lock().await.read(delta_from).count(), M);
 
         // Recover WAL on node C by writing delta from node B to it
         c_wal.append_from(&b_wal, delta_from).await.unwrap();
@@ -694,9 +735,10 @@ mod tests {
         a_wal
             .wal
             .lock()
+            .await
             .read(0)
-            .zip(b_wal.wal.lock().read(0))
-            .zip(c_wal.wal.lock().read(0))
+            .zip(b_wal.wal.lock().await.read(0))
+            .zip(c_wal.wal.lock().await.read(0))
             .for_each(|((a, b), c)| {
                 assert_eq!(a, b);
                 assert_eq!(b, c);
@@ -720,11 +762,11 @@ mod tests {
         // Create clock sets for peer A and B, start first clocks from 1
         let mut a_clock_set = ClockSet::new();
         let mut b_clock_set = ClockSet::new();
-        a_clock_set.get_clock().advance_to(0);
-        b_clock_set.get_clock().advance_to(0);
+        a_clock_set.get_clock().unwrap().advance_to(0);
+        b_clock_set.get_clock().unwrap().advance_to(0);
 
         // Create operation on peer A
-        let mut a_clock_0 = a_clock_set.get_clock();
+        let mut a_clock_0 = a_clock_set.get_clock().unwrap();
         let clock_tick = a_clock_0.tick_once();
         let clock_tag = ClockTag::new(1, a_clock_0.id(), clock_tick);
         let bare_operation = mock_operation(1);
@@ -743,8 +785,8 @@ mod tests {
         drop(a_clock_0);
 
         // Create operations on nodes A and B
-        let mut a_clock_0 = a_clock_set.get_clock();
-        let mut b_clock_0 = b_clock_set.get_clock();
+        let mut a_clock_0 = a_clock_set.get_clock().unwrap();
+        let mut b_clock_0 = b_clock_set.get_clock().unwrap();
         let a_clock_tick = a_clock_0.tick_once();
         let b_clock_tick = b_clock_0.tick_once();
         let a_clock_tag = ClockTag::new(1, a_clock_0.id(), a_clock_tick);
@@ -789,30 +831,36 @@ mod tests {
         assert_eq!(delta_from, 1);
 
         // Diff should have 2 operations on both nodes
-        assert_eq!(a_wal.wal.lock().read(delta_from).count(), 2);
-        assert_eq!(b_wal.wal.lock().read(delta_from).count(), 2);
+        assert_eq!(a_wal.wal.lock().await.read(delta_from).count(), 2);
+        assert_eq!(b_wal.wal.lock().await.read(delta_from).count(), 2);
 
         // Recover WAL on node C by writing delta from node B to it
         c_wal.append_from(&b_wal, delta_from).await.unwrap();
 
         // WAL on node B and C will match, A is in different order
-        assert!(!a_wal
-            .wal
-            .lock()
-            .read(0)
-            .zip(c_wal.wal.lock().read(0))
-            .all(|(a, c)| a == c));
-        assert!(b_wal
-            .wal
-            .lock()
-            .read(0)
-            .zip(c_wal.wal.lock().read(0))
-            .all(|(b, c)| b == c));
+        assert!(
+            !a_wal
+                .wal
+                .lock()
+                .await
+                .read(0)
+                .zip(c_wal.wal.lock().await.read(0))
+                .all(|(a, c)| a == c),
+        );
+        assert!(
+            b_wal
+                .wal
+                .lock()
+                .await
+                .read(0)
+                .zip(c_wal.wal.lock().await.read(0))
+                .all(|(b, c)| b == c),
+        );
 
         // All WALs should have 3 operations
-        assert_eq!(a_wal.wal.lock().read(0).count(), 3);
-        assert_eq!(b_wal.wal.lock().read(0).count(), 3);
-        assert_eq!(c_wal.wal.lock().read(0).count(), 3);
+        assert_eq!(a_wal.wal.lock().await.read(0).count(), 3);
+        assert_eq!(b_wal.wal.lock().await.read(0).count(), 3);
+        assert_eq!(c_wal.wal.lock().await.read(0).count(), 3);
 
         // All WALs must have operations for point 1, 2 and 3
         let get_point = |op| match op {
@@ -828,18 +876,21 @@ mod tests {
         let a_wal_point_ids = a_wal
             .wal
             .lock()
+            .await
             .read(0)
             .map(|(_, op)| get_point(op).id)
             .collect::<HashSet<_>>();
         let b_wal_point_ids = b_wal
             .wal
             .lock()
+            .await
             .read(0)
             .map(|(_, op)| get_point(op).id)
             .collect::<HashSet<_>>();
         let c_wal_point_ids = c_wal
             .wal
             .lock()
+            .await
             .read(0)
             .map(|(_, op)| get_point(op).id)
             .collect::<HashSet<_>>();
@@ -921,7 +972,7 @@ mod tests {
         // Initial normal operation, written to both A and B  + additionally Em but we will need it later
         {
             // Node C is sending updates to A and B
-            let mut c_clock_0 = c_clock_set.get_clock();
+            let mut c_clock_0 = c_clock_set.get_clock().unwrap();
             c_clock_0.advance_to(0);
             let clock_tick = c_clock_0.tick_once();
             let clock_tag = ClockTag::new(node_c_peer_id, c_clock_0.id(), clock_tick);
@@ -946,7 +997,7 @@ mod tests {
         // Initial normal operation, written to both
         {
             // Node C is sending updates to A and B
-            let mut c_clock_0 = c_clock_set.get_clock();
+            let mut c_clock_0 = c_clock_set.get_clock().unwrap();
             c_clock_0.advance_to(0);
             let clock_tick = c_clock_0.tick_once();
             let clock_tag = ClockTag::new(node_c_peer_id, c_clock_0.id(), clock_tick);
@@ -969,8 +1020,8 @@ mod tests {
         // Next operation gets written to A, but not B
         {
             // Node C is sending updates to A and B
-            let mut c_clock_0 = c_clock_set.get_clock();
-            let mut c_clock_1 = c_clock_set.get_clock();
+            let mut c_clock_0 = c_clock_set.get_clock().unwrap();
+            let mut c_clock_1 = c_clock_set.get_clock().unwrap();
             c_clock_0.advance_to(0);
             c_clock_1.advance_to(0);
 
@@ -1007,7 +1058,7 @@ mod tests {
 
         // Node D sends an update to both A and B, both successfully written
         {
-            let mut d_clock_0 = d_clock_set.get_clock();
+            let mut d_clock_0 = d_clock_set.get_clock().unwrap();
             d_clock_0.advance_to(0);
             let clock_tick = d_clock_0.tick_once();
             let clock_tag = ClockTag::new(node_d_peer_id, d_clock_0.id(), clock_tick);
@@ -1028,7 +1079,7 @@ mod tests {
 
         // Node D sends an update to both A and B, both successfully written
         {
-            let mut d_clock_0 = d_clock_set.get_clock();
+            let mut d_clock_0 = d_clock_set.get_clock().unwrap();
             d_clock_0.advance_to(0);
             let clock_tick = d_clock_0.tick_once();
             let clock_tag = ClockTag::new(node_d_peer_id, d_clock_0.id(), clock_tick);
@@ -1081,7 +1132,7 @@ mod tests {
         // In between the recovery, we have a new update from C
         // It is written to both A and B, plus forwarded to B with forward proxy
         {
-            let mut c_clock_0 = c_clock_set.get_clock();
+            let mut c_clock_0 = c_clock_set.get_clock().unwrap();
             c_clock_0.advance_to(0);
             let clock_tick = c_clock_0.tick_once();
             let clock_tag = ClockTag::new(node_c_peer_id, c_clock_0.id(), clock_tick);
@@ -1176,7 +1227,7 @@ mod tests {
         // Add operation to B but not A
         {
             // Node D is sending updates to B
-            let mut d_clock = d_clock_set.get_clock();
+            let mut d_clock = d_clock_set.get_clock().unwrap();
             d_clock.advance_to(0);
 
             // First parallel operation
@@ -1200,7 +1251,7 @@ mod tests {
             .unwrap();
 
         // Diff expected
-        assert_eq!(b_wal.wal.lock().read(delta_from).count(), 1);
+        assert_eq!(b_wal.wal.lock().await.read(delta_from).count(), 1);
 
         assert_wal_ordering_property(&a_wal, false).await;
         assert_wal_ordering_property(&b_wal, false).await;
@@ -1246,7 +1297,7 @@ mod tests {
         let mut wals = std::iter::repeat_with(fixture_empty_wal)
             .take(node_count)
             .collect::<Vec<_>>();
-        let mut clock_sets = std::iter::repeat_with(ClockSet::new)
+        let mut clock_sets = std::iter::repeat_with(|| ClockSet::with_max_clocks(256))
             .take(node_count)
             .collect::<Vec<_>>();
 
@@ -1264,7 +1315,7 @@ mod tests {
             for _ in 0..rng.random_range(0..10) {
                 let entrypoint = rng.random_range(0..node_count);
 
-                let mut clock = clock_sets[entrypoint].get_clock();
+                let mut clock = clock_sets[entrypoint].get_clock().unwrap();
                 clock.advance_to(0);
                 let clock_tick = clock.tick_once();
                 let clock_tag = ClockTag::new(entrypoint as u64, clock.id(), clock_tick);
@@ -1292,7 +1343,7 @@ mod tests {
                 }
 
                 // Maybe keep the clock for some iterations
-                let keep_clock_for = rng.random_range(0..3);
+                let keep_clock_for = rng.random_range(0..10);
                 if keep_clock_for > 0 {
                     kept_clocks.push((keep_clock_for, clock));
                 }
@@ -1310,7 +1361,7 @@ mod tests {
             for _ in 0..operation_count {
                 let entrypoint = *alive_nodes.choose(&mut rng).unwrap();
 
-                let mut clock = clock_sets[entrypoint].get_clock();
+                let mut clock = clock_sets[entrypoint].get_clock().unwrap();
                 clock.advance_to(0);
                 let clock_tick = clock.tick_once();
                 let clock_tag = ClockTag::new(entrypoint as u64, clock.id(), clock_tick);
@@ -1342,7 +1393,7 @@ mod tests {
                 }
 
                 // Maybe keep the clock for some iterations
-                let keep_clock_for = rng.random_range(0..10);
+                let keep_clock_for = rng.random_range(0..3);
                 if keep_clock_for > 0 {
                     kept_clocks.push((keep_clock_for, clock));
                 }
@@ -1361,7 +1412,11 @@ mod tests {
                         .expect("failed to resolve WAL delta on alive node");
                     from_deltas.insert(delta_from);
                 }
-                assert_eq!(from_deltas.len(), 1, "found different delta starting points in different WALs, while all should be the same");
+                assert_eq!(
+                    from_deltas.len(),
+                    1,
+                    "found different delta starting points in different WALs, while all should be the same",
+                );
                 let delta_from = from_deltas.into_iter().next().unwrap();
                 assert_eq!(
                     delta_from.is_some(),
@@ -1381,21 +1436,24 @@ mod tests {
             }
 
             // All WALs must be equal, having exactly the same entries
-            wals.iter()
-                .map(|wal| wal.0.wal.lock())
-                .collect::<Vec<_>>()
-                .windows(2)
-                .for_each(|wals| {
-                    assert!(
-                        wals[0].read(0).eq(wals[1].read(0)),
-                        "all WALs must have the same entries",
-                    );
-                });
+            let mut opened_wals = Vec::new();
+            for wal in &wals {
+                opened_wals.push(wal.0.wal.lock().await);
+            }
+            opened_wals.windows(2).for_each(|wals| {
+                assert!(
+                    wals[0].read(0).eq(wals[1].read(0)),
+                    "all WALs must have the same entries",
+                );
+            });
 
             // Release some kept clocks
-            kept_clocks.retain(|(mut keep_for, _)| {
-                keep_for -= 1;
-                keep_for > 0
+            kept_clocks.retain_mut(|(keep_for, _)| {
+                if *keep_for == 0 {
+                    return false;
+                }
+                *keep_for -= 1;
+                true
             });
         }
 
@@ -1475,7 +1533,7 @@ mod tests {
 
         let resolve_result = resolve_wal_delta(
             wal.wal
-                .lock()
+                .blocking_lock()
                 .read_all(true)
                 .map(|(op_num, op)| (op_num, op.clock_tag)),
             recovery_point,
@@ -1502,7 +1560,7 @@ mod tests {
 
         let resolve_result = resolve_wal_delta(
             wal.wal
-                .lock()
+                .blocking_lock()
                 .read_all(true)
                 .map(|(op_num, op)| (op_num, op.clock_tag)),
             recovery_point,
@@ -1528,7 +1586,7 @@ mod tests {
 
         let resolve_result = resolve_wal_delta(
             wal.wal
-                .lock()
+                .blocking_lock()
                 .read_all(true)
                 .map(|(op_num, op)| (op_num, op.clock_tag)),
             recovery_point,
@@ -1559,7 +1617,7 @@ mod tests {
 
         let resolve_result = resolve_wal_delta(
             wal.wal
-                .lock()
+                .blocking_lock()
                 .read_all(true)
                 .map(|(op_num, op)| (op_num, op.clock_tag)),
             recovery_point,
@@ -1585,7 +1643,7 @@ mod tests {
 
         let resolve_result = resolve_wal_delta(
             wal.wal
-                .lock()
+                .blocking_lock()
                 .read_all(true)
                 .map(|(op_num, op)| (op_num, op.clock_tag)),
             recovery_point,
@@ -1602,6 +1660,7 @@ mod tests {
             let cutoff = wal.oldest_clocks.lock().await;
             wal.wal
                 .lock()
+                .await
                 .read(0)
                 // Only take records with clock tags
                 .filter_map(|(_, operation)| operation.clock_tag)
@@ -1609,7 +1668,7 @@ mod tests {
                 .filter(|clock_tag| {
                     cutoff
                         .current_tick(clock_tag.peer_id, clock_tag.clock_id)
-                        .map_or(true, |cutoff_tick| clock_tag.clock_tick >= cutoff_tick)
+                        .is_none_or(|cutoff_tick| clock_tag.clock_tick >= cutoff_tick)
                 })
                 .collect::<Vec<_>>()
         };
@@ -1684,7 +1743,11 @@ mod tests {
             if !must_see_ticks.is_empty() {
                 return Err(format!(
                     "following clock tags did not cover ticks [{}] in order (peer_id: {}, clock_id: {}, max_tick: {highest})",
-                    must_see_ticks.into_iter().map(|tick| tick.to_string()).collect::<Vec<_>>().join(", "),
+                    must_see_ticks
+                        .into_iter()
+                        .map(|tick| tick.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     clock_tag.peer_id,
                     clock_tag.clock_id,
                 ));

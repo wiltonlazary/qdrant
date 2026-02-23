@@ -1,7 +1,8 @@
-use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use api::rest::{BaseGroupRequest, SearchGroupsRequestInternal, SearchRequestInternal};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use fnv::FnvBuildHasher;
@@ -12,7 +13,6 @@ use segment::types::{
     WithVector,
 };
 use serde_json::Value;
-use tokio::sync::RwLockReadGuard;
 
 use super::aggregator::GroupsAggregator;
 use super::types::QueryGroupRequest;
@@ -28,9 +28,7 @@ use crate::operations::types::{
 use crate::operations::universal_query::collection_query::{
     CollectionQueryGroupsRequest, CollectionQueryRequest,
 };
-use crate::operations::universal_query::shard_query::{
-    ScoringQuery, ShardPrefetch, ShardQueryRequest,
-};
+use crate::operations::universal_query::shard_query::{self, ShardPrefetch, ShardQueryRequest};
 use crate::recommendations::recommend_into_core_search;
 
 const MAX_GET_GROUPS_REQUESTS: usize = 5;
@@ -81,7 +79,7 @@ impl GroupRequest {
         }
     }
 
-    pub async fn into_query_group_request<'a, F, Fut>(
+    pub async fn into_query_group_request<F, Fut>(
         self,
         collection: &Collection,
         collection_by_name: F,
@@ -92,7 +90,7 @@ impl GroupRequest {
     ) -> CollectionResult<QueryGroupRequest>
     where
         F: Fn(String) -> Fut,
-        Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+        Fut: Future<Output = Option<Arc<Collection>>>,
     {
         let query_search = match self.source {
             SourceRequest::Search(search_req) => ShardQueryRequest::from(search_req),
@@ -133,7 +131,6 @@ impl GroupRequest {
             group_by: self.group_by,
             group_size: self.group_size,
             groups: self.limit,
-            with_lookup: self.with_lookup,
         })
     }
 }
@@ -286,8 +283,8 @@ impl From<CollectionQueryGroupsRequest> for GroupRequest {
         } = request;
 
         let collection_query_request = CollectionQueryRequest {
-            prefetch: prefetch.into_iter().map(From::from).collect(),
-            query: query.map(From::from),
+            prefetch: prefetch.into_iter().collect(),
+            query,
             using,
             filter,
             score_threshold,
@@ -304,7 +301,7 @@ impl From<CollectionQueryGroupsRequest> for GroupRequest {
             group_by,
             group_size,
             limit,
-            with_lookup: with_lookup_interface.map(Into::into),
+            with_lookup: with_lookup_interface,
         }
     }
 }
@@ -320,7 +317,8 @@ pub async fn group_by(
 ) -> CollectionResult<Vec<PointGroup>> {
     let start = std::time::Instant::now();
     let collection_params = collection.collection_config.read().await.params.clone();
-    let score_ordering = ScoringQuery::order(request.source.query.as_ref(), &collection_params)?;
+    let score_ordering =
+        shard_query::query_result_order(request.source.query.as_ref(), &collection_params)?;
 
     let mut aggregator = GroupsAggregator::new(
         request.groups,
@@ -470,7 +468,7 @@ pub async fn group_by(
     let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
 
     // enrich with payload and vector
-    let enriched_points: HashMap<_, _> = collection
+    let enriched_points: AHashMap<_, _> = collection
         .fill_search_result_with_payload(
             bare_points,
             Some(request.source.with_payload),
@@ -554,8 +552,7 @@ fn increase_limit_for_group(shard_prefetch: &mut ShardPrefetch, group_size: usiz
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
+    use ahash::AHashMap;
     use segment::data_types::groups::GroupId;
     use segment::payload_json;
     use segment::types::{Payload, ScoredPoint};
@@ -613,7 +610,7 @@ mod tests {
             make_scored_point(4, 1.0, Some(payload_b.clone())),
         ];
 
-        let set: HashMap<_, _> = hydrated.into_iter().map(|p| (p.id, p)).collect();
+        let set: AHashMap<_, _> = hydrated.into_iter().map(|p| (p.id, p)).collect();
 
         // act
         groups.iter_mut().for_each(|group| group.hydrate_from(&set));
@@ -626,13 +623,15 @@ mod tests {
         let a = groups.first().unwrap();
         let b = groups.get(1).unwrap();
 
-        assert!(a
-            .hits
-            .iter()
-            .all(|x| x.payload.as_ref() == Some(&payload_a)));
-        assert!(b
-            .hits
-            .iter()
-            .all(|x| x.payload.as_ref() == Some(&payload_b)));
+        assert!(
+            a.hits
+                .iter()
+                .all(|x| x.payload.as_ref() == Some(&payload_a)),
+        );
+        assert!(
+            b.hits
+                .iter()
+                .all(|x| x.payload.as_ref() == Some(&payload_b)),
+        );
     }
 }

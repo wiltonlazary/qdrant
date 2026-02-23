@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
+use ahash::AHashSet;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::TelemetryDetail;
 use itertools::Itertools;
@@ -11,14 +12,14 @@ use segment::data_types::query_context::{QueryContext, VectorQueryContext};
 use segment::data_types::vectors::{QueryVector, VectorElementType, VectorInternal};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_vector;
+use segment::index::VectorIndex;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::index::sparse_index::sparse_vector_index::SparseVectorIndexOpenArgs;
-use segment::index::VectorIndex;
 use segment::segment_constructor::{build_segment, create_sparse_vector_index_test};
 use segment::types::{
-    Condition, Distance, ExtendedPointId, Filter, HasIdCondition, Indexes, PointIdType,
-    SegmentConfig, SeqNumberType, SparseVectorDataConfig, SparseVectorStorageType,
-    VectorDataConfig, VectorStorageDatatype, VectorStorageType, DEFAULT_SPARSE_FULL_SCAN_THRESHOLD,
+    Condition, DEFAULT_SPARSE_FULL_SCAN_THRESHOLD, Distance, ExtendedPointId, Filter,
+    HasIdCondition, Indexes, PointIdType, SegmentConfig, SeqNumberType, SparseVectorDataConfig,
+    SparseVectorStorageType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
 use segment::vector_storage::query::{ContextPair, DiscoveryQuery};
 use sparse::common::sparse_vector::SparseVector;
@@ -37,7 +38,10 @@ fn convert_to_sparse_vector(vector: &[VectorElementType]) -> SparseVector {
     sparse_vector
 }
 
-fn random_named_vector<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> (NamedVectors, NamedVectors) {
+fn random_named_vector<R: Rng + ?Sized>(
+    rnd: &mut R,
+    dim: usize,
+) -> (NamedVectors<'_>, NamedVectors<'_>) {
     let dense_vector = random_vector(rnd, dim);
     let sparse_vector = convert_to_sparse_vector(&dense_vector);
 
@@ -126,6 +130,7 @@ fn sparse_index_discover_test() {
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
                 storage_type: SparseVectorStorageType::default(),
+                modifier: None,
             },
         )]),
         payload_storage_type: Default::default(),
@@ -136,7 +141,7 @@ fn sparse_index_discover_test() {
             VectorDataConfig {
                 size: dim,
                 distance,
-                storage_type: VectorStorageType::Memory,
+                storage_type: VectorStorageType::default(),
                 index: Indexes::Plain {},
                 quantization_config: None,
                 multivector_config: None,
@@ -266,6 +271,7 @@ fn sparse_index_hardware_measurement_test() {
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
                 storage_type: SparseVectorStorageType::default(),
+                modifier: None,
             },
         )]),
         payload_storage_type: Default::default(),
@@ -313,7 +319,7 @@ fn sparse_index_hardware_measurement_test() {
     assert_eq!(cpu_usage, 0);
 
     // Some filter so we do plain sparse search
-    let ids: HashSet<PointIdType> = (0..3).map(ExtendedPointId::NumId).collect();
+    let ids: AHashSet<PointIdType> = (0..3).map(ExtendedPointId::NumId).collect();
     let filter = Filter::new_must(Condition::HasId(HasIdCondition::from(ids)));
 
     sparse_index

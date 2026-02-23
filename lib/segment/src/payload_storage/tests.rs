@@ -1,11 +1,15 @@
 use std::path::Path;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use rstest::rstest;
 
-use super::mmap_payload_storage::MmapPayloadStorage;
-use super::on_disk_payload_storage::OnDiskPayloadStorage;
-use super::simple_payload_storage::SimplePayloadStorage;
 use super::PayloadStorage;
+use super::mmap_payload_storage::MmapPayloadStorage;
+#[cfg(feature = "rocksdb")]
+use super::on_disk_payload_storage::OnDiskPayloadStorage;
+#[cfg(feature = "rocksdb")]
+use super::simple_payload_storage::SimplePayloadStorage;
+#[cfg(feature = "rocksdb")]
 use crate::common::rocksdb_wrapper::open_db;
 use crate::payload_json;
 
@@ -97,14 +101,17 @@ fn test_trait_impl<S: PayloadStorage>(open: impl Fn(&Path) -> S) {
 
     let assert_payloads = |storage: &S| {
         storage
-            .iter(|key, value| {
-                if key == 0 {
-                    assert_eq!(value, &payload_json! {});
-                    return Ok(true);
-                }
-                assert_eq!(value, &payload);
-                Ok(true)
-            })
+            .iter(
+                |key, value| {
+                    if key == 0 {
+                        assert_eq!(value, &payload_json! {});
+                        return Ok(true);
+                    }
+                    assert_eq!(value, &payload);
+                    Ok(true)
+                },
+                &hw_counter,
+            )
             .unwrap();
     };
 
@@ -124,6 +131,7 @@ fn test_trait_impl<S: PayloadStorage>(open: impl Fn(&Path) -> S) {
 }
 
 #[test]
+#[cfg(feature = "rocksdb")]
 fn test_in_memory_storage() {
     test_trait_impl(|path| {
         let db = open_db(path, &[""]).unwrap();
@@ -131,12 +139,15 @@ fn test_in_memory_storage() {
     });
 }
 
-#[test]
-fn test_mmap_storage() {
-    test_trait_impl(|path| MmapPayloadStorage::open_or_create(path).unwrap());
+#[rstest]
+fn test_mmap_storage(#[values(false, true)] populate: bool) {
+    test_trait_impl(|path| {
+        MmapPayloadStorage::open_or_create(path.to_path_buf(), populate).unwrap()
+    });
 }
 
 #[test]
+#[cfg(feature = "rocksdb")]
 fn test_on_disk_storage() {
     test_trait_impl(|path| {
         let db = open_db(path, &[""]).unwrap();

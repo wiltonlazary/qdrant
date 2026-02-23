@@ -1,5 +1,6 @@
 use api::rest::{
-    BatchVectorStruct, MultiDenseVector, PointInsertOperations, UpdateVectors, Vector, VectorStruct,
+    BatchVectorStruct, MultiDenseVector, PointInsertOperations, PointsBatch, PointsList,
+    UpdateVectors, Vector, VectorStruct,
 };
 use segment::data_types::tiny_map::TinyMap;
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
@@ -8,12 +9,12 @@ use segment::types::{
     VectorNameBuf,
 };
 
-use super::{check_limit_opt, StrictModeVerification};
+use super::{StrictModeVerification, check_limit_opt};
 use crate::collection::Collection;
 use crate::common::collection_size_stats::CollectionSizeAtomicStats;
 use crate::operations::payload_ops::{DeletePayload, SetPayload};
 use crate::operations::point_ops::PointsSelector;
-use crate::operations::types::CollectionError;
+use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::vector_ops::DeleteVectors;
 
 impl StrictModeVerification for PointsSelector {
@@ -68,12 +69,11 @@ impl StrictModeVerification for SetPayload {
         &self,
         collection: &Collection,
         strict_mode_config: &StrictModeConfig,
-    ) -> Result<(), CollectionError> {
+    ) -> CollectionResult<()> {
         if let Some(payload_size_limit_bytes) = strict_mode_config.max_collection_payload_size_bytes
+            && let Some(local_stats) = collection.estimated_collection_stats().await?
         {
-            if let Some(local_stats) = collection.estimated_collection_stats().await {
-                check_collection_payload_size_limit(payload_size_limit_bytes, local_stats)?;
-            }
+            check_collection_payload_size_limit(payload_size_limit_bytes, local_stats)?;
         }
 
         Ok(())
@@ -127,7 +127,7 @@ impl StrictModeVerification for PointInsertOperations {
         &self,
         collection: &Collection,
         strict_mode_config: &StrictModeConfig,
-    ) -> Result<(), CollectionError> {
+    ) -> CollectionResult<()> {
         check_limit_opt(
             Some(self.len()),
             strict_mode_config.upsert_max_batchsize,
@@ -137,11 +137,11 @@ impl StrictModeVerification for PointInsertOperations {
         check_collection_size_limit(collection, strict_mode_config).await?;
 
         if let Some(multivector_config) = &strict_mode_config.multivector_config {
-            check_multivectors_limits_insert(self, multivector_config).await?;
+            check_multivectors_limits_insert(self, multivector_config)?;
         }
 
         if let Some(sparse_config) = &strict_mode_config.sparse_config {
-            check_sparse_vector_limits_insert(self, sparse_config).await?;
+            check_sparse_vector_limits_insert(self, sparse_config)?;
         }
 
         Ok(())
@@ -156,7 +156,23 @@ impl StrictModeVerification for PointInsertOperations {
     }
 
     fn indexed_filter_write(&self) -> Option<&Filter> {
-        None
+        // Update filter doesn't require strict mode checks
+        // as it is only used on a limited and small subset of points.
+        // Reading from payload storage is acceptable in this case.
+        match self {
+            PointInsertOperations::PointsBatch(PointsBatch {
+                batch: _,
+                shard_key: _,
+                update_filter: _,
+                update_mode: _,
+            }) => None,
+            PointInsertOperations::PointsList(PointsList {
+                points: _,
+                shard_key: _,
+                update_filter: _,
+                update_mode: _,
+            }) => None,
+        }
     }
 
     fn request_exact(&self) -> Option<bool> {
@@ -173,7 +189,7 @@ impl StrictModeVerification for UpdateVectors {
         &self,
         collection: &Collection,
         strict_mode_config: &StrictModeConfig,
-    ) -> Result<(), CollectionError> {
+    ) -> CollectionResult<()> {
         check_limit_opt(
             Some(self.points.len()),
             strict_mode_config.upsert_max_batchsize,
@@ -183,11 +199,11 @@ impl StrictModeVerification for UpdateVectors {
         check_collection_size_limit(collection, strict_mode_config).await?;
 
         if let Some(multivector_config) = &strict_mode_config.multivector_config {
-            check_multivectors_limits_update(self, multivector_config).await?;
+            check_multivectors_limits_update(self, multivector_config)?;
         }
 
         if let Some(sparse_config) = &strict_mode_config.sparse_config {
-            check_sparse_vector_limits_update(self, sparse_config).await?;
+            check_sparse_vector_limits_update(self, sparse_config)?;
         }
 
         Ok(())
@@ -202,6 +218,14 @@ impl StrictModeVerification for UpdateVectors {
     }
 
     fn indexed_filter_write(&self) -> Option<&Filter> {
+        let UpdateVectors {
+            points: _,
+            shard_key: _,
+            // Update filter doesn't require strict mode checks
+            // as it is only used on a limited and small subset of points.
+            // Reading from payload storage is acceptable in this case.
+            update_filter: _,
+        } = self;
         None
     }
 
@@ -218,7 +242,7 @@ impl StrictModeVerification for UpdateVectors {
 async fn check_collection_size_limit(
     collection: &Collection,
     strict_mode_config: &StrictModeConfig,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     let vector_limit = strict_mode_config.max_collection_vector_size_bytes;
     let payload_limit = strict_mode_config.max_collection_payload_size_bytes;
     let point_limit = strict_mode_config.max_points_count;
@@ -228,7 +252,7 @@ async fn check_collection_size_limit(
         return Ok(());
     }
 
-    let Some(stats) = collection.estimated_collection_stats().await else {
+    let Some(stats) = collection.estimated_collection_stats().await? else {
         return Ok(());
     };
 
@@ -250,7 +274,7 @@ async fn check_collection_size_limit(
 fn check_collection_points_count_limit(
     points_count_limit: usize,
     stats: &CollectionSizeAtomicStats,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     let points_count = stats.get_points_count();
     if points_count >= points_count_limit {
         return Err(CollectionError::bad_request(format!(
@@ -265,7 +289,7 @@ fn check_collection_points_count_limit(
 fn check_collection_vector_size_limit(
     max_vec_storage_size_bytes: usize,
     stats: &CollectionSizeAtomicStats,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     let vec_storage_size_bytes = stats.get_vector_storage_size();
 
     if vec_storage_size_bytes >= max_vec_storage_size_bytes {
@@ -282,7 +306,7 @@ fn check_collection_vector_size_limit(
 fn check_collection_payload_size_limit(
     max_payload_storage_size_bytes: usize,
     stats: &CollectionSizeAtomicStats,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     let payload_storage_size_bytes = stats.get_payload_storage_size();
 
     if payload_storage_size_bytes >= max_payload_storage_size_bytes {
@@ -300,7 +324,7 @@ fn check_collection_payload_size_limit(
 /// Uses a tiny map as we expect a small number of multivectors to be configured per collection in strict mode.
 ///
 /// Return None if no multivectors are configured with strict mode
-async fn multivector_limits_by_name(
+fn multivector_limits_by_name(
     multivector_strict_config: &StrictModeMultivectorConfig,
 ) -> Option<TinyMap<VectorNameBuf, usize>> {
     // If no multivectors strict mode no need to check anything.
@@ -326,12 +350,11 @@ async fn multivector_limits_by_name(
     }
 }
 
-async fn check_multivectors_limits_update(
+fn check_multivectors_limits_update(
     point_insert: &UpdateVectors,
     multivector_strict_config: &StrictModeMultivectorConfig,
-) -> Result<(), CollectionError> {
-    let Some(multivector_max_size_by_name) =
-        multivector_limits_by_name(multivector_strict_config).await
+) -> CollectionResult<()> {
+    let Some(multivector_max_size_by_name) = multivector_limits_by_name(multivector_strict_config)
     else {
         return Ok(());
     };
@@ -347,9 +370,7 @@ async fn check_multivectors_limits_update(
     Ok(())
 }
 
-async fn sparse_limits(
-    sparse_config: &StrictModeSparseConfig,
-) -> Option<TinyMap<&VectorName, usize>> {
+fn sparse_limits(sparse_config: &StrictModeSparseConfig) -> Option<TinyMap<&VectorName, usize>> {
     if sparse_config.config.is_empty() {
         return None;
     }
@@ -367,11 +388,11 @@ async fn sparse_limits(
     (!sparse_max_size.is_empty()).then_some(sparse_max_size)
 }
 
-async fn check_sparse_vector_limits_update(
+fn check_sparse_vector_limits_update(
     point_insert: &UpdateVectors,
     sparse_config: &StrictModeSparseConfig,
-) -> Result<(), CollectionError> {
-    let Some(sparse_max_size_by_name) = sparse_limits(sparse_config).await else {
+) -> CollectionResult<()> {
+    let Some(sparse_max_size_by_name) = sparse_limits(sparse_config) else {
         return Ok(());
     };
 
@@ -382,11 +403,11 @@ async fn check_sparse_vector_limits_update(
     Ok(())
 }
 
-async fn check_sparse_vector_limits_insert(
+fn check_sparse_vector_limits_insert(
     point_insert: &PointInsertOperations,
     sparse_config: &StrictModeSparseConfig,
-) -> Result<(), CollectionError> {
-    let Some(sparse_max_size_by_name) = sparse_limits(sparse_config).await else {
+) -> CollectionResult<()> {
+    let Some(sparse_max_size_by_name) = sparse_limits(sparse_config) else {
         return Ok(());
     };
 
@@ -430,7 +451,7 @@ async fn check_sparse_vector_limits_insert(
 fn check_sparse_vecstruct_limit(
     vector: &VectorStruct,
     sparse_max_size_by_name: &TinyMap<&VectorName, usize>,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     match vector {
         VectorStruct::Named(named) => {
             for (name, vec) in named {
@@ -450,11 +471,11 @@ fn check_named_sparse_vec_limit(
     name: &VectorName,
     vector: &Vector,
     sparse_max_size_by_name: &TinyMap<&VectorName, usize>,
-) -> Result<(), CollectionError> {
-    if let Vector::Sparse(sparse) = vector {
-        if let Some(strict_sparse_limit) = sparse_max_size_by_name.get(name) {
-            check_sparse_vector_limit(name, sparse, *strict_sparse_limit)?;
-        }
+) -> CollectionResult<()> {
+    if let Vector::Sparse(sparse) = vector
+        && let Some(strict_sparse_limit) = sparse_max_size_by_name.get(name)
+    {
+        check_sparse_vector_limit(name, sparse, *strict_sparse_limit)?;
     }
     Ok(())
 }
@@ -463,7 +484,7 @@ fn check_sparse_vector_limit(
     name: &VectorName,
     sparse: &sparse::common::sparse_vector::SparseVector,
     max_size: usize,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     let vector_len = sparse.indices.len();
 
     if vector_len > max_size || sparse.values.len() > max_size {
@@ -474,12 +495,11 @@ fn check_sparse_vector_limit(
     Ok(())
 }
 
-async fn check_multivectors_limits_insert(
+fn check_multivectors_limits_insert(
     point_insert: &PointInsertOperations,
     multivector_strict_config: &StrictModeMultivectorConfig,
-) -> Result<(), CollectionError> {
-    let Some(multivector_max_size_by_name) =
-        multivector_limits_by_name(multivector_strict_config).await
+) -> CollectionResult<()> {
+    let Some(multivector_max_size_by_name) = multivector_limits_by_name(multivector_strict_config)
     else {
         return Ok(());
     };
@@ -546,7 +566,7 @@ fn check_named_multivectors_vecstruct_limit(
     name: &VectorName,
     vector: &VectorStruct,
     multivector_max_size_by_name: &TinyMap<VectorNameBuf, usize>,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     match vector {
         VectorStruct::MultiDense(multi) => {
             check_named_multivector_limit(name, multi, multivector_max_size_by_name)
@@ -568,7 +588,7 @@ fn check_named_multivectors_vec_limit(
     name: &VectorName,
     vector: &Vector,
     multivector_max_size_by_name: &TinyMap<VectorNameBuf, usize>,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     match vector {
         Vector::MultiDense(multi) => {
             check_named_multivector_limit(name, multi, multivector_max_size_by_name)
@@ -585,7 +605,7 @@ fn check_named_multivector_limit(
     name: &VectorName,
     multi: &MultiDenseVector,
     multivector_max_size_by_name: &TinyMap<VectorNameBuf, usize>,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     if let Some(strict_multi_limit) = multivector_max_size_by_name.get(name) {
         check_multivector_limit(name, multi, *strict_multi_limit)?
     }
@@ -596,7 +616,7 @@ fn check_multivector_limit(
     name: &VectorName,
     multi: &MultiDenseVector,
     max_size: usize,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
     let multi_len = multi.len();
     if multi_len > max_size {
         return Err(CollectionError::bad_request(format!(

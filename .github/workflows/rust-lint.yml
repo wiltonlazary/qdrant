@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  lint:
 
     runs-on: ubuntu-latest
 
@@ -23,7 +23,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -31,6 +31,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: clippy
+    - name: Update apt
+      run: sudo apt-get update
     - name: Install dependencies
       run: sudo apt-get install clang libunwind-dev
     - name: Check code formatting

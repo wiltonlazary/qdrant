@@ -6,7 +6,7 @@ authors = [
     "Qdrant Team <info@qdrant.tech>",
 ]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lints]
@@ -16,35 +16,50 @@ workspace = true
 testing = []
 
 [dependencies]
+ahash = { workspace = true }
+atomicwrites = { workspace = true }
+bincode = { workspace = true }
+bitvec = { workspace = true }
 bytemuck = { workspace = true }
+chrono = { workspace = true }
+delegate = { workspace = true }
+fs-err = { workspace = true }
+fs_extra = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+nix = { workspace = true }
 num-traits = { workspace = true }
-num_cpus = "1.16"
+num_cpus = "1.17"
 ordered-float = { workspace = true }
+parking_lot = { workspace = true }
 ph = { workspace = true }
 rand = { workspace = true }
+schemars = { workspace = true }
+semver = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
 tap = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 validator = { workspace = true }
-lazy_static = "1.5.0"
-memmap2 = { workspace = true }
-semver = { workspace = true }
-thiserror = { workspace = true }
+walkdir = { workspace = true }
 zerocopy = { workspace = true }
-log = { workspace = true }
 
 [dev-dependencies]
 common = { path = ".", features = ["testing"] }
 criterion = { workspace = true }
+fs-err = { workspace = true, features = ["debug"] }
 itertools = { workspace = true }
 rstest = { workspace = true }
-self_cell = "1.1.0"
+self_cell = { workspace = true }
+serde_json = { workspace = true }
 tango-bench = "0.6.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-thread-priority = "1.2"
+thread-priority = "3.0.0"
 
 [[bench]]
 name = "bitpacking"
@@ -56,4 +71,12 @@ harness = false
 
 [[bench]]
 name = "mmap_hashmap"
+harness = false
+
+[[bench]]
+name = "hw_counter"
+harness = false
+
+[[bench]]
+name = "atomic_stop"
 harness = false

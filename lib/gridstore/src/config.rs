@@ -11,7 +11,7 @@ pub const DEFAULT_REGION_SIZE_BLOCKS: usize = 8_192;
 
 pub const DEFAULT_USE_COMPRESSION: bool = true;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Default)]
 pub enum Compression {
     None,
     #[default]
@@ -42,7 +42,7 @@ pub struct StorageOptions {
     pub compression: Option<Compression>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub(crate) struct StorageConfig {
     /// Size of a page in bytes
     ///
@@ -95,7 +95,7 @@ impl TryFrom<StorageOptions> for StorageConfig {
             return Err("Page size must be greater than or equal to (block size * region size)");
         }
 
-        if page_size_bytes % region_size_bytes != 0 {
+        if !page_size_bytes.is_multiple_of(region_size_bytes) {
             return Err("Page size must be a multiple of (block size * region size)");
         }
 
@@ -105,5 +105,16 @@ impl TryFrom<StorageOptions> for StorageConfig {
             region_size_blocks,
             compression: options.compression.unwrap_or_default(),
         })
+    }
+}
+
+impl From<StorageConfig> for StorageOptions {
+    fn from(config: StorageConfig) -> Self {
+        Self {
+            page_size_bytes: Some(config.page_size_bytes),
+            block_size_bytes: Some(config.block_size_bytes),
+            region_size_blocks: Some(config.region_size_blocks as u16),
+            compression: Some(config.compression),
+        }
     }
 }

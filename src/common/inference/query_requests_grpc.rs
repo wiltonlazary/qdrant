@@ -1,31 +1,35 @@
 use api::conversions::json::json_path_from_proto;
-use api::grpc::qdrant as grpc;
-use api::grpc::qdrant::query::Variant;
 use api::grpc::qdrant::RecommendInput;
-use api::rest;
-use api::rest::RecommendStrategy;
+use api::grpc::qdrant::query::Variant;
+use api::grpc::{InferenceUsage, qdrant as grpc};
+use api::rest::{self, LookupLocation, RecommendStrategy};
 use collection::operations::universal_query::collection_query::{
-    CollectionPrefetch, CollectionQueryGroupsRequest, CollectionQueryRequest, Query,
-    VectorInputInternal, VectorQuery,
+    CollectionPrefetch, CollectionQueryGroupsRequest, CollectionQueryRequest, FeedbackInternal,
+    FeedbackStrategy, Mmr, NearestWithMmr, Query, VectorInputInternal, VectorQuery,
 };
+use collection::operations::universal_query::formula::FormulaInternal;
 use collection::operations::universal_query::shard_query::{FusionInternal, SampleInternal};
+use ordered_float::OrderedFloat;
 use segment::data_types::order_by::OrderBy;
-use segment::data_types::vectors::{VectorInternal, DEFAULT_VECTOR_NAME};
-use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal};
+use segment::types::{Filter, PointIdType, SearchParams};
+use segment::vector_storage::query::{
+    ContextPair, ContextQuery, DiscoveryQuery, FeedbackItem, RecoQuery,
+};
 use tonic::Status;
 
 use crate::common::inference::batch_processing_grpc::{
-    collect_prefetch, collect_query, BatchAccumGrpc,
+    BatchAccumGrpc, collect_prefetch, collect_query,
 };
 use crate::common::inference::infer_processing::BatchAccumInferred;
+use crate::common::inference::params::InferenceParams;
 use crate::common::inference::service::{InferenceData, InferenceType};
-use crate::common::inference::InferenceToken;
 
 /// ToDo: this function is supposed to call an inference endpoint internally
 pub async fn convert_query_point_groups_from_grpc(
     query: grpc::QueryPointGroups,
-    inference_token: InferenceToken,
-) -> Result<CollectionQueryGroupsRequest, Status> {
+    inference_params: InferenceParams,
+) -> Result<(CollectionQueryGroupsRequest, InferenceUsage), Status> {
     let grpc::QueryPointGroups {
         collection_name: _,
         prefetch,
@@ -58,8 +62,8 @@ pub async fn convert_query_point_groups_from_grpc(
 
     let BatchAccumGrpc { objects } = batch;
 
-    let inferred =
-        BatchAccumInferred::from_objects(objects, InferenceType::Search, inference_token)
+    let (inferred, usage) =
+        BatchAccumInferred::from_objects(objects, InferenceType::Search, inference_params)
             .await
             .map_err(|e| Status::internal(format!("Inference error: {e}")))?;
 
@@ -77,7 +81,7 @@ pub async fn convert_query_point_groups_from_grpc(
     let request = CollectionQueryGroupsRequest {
         prefetch,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
+        using: using.unwrap_or_else(|| DEFAULT_VECTOR_NAME.to_owned()),
         filter: filter.map(TryFrom::try_from).transpose()?,
         score_threshold,
         with_vector: with_vectors
@@ -87,7 +91,7 @@ pub async fn convert_query_point_groups_from_grpc(
             .map(TryFrom::try_from)
             .transpose()?
             .unwrap_or(CollectionQueryRequest::DEFAULT_WITH_PAYLOAD),
-        lookup_from: lookup_from.map(From::from),
+        lookup_from: lookup_from.map(LookupLocation::try_from).transpose()?,
         group_by: json_path_from_proto(&group_by)?,
         group_size: group_size
             .map(|s| s as usize)
@@ -99,14 +103,14 @@ pub async fn convert_query_point_groups_from_grpc(
         with_lookup: with_lookup.map(TryFrom::try_from).transpose()?,
     };
 
-    Ok(request)
+    Ok((request, usage.unwrap_or_default().into()))
 }
 
 /// ToDo: this function is supposed to call an inference endpoint internally
 pub async fn convert_query_points_from_grpc(
     query: grpc::QueryPoints,
-    inference_token: InferenceToken,
-) -> Result<CollectionQueryRequest, Status> {
+    inference_params: InferenceParams,
+) -> Result<(CollectionQueryRequest, InferenceUsage), Status> {
     let grpc::QueryPoints {
         collection_name: _,
         prefetch,
@@ -137,8 +141,8 @@ pub async fn convert_query_points_from_grpc(
 
     let BatchAccumGrpc { objects } = batch;
 
-    let inferred =
-        BatchAccumInferred::from_objects(objects, InferenceType::Search, inference_token)
+    let (inferred, usage) =
+        BatchAccumInferred::from_objects(objects, InferenceType::Search, inference_params)
             .await
             .map_err(|e| Status::internal(format!("Inference error: {e}")))?;
 
@@ -151,28 +155,31 @@ pub async fn convert_query_points_from_grpc(
         .map(|q| convert_query_with_inferred(q, &inferred))
         .transpose()?;
 
-    Ok(CollectionQueryRequest {
-        prefetch,
-        query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
-        filter: filter.map(TryFrom::try_from).transpose()?,
-        score_threshold,
-        limit: limit
-            .map(|l| l as usize)
-            .unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
-        offset: offset
-            .map(|o| o as usize)
-            .unwrap_or(CollectionQueryRequest::DEFAULT_OFFSET),
-        params: params.map(From::from),
-        with_vector: with_vectors
-            .map(From::from)
-            .unwrap_or(CollectionQueryRequest::DEFAULT_WITH_VECTOR),
-        with_payload: with_payload
-            .map(TryFrom::try_from)
-            .transpose()?
-            .unwrap_or(CollectionQueryRequest::DEFAULT_WITH_PAYLOAD),
-        lookup_from: lookup_from.map(From::from),
-    })
+    Ok((
+        CollectionQueryRequest {
+            prefetch,
+            query,
+            using: using.unwrap_or_else(|| DEFAULT_VECTOR_NAME.to_owned()),
+            filter: filter.map(TryFrom::try_from).transpose()?,
+            score_threshold,
+            limit: limit
+                .map(|l| l as usize)
+                .unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
+            offset: offset
+                .map(|o| o as usize)
+                .unwrap_or(CollectionQueryRequest::DEFAULT_OFFSET),
+            params: params.map(From::from),
+            with_vector: with_vectors
+                .map(From::from)
+                .unwrap_or(CollectionQueryRequest::DEFAULT_WITH_VECTOR),
+            with_payload: with_payload
+                .map(TryFrom::try_from)
+                .transpose()?
+                .unwrap_or(CollectionQueryRequest::DEFAULT_WITH_PAYLOAD),
+            lookup_from: lookup_from.map(LookupLocation::try_from).transpose()?,
+        },
+        usage.unwrap_or_default().into(),
+    ))
 }
 
 fn convert_prefetch_with_inferred(
@@ -202,14 +209,14 @@ fn convert_prefetch_with_inferred(
     Ok(CollectionPrefetch {
         prefetch: nested_prefetches,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
-        filter: filter.map(TryFrom::try_from).transpose()?,
-        score_threshold,
+        using: using.unwrap_or_else(|| DEFAULT_VECTOR_NAME.to_owned()),
+        filter: filter.map(Filter::try_from).transpose()?,
+        score_threshold: score_threshold.map(OrderedFloat),
         limit: limit
             .map(|l| l as usize)
             .unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
-        params: params.map(From::from),
-        lookup_from: lookup_from.map(From::from),
+        params: params.map(SearchParams::from),
+        lookup_from: lookup_from.map(LookupLocation::try_from).transpose()?,
     })
 }
 
@@ -257,6 +264,9 @@ fn convert_query_with_inferred(
                 RecommendStrategy::BestScore => {
                     Query::Vector(VectorQuery::RecommendBestScore(reco_query))
                 }
+                RecommendStrategy::SumScores => {
+                    Query::Vector(VectorQuery::RecommendSumScores(reco_query))
+                }
             }
         }
         Variant::Discover(discover) => {
@@ -283,7 +293,63 @@ fn convert_query_with_inferred(
         }
         Variant::OrderBy(order_by) => Query::OrderBy(OrderBy::try_from(order_by)?),
         Variant::Fusion(fusion) => Query::Fusion(FusionInternal::try_from(fusion)?),
+        Variant::Rrf(rrf) => Query::Fusion(FusionInternal::try_from(rrf)?),
+        Variant::Formula(formula) => Query::Formula(FormulaInternal::try_from(formula)?),
         Variant::Sample(sample) => Query::Sample(SampleInternal::try_from(sample)?),
+        Variant::NearestWithMmr(grpc::NearestInputWithMmr { nearest, mmr }) => {
+            let nearest =
+                nearest.ok_or_else(|| Status::invalid_argument("nearest vector is missing"))?;
+            let nearest = convert_vector_input_with_inferred(nearest, inferred)?;
+
+            let mmr = mmr.ok_or_else(|| Status::invalid_argument("mmr is missing"))?;
+            let grpc::Mmr {
+                diversity,
+                candidates_limit,
+            } = mmr;
+            let mmr = Mmr {
+                diversity,
+                candidates_limit: candidates_limit.map(|x| x as usize),
+            };
+
+            Query::Vector(VectorQuery::NearestWithMmr(NearestWithMmr { nearest, mmr }))
+        }
+        Variant::RelevanceFeedback(feedback) => {
+            let grpc::RelevanceFeedbackInput {
+                target,
+                feedback,
+                strategy,
+            } = feedback;
+
+            let target = target.ok_or_else(|| Status::invalid_argument("target is missing"))?;
+            let target = convert_vector_input_with_inferred(target, inferred)?;
+
+            let feedback = feedback
+                .into_iter()
+                .map(|item| {
+                    let example = convert_vector_input_with_inferred(
+                        item.example.ok_or_else(|| {
+                            Status::invalid_argument("feedback example is missing")
+                        })?,
+                        inferred,
+                    )?;
+
+                    Ok(FeedbackItem {
+                        vector: example,
+                        score: OrderedFloat(item.score),
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+
+            let strategy =
+                strategy.ok_or_else(|| Status::invalid_argument("strategy is missing"))?;
+            let strategy = FeedbackStrategy::try_from(strategy)?;
+
+            Query::Vector(VectorQuery::Feedback(FeedbackInternal {
+                target,
+                feedback,
+                strategy,
+            }))
+        }
     };
 
     Ok(query)
@@ -300,7 +366,7 @@ fn convert_vector_input_with_inferred(
         .ok_or_else(|| Status::invalid_argument("VectorInput variant is missing"))?;
 
     match variant {
-        Variant::Id(id) => Ok(VectorInputInternal::Id(TryFrom::try_from(id)?)),
+        Variant::Id(id) => Ok(VectorInputInternal::Id(PointIdType::try_from(id)?)),
         Variant::Dense(dense) => Ok(VectorInputInternal::Vector(VectorInternal::Dense(
             From::from(dense),
         ))),
@@ -308,7 +374,7 @@ fn convert_vector_input_with_inferred(
             From::from(sparse),
         ))),
         Variant::MultiDense(multi_dense) => Ok(VectorInputInternal::Vector(
-            VectorInternal::MultiDense(From::from(multi_dense)),
+            VectorInternal::MultiDense(MultiDenseVectorInternal::from(multi_dense)),
         )),
         Variant::Document(doc) => {
             let doc: rest::Document = doc
@@ -388,9 +454,9 @@ fn context_pair_from_grpc_with_inferred(
 mod tests {
     use std::collections::HashMap;
 
+    use api::grpc::qdrant::Value;
     use api::grpc::qdrant::value::Kind;
     use api::grpc::qdrant::vector_input::Variant;
-    use api::grpc::qdrant::Value;
     use collection::operations::point_ops::VectorPersisted;
 
     use super::*;
@@ -532,9 +598,11 @@ mod tests {
 
         let result = context_pair_from_grpc_with_inferred(pair, &inferred);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .message()
-            .contains("positive is missing"));
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("positive is missing"),
+        );
     }
 }

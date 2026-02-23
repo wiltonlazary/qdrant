@@ -1,16 +1,18 @@
 use std::fmt;
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::{BitSlice, BitVec};
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::ext::BitSliceExt as _;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
-use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::data_types::named_vectors::{CowMultiVector, CowVector};
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{
@@ -18,10 +20,11 @@ use crate::data_types::vectors::{
 };
 use crate::types::{Distance, MultiVectorConfig, VectorStorageDatatype};
 use crate::vector_storage::bitvec::bitvec_set_deleted;
-use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
-use crate::vector_storage::common::{StoredRecord, CHUNK_SIZE, VECTOR_READ_BATCH_SIZE};
-use crate::vector_storage::{MultiVectorStorage, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::common::{CHUNK_SIZE, StoredRecord};
+use crate::vector_storage::{
+    AccessPattern, MultiVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum,
+};
 
 type StoredMultiDenseVector<T> = StoredRecord<TypedMultiDenseVector<T>>;
 
@@ -64,6 +67,43 @@ impl<T: fmt::Debug + PrimitiveVectorElement> fmt::Debug for SimpleMultiDenseVect
 }
 
 pub fn open_simple_multi_dense_vector_storage(
+    storage_element_type: VectorStorageDatatype,
+    database: Arc<RwLock<DB>>,
+    database_column_name: &str,
+    dim: usize,
+    distance: Distance,
+    multi_vector_config: MultiVectorConfig,
+    stopped: &AtomicBool,
+) -> OperationResult<VectorStorageEnum> {
+    match storage_element_type {
+        VectorStorageDatatype::Float32 => open_simple_multi_dense_vector_storage_full(
+            database,
+            database_column_name,
+            dim,
+            distance,
+            multi_vector_config,
+            stopped,
+        ),
+        VectorStorageDatatype::Uint8 => open_simple_multi_dense_vector_storage_byte(
+            database,
+            database_column_name,
+            dim,
+            distance,
+            multi_vector_config,
+            stopped,
+        ),
+        VectorStorageDatatype::Float16 => open_simple_multi_dense_vector_storage_half(
+            database,
+            database_column_name,
+            dim,
+            distance,
+            multi_vector_config,
+            stopped,
+        ),
+    }
+}
+
+pub fn open_simple_multi_dense_vector_storage_full(
     database: Arc<RwLock<DB>>,
     database_column_name: &str,
     dim: usize,
@@ -202,7 +242,8 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
         &self,
         key: PointOffsetType,
         deleted: bool,
-        vector: Option<TypedMultiDenseVectorRef<T>>,
+        vector: Option<TypedMultiDenseVectorRef<'_, T>>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         let mut record = StoredMultiDenseVector {
             deleted,
@@ -217,11 +258,15 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
                 .extend_from_slice(vector.flattened_vectors);
         }
 
+        let key_enc = bincode::serialize(&key).unwrap();
+        let record_enc = bincode::serialize(&record).unwrap();
+
+        hw_counter
+            .vector_io_write_counter()
+            .incr_delta(key_enc.len() + record_enc.len());
+
         // Store updated record
-        self.db_wrapper.put(
-            bincode::serialize(&key).unwrap(),
-            bincode::serialize(&record).unwrap(),
-        )?;
+        self.db_wrapper.put(key_enc, record_enc)?;
 
         Ok(())
     }
@@ -231,6 +276,7 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
         key: PointOffsetType,
         vector: VectorRef,
         is_deleted: bool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         let multi_vector: TypedMultiDenseVectorRef<VectorElementType> = vector.try_into()?;
         let multi_vector = T::from_float_multivector(CowMultiVector::Borrowed(multi_vector));
@@ -238,7 +284,9 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
         assert_eq!(multi_vector.dim, self.dim);
         let multivector_size_in_bytes = std::mem::size_of_val(multi_vector.flattened_vectors);
         if multivector_size_in_bytes >= CHUNK_SIZE {
-            return Err(OperationError::service_error(format!("Cannot insert multi vector of size {multivector_size_in_bytes} to the vector storage. It's too large, maximum size is {CHUNK_SIZE}.")));
+            return Err(OperationError::service_error(format!(
+                "Cannot insert multi vector of size {multivector_size_in_bytes} to the vector storage. It's too large, maximum size is {CHUNK_SIZE}.",
+            )));
         }
 
         let key_usize = key as usize;
@@ -271,7 +319,13 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
         }
 
         self.set_deleted(key, is_deleted);
-        self.update_stored(key, is_deleted, Some(multi_vector))?;
+        self.update_stored(key, is_deleted, Some(multi_vector), hw_counter)?;
+        Ok(())
+    }
+
+    /// Destroy this vector storage, remove persisted data from RocksDB
+    pub fn destroy(&self) -> OperationResult<()> {
+        self.db_wrapper.remove_column_family()?;
         Ok(())
     }
 }
@@ -282,12 +336,16 @@ impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for SimpleMultiDenseVector
     }
 
     /// Panics if key is out of bounds
-    fn get_multi(&self, key: PointOffsetType) -> TypedMultiDenseVectorRef<T> {
-        self.get_multi_opt(key).expect("vector not found")
+    fn get_multi<P: AccessPattern>(&self, key: PointOffsetType) -> TypedMultiDenseVectorRef<'_, T> {
+        self.get_multi_opt::<P>(key).expect("vector not found")
     }
 
     /// None if key is out of bounds
-    fn get_multi_opt(&self, key: PointOffsetType) -> Option<TypedMultiDenseVectorRef<T>> {
+    fn get_multi_opt<P: AccessPattern>(
+        &self,
+        key: PointOffsetType,
+    ) -> Option<TypedMultiDenseVectorRef<'_, T>> {
+        // No sequential optimizations available for in memory storage.
         self.vectors_metadata.get(key as usize).map(|metadata| {
             let flattened_vectors = self
                 .vectors
@@ -298,19 +356,6 @@ impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for SimpleMultiDenseVector
                 dim: self.dim,
             }
         })
-    }
-
-    fn get_batch_multi<'a>(
-        &'a self,
-        keys: &[PointOffsetType],
-        vectors: &mut [TypedMultiDenseVectorRef<'a, T>],
-    ) {
-        debug_assert_eq!(keys.len(), vectors.len());
-        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
-
-        for (i, key) in keys.iter().enumerate() {
-            vectors[i] = self.get_multi(*key);
-        }
     }
 
     fn iterate_inner_vectors(&self) -> impl Iterator<Item = &[T]> + Clone + Send {
@@ -352,20 +397,25 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleMultiDenseVectorStorage<
         self.vectors_metadata.len()
     }
 
-    fn get_vector(&self, key: PointOffsetType) -> CowVector {
-        self.get_vector_opt(key).expect("vector not found")
+    fn get_vector<P: AccessPattern>(&self, key: PointOffsetType) -> CowVector<'_> {
+        self.get_vector_opt::<P>(key).expect("vector not found")
     }
 
-    fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
-        self.get_multi_opt(key).map(|multi_dense_vector| {
+    fn get_vector_opt<P: AccessPattern>(&self, key: PointOffsetType) -> Option<CowVector<'_>> {
+        self.get_multi_opt::<P>(key).map(|multi_dense_vector| {
             CowVector::MultiDense(T::into_float_multivector(CowMultiVector::Borrowed(
                 multi_dense_vector,
             )))
         })
     }
 
-    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
-        self.insert_vector_impl(key, vector, false)
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.insert_vector_impl(key, vector, false, hw_counter)
     }
 
     fn update_from<'a>(
@@ -379,7 +429,12 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleMultiDenseVectorStorage<
             // Do not perform preprocessing - vectors should be already processed
             let other_vector: VectorRef = other_vector.as_vec_ref();
             let new_id = self.vectors_metadata.len() as PointOffsetType;
-            self.insert_vector_impl(new_id, other_vector, other_deleted)?;
+            self.insert_vector_impl(
+                new_id,
+                other_vector,
+                other_deleted,
+                &HardwareCounterCell::disposable(), // This function is only used by internal operations
+            )?;
         }
         let end_index = self.vectors_metadata.len() as PointOffsetType;
         Ok(start_index..end_index)
@@ -396,13 +451,14 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleMultiDenseVectorStorage<
     fn delete_vector(&mut self, key: PointOffsetType) -> OperationResult<bool> {
         let is_deleted = !self.set_deleted(key, true);
         if is_deleted {
-            self.update_stored(key, true, None)?;
+            // We don't measure deletions.
+            self.update_stored(key, true, None, &HardwareCounterCell::disposable())?;
         }
         Ok(is_deleted)
     }
 
     fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key as usize).map(|b| *b).unwrap_or(false)
+        self.deleted.get_bit(key as usize).unwrap_or(false)
     }
 
     fn deleted_vector_count(&self) -> usize {
@@ -411,5 +467,116 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleMultiDenseVectorStorage<
 
     fn deleted_vector_bitslice(&self) -> &BitSlice {
         self.deleted.as_bitslice()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
+    use crate::data_types::vectors::MultiDenseVectorInternal;
+    use crate::segment_constructor::migrate_rocksdb_multi_dense_vector_storage_to_mmap;
+    use crate::vector_storage::Sequential;
+
+    const RAND_SEED: u64 = 42;
+
+    /// Create RocksDB based multi dense vector storage.
+    ///
+    /// Migrate it to the mmap based multi dense vector storage and assert vector data is correct.
+    #[test]
+    fn test_migrate_simple_to_mmap() {
+        const POINT_COUNT: PointOffsetType = 128;
+        const DIM: usize = 128;
+        const DELETE_PROBABILITY: f64 = 0.1;
+
+        let mut rng = StdRng::seed_from_u64(RAND_SEED);
+
+        let multi_vector_config = MultiVectorConfig::default();
+        let db_dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let db = open_db(db_dir.path(), &[DB_VECTOR_CF]).unwrap();
+
+        // Create simple multi dense vector storage, insert test points and delete some of them again
+        let mut storage = open_simple_multi_dense_vector_storage_full(
+            db,
+            DB_VECTOR_CF,
+            DIM,
+            Distance::Dot,
+            multi_vector_config,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        for internal_id in 0..POINT_COUNT {
+            let size = rng.random_range(1..=4);
+            let vectors = std::iter::repeat_with(|| {
+                std::iter::repeat_with(|| rng.random_range(-1.0..1.0))
+                    .take(DIM)
+                    .collect()
+            })
+            .take(size)
+            .collect::<Vec<Vec<_>>>();
+            let multivec = MultiDenseVectorInternal::try_from(vectors).unwrap();
+            storage
+                .insert_vector(
+                    internal_id,
+                    VectorRef::from(&multivec),
+                    &HardwareCounterCell::disposable(),
+                )
+                .unwrap();
+            if rng.random_bool(DELETE_PROBABILITY) {
+                storage.delete_vector(internal_id).unwrap();
+            }
+        }
+
+        let deleted_vector_count = storage.deleted_vector_count();
+        let total_vector_count = storage.total_vector_count();
+
+        // Migrate from RocksDB to mmap storage
+        let storage_dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let new_storage = migrate_rocksdb_multi_dense_vector_storage_to_mmap(
+            &storage,
+            DIM,
+            multi_vector_config,
+            storage_dir.path(),
+        )
+        .expect("failed to migrate from RocksDB to mmap");
+
+        // Destroy persisted RocksDB dense vector data
+        match storage {
+            VectorStorageEnum::MultiDenseSimple(storage) => storage.destroy().unwrap(),
+            VectorStorageEnum::MultiDenseSimpleByte(storage) => storage.destroy().unwrap(),
+            VectorStorageEnum::MultiDenseSimpleHalf(storage) => storage.destroy().unwrap(),
+            _ => unreachable!("unexpected vector storage type"),
+        }
+
+        // We can drop RocksDB storage now
+        db_dir.close().expect("failed to drop RocksDB storage");
+
+        // Assert vector counts and data
+        let mut rng = StdRng::seed_from_u64(RAND_SEED);
+        assert_eq!(new_storage.deleted_vector_count(), deleted_vector_count);
+        assert_eq!(new_storage.total_vector_count(), total_vector_count);
+        for internal_id in 0..POINT_COUNT {
+            let size = rng.random_range(1..=4);
+            let vectors = std::iter::repeat_with(|| {
+                std::iter::repeat_with(|| rng.random_range(-1.0..1.0))
+                    .take(DIM)
+                    .collect()
+            })
+            .take(size)
+            .collect::<Vec<Vec<_>>>();
+            let multivec = MultiDenseVectorInternal::try_from(vectors).unwrap();
+            assert_eq!(
+                new_storage.get_vector::<Sequential>(internal_id),
+                CowVector::from(&multivec),
+            );
+            assert_eq!(
+                new_storage.is_deleted_vector(internal_id),
+                rng.random_bool(DELETE_PROBABILITY)
+            );
+        }
     }
 }

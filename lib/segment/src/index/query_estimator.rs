@@ -64,6 +64,28 @@ pub fn adjust_to_available_vectors(
     }
 }
 
+/// Combine cardinality of multiple estimations in an OR fashion by using the complement rule.
+/// Assumes that the estimations are independent.
+///
+/// Formula is  `(1 - ∏(1-pᵢ)) * total`:
+/// * For each condition, it calculates the probability that an item does not match it: `1 - (x / total)`.
+/// * It multiplies these probabilities to get the probability that an item matches none of the conditions.
+/// * Subtracts this from 1 to get the probability that an item matches at least one condition.
+/// * Multiplies this probability by the total number of items and rounds to get the expected count.
+pub fn expected_should_estimation(estimations: impl Iterator<Item = usize>, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+
+    let element_not_hit_prob: f64 = estimations
+        .map(|x| 1.0 - (x as f64 / total as f64))
+        .product();
+
+    let element_hit_prob = 1.0 - element_not_hit_prob;
+
+    (element_hit_prob * (total as f64)).round() as usize
+}
+
 pub fn combine_should_estimations(
     estimations: &[CardinalityEstimation],
     total: usize,
@@ -78,12 +100,7 @@ pub fn combine_should_estimations(
         }
         clauses.append(&mut estimation.primary_clauses.clone());
     }
-    let element_not_hit_prob: f64 = estimations
-        .iter()
-        .map(|x| (total - x.exp) as f64 / (total as f64))
-        .product();
-    let element_hit_prob = 1.0 - element_not_hit_prob;
-    let expected_count = (element_hit_prob * (total as f64)).round() as usize;
+    let expected_count = expected_should_estimation(estimations.iter().map(|x| x.exp), total);
     CardinalityEstimation {
         primary_clauses: clauses,
         min: estimations.iter().map(|x| x.min).max().unwrap_or(0),
@@ -248,9 +265,9 @@ pub fn invert_estimation(
 ) -> CardinalityEstimation {
     CardinalityEstimation {
         primary_clauses: vec![],
-        min: total - estimation.max,
-        exp: total - estimation.exp,
-        max: total - estimation.min,
+        min: total.saturating_sub(estimation.max),
+        exp: total.saturating_sub(estimation.exp),
+        max: total.saturating_sub(estimation.min),
     }
 }
 
@@ -270,6 +287,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::field_index::ResolvedHasId;
     use crate::json_path::JsonPath;
     use crate::types::{FieldCondition, HasIdCondition};
 
@@ -283,7 +301,9 @@ mod tests {
             geo_bounding_box: None,
             geo_radius: None,
             values_count: None,
+            is_empty: None,
             geo_polygon: None,
+            is_null: None,
         })
     }
 
@@ -314,25 +334,30 @@ mod tests {
                 _ => CardinalityEstimation::unknown(TOTAL),
             },
             Condition::HasId(has_id) => CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::Ids(
-                    has_id
+                primary_clauses: vec![PrimaryCondition::Ids(ResolvedHasId {
+                    point_ids: has_id.has_id.clone(),
+                    resolved_point_offsets: has_id
                         .has_id
                         .iter()
-                        .map(|&x| format!("{x}").parse().unwrap()) // hack to convert ID as "number"
+                        .map(|id| id.to_string().parse().unwrap())
                         .collect(),
-                )],
+                })],
                 min: has_id.has_id.len(),
                 exp: has_id.has_id.len(),
                 max: has_id.has_id.len(),
             },
             Condition::IsEmpty(condition) => CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::IsEmpty(condition.to_owned())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(
+                    FieldCondition::new_is_empty(condition.is_empty.key.clone(), true),
+                ))],
                 min: 0,
                 exp: TOTAL / 2,
                 max: TOTAL,
             },
             Condition::IsNull(condition) => CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::IsNull(condition.to_owned())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(
+                    FieldCondition::new_is_null(condition.is_null.key.clone(), true),
+                ))],
                 min: 0,
                 exp: TOTAL / 2,
                 max: TOTAL,

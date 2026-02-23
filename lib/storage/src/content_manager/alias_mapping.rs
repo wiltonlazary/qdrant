@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use collection::shards::CollectionId;
-use io::file_operations::{atomic_save_json, read_json};
+use common::fs::{atomic_save_json, read_json};
+use fs_err as fs;
 use serde::{Deserialize, Serialize};
 
 use crate::content_manager::errors::StorageError;

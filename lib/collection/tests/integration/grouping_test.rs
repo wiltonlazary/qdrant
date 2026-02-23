@@ -1,12 +1,12 @@
 use collection::collection::Collection;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::WriteOrdering;
 use collection::operations::types::{RecommendRequestInternal, UpdateStatus};
-use collection::operations::CollectionUpdateOperations;
 use itertools::Itertools;
+use rand::Rng;
 use rand::distr::Uniform;
 use rand::rngs::ThreadRng;
-use rand::Rng;
 use segment::data_types::vectors::DenseVector;
 use segment::json_path::JsonPath;
 use segment::types::{Filter, WithPayloadInterface, WithVector};
@@ -80,8 +80,15 @@ mod group_by {
             PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
         );
 
+        let hw_counter = HwMeasurementAcc::new();
         let insert_result = collection
-            .update_from_client_simple(insert_points, true, WriteOrdering::default())
+            .update_from_client_simple(
+                insert_points,
+                true,
+                None,
+                WriteOrdering::default(),
+                hw_counter.clone(),
+            )
             .await
             .expect("insert failed");
 
@@ -471,17 +478,18 @@ mod group_by {
 
 /// Tests out the different features working together. The individual features are already tested in other places.
 mod group_by_builder {
+    use std::sync::Arc;
+
     use api::rest::SearchRequestInternal;
     use collection::grouping::GroupBy;
-    use collection::lookup::types::PseudoId;
     use collection::lookup::WithLookup;
+    use collection::lookup::types::PseudoId;
     use collection::operations::point_ops::{
         BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
     };
     use common::counter::hardware_accumulator::HwMeasurementAcc;
     use segment::json_path::JsonPath;
     use segment::payload_json;
-    use tokio::sync::RwLock;
 
     use super::*;
 
@@ -489,7 +497,7 @@ mod group_by_builder {
 
     struct Resources {
         request: GroupRequest,
-        lookup_collection: RwLock<Collection>,
+        lookup_collection: Arc<Collection>,
         collection: Collection,
     }
 
@@ -514,6 +522,8 @@ mod group_by_builder {
         let collection_dir = tempfile::Builder::new().prefix("chunks").tempdir().unwrap();
         let collection = simple_collection_fixture(collection_dir.path(), 1).await;
 
+        let hw_counter = HwMeasurementAcc::new();
+
         // insert chunk points
         {
             let batch = BatchPersisted {
@@ -536,7 +546,13 @@ mod group_by_builder {
             );
 
             let insert_result = collection
-                .update_from_client_simple(insert_points, true, WriteOrdering::default())
+                .update_from_client_simple(
+                    insert_points,
+                    true,
+                    None,
+                    WriteOrdering::default(),
+                    hw_counter.clone(),
+                )
                 .await
                 .expect("insert failed");
 
@@ -565,14 +581,20 @@ mod group_by_builder {
                 PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
             );
             let insert_result = lookup_collection
-                .update_from_client_simple(insert_points, true, WriteOrdering::default())
+                .update_from_client_simple(
+                    insert_points,
+                    true,
+                    None,
+                    WriteOrdering::default(),
+                    hw_counter.clone(),
+                )
                 .await
                 .expect("insert failed");
 
             assert_eq!(insert_result.status, UpdateStatus::Completed);
         }
 
-        let lookup_collection = RwLock::new(lookup_collection);
+        let lookup_collection = Arc::new(lookup_collection);
 
         Resources {
             request,
@@ -623,7 +645,7 @@ mod group_by_builder {
             with_vectors: Some(true.into()),
         });
 
-        let collection_by_name = |_: String| async { Some(lookup_collection.read().await) };
+        let collection_by_name = |_: String| async { Some(lookup_collection.clone()) };
 
         let hw_acc = HwMeasurementAcc::new();
         let result = GroupBy::new(request.clone(), &collection, collection_by_name, hw_acc)

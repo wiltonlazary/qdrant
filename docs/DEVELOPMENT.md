@@ -41,6 +41,31 @@ Make sure to mount it as a volume, otherwise docker will drop it with the contai
 
 Now Qdrant should be accessible at [localhost:6333](http://localhost:6333/).
 
+#### Docker image build parameters
+
+As it was mentioned before, you can build your own Qdrant docker image with
+
+```bash
+docker build . --tag=qdrant/qdrant
+```
+
+You may also configure certain Docker arguments to fine tune your image:
+
++ `FEATURES` -- define cargo features;
++ `RUSTFLAGS` -- define `rustc` compilation flags;
++ `LINKER` -- define linker in `RUSTFLAGS`;
++ `TARGET_CPU` -- define `target-cpu` in `RUSTFLAGS`;
++ `JEMALLOC_SYS_WITH_LG_PAGE` -- define jemalloc's page size in base 2 log; may be
+  useful when compiling for some ARM machines; it corresponds to jemalloc's
+  `--with-lg-page` configure argument.
++ `GPU` -- add GPU support, either `nvidia` or `amd`.
+
+For example:
+
+```bash
+docker build . --tag=qdrant/qdrant \
+    --build-arg TARGET_CPU=native --build-arg GPU=amd
+```
 
 ### Local development
 #### Linux/Debian/MacOS
@@ -83,11 +108,8 @@ To run Qdrant on local development environment you need to install below:
 
     ./target/release/qdrant
     ```
-- Install Python dependencies for testing
-    ```shell
-    poetry -C tests install --sync
-    ```
-    Then you could use `poetry -C run pytest tests/openapi` and `poetry -C run pytest tests/consensus_tests` to run the tests.
+- Install [uv](https://docs.astral.sh/uv) for testing
+    Then you can use `uv --project tests run pytest tests/openapi` and `uv --project tests run pytest tests/consensus_tests` to run the tests.
 - Use the web UI
 
     Web UI repo is [in a separate repo](https://github.com/qdrant/qdrant-web-ui), but there's a utility script to sync it to the `static` folder:
@@ -272,7 +294,7 @@ Here is a quick step-by-step guide:
 2. change specs in `/openapi/*ytt.yaml`
 3. add new schema definitions to `src/schema_generator.rs`
 4. run `./tools/generate_openapi_models.sh` to generate specs
-5. update integration tests `tests/openapi` and run them with `pytest tests/openapi` (use poetry or nix to get `pytest`)
+5. update integration tests `tests/openapi` and run them with `uv --project tests run pytest tests/openapi`
 6. expose file by starting an HTTP server, for instance `python -m http.server`, in `/docs/redoc`
 7. validate specs by browsing redoc on `http://localhost:8000/?v=master`
 8. validate `openapi-merged.yaml` using [swagger editor](https://editor.swagger.io/)
@@ -283,13 +305,12 @@ Qdrant uses [tonic](https://github.com/hyperium/tonic) to serve gRPC traffic.
 
 Our protocol buffers are defined in `lib/api/src/grpc/proto/*.proto`
 
-1. define request and response types using protocol buffers (use [oneOf](https://developers.google.com/protocol-buffers/docs/proto3#oneof) for enums payloads)
+1. define request and response types using protocol buffers (use [oneof](https://developers.google.com/protocol-buffers/docs/proto3#oneof) for enums payloads)
 2. specify RPC methods inside the service definition using protocol buffers
-3. `cargo build` will generate the struct definitions and a service trait
+3. `cargo build` or `cargo build -p api` will generate the struct definitions and a service trait
 4. implement the service trait in Rust
 5. start server `cargo run --bin qdrant`
 6. run integration test `./tests/basic_grpc_test.sh`
-7. generate docs `./tools/generate_grpc_docs.sh`
 
 Here is a good [tonic tutorial](https://github.com/hyperium/tonic/blob/master/examples/routeguide-tutorial.md#defining-the-service) for reference.
 

@@ -1,4 +1,4 @@
-use common::validation::validate_collection_name;
+use common::validation::{validate_collection_name, validate_collection_name_legacy};
 use serde::Deserialize;
 use validator::Validate;
 
@@ -10,6 +10,7 @@ pub mod discovery_api;
 pub mod facet_api;
 pub mod issues_api;
 pub mod local_shard_api;
+pub mod profiler_api;
 pub mod query_api;
 pub mod read_params;
 pub mod recommend_api;
@@ -41,6 +42,9 @@ struct StrictCollectionPath {
 /// collections. Basic validation is enforced everywhere else.
 #[derive(Deserialize, Validate)]
 struct CollectionPath {
-    #[validate(length(min = 1, max = 255))]
+    #[validate(
+        length(min = 1, max = 255),
+        custom(function = "validate_collection_name_legacy")
+    )]
     name: String,
 }

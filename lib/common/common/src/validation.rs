@@ -77,6 +77,29 @@ pub fn validate_collection_name(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Validate the collection name contains no illegal characters, legacy edition
+///
+/// Similar to [`validate_collection_name`], but this still allows some special characters that
+/// were supported pre Qdrant 1.5. More specifically, this only disallows characters that could
+/// never have been used on both Linux and Windows filesystems.
+///
+/// This does not check the length of the name.
+pub fn validate_collection_name_legacy(value: &str) -> Result<(), ValidationError> {
+    // Disallowed characters on on both Linux/Windows, sourced from: <https://stackoverflow.com/a/31976060/1000145>
+    const INVALID_CHARS: [char; 2] = ['/', '\0'];
+
+    match INVALID_CHARS.into_iter().find(|c| value.contains(*c)) {
+        Some(c) => {
+            let mut err = ValidationError::new("does_not_contain");
+            err.add_param(Cow::from("pattern"), &c);
+            err.message
+                .replace(format!("collection name cannot contain \"{c}\" char").into());
+            Err(err)
+        }
+        None => Ok(()),
+    }
+}
+
 /// Validate a polygon has at least 4 points and is closed.
 pub fn validate_geo_polygon<T>(points: &[T]) -> Result<(), ValidationError>
 where
@@ -154,9 +177,9 @@ pub fn validate_sha256_hash(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErrors> {
+pub fn validate_multi_vector_by_length(multivec_length: &[usize]) -> Result<(), ValidationErrors> {
     // non_empty
-    if multivec.is_empty() {
+    if multivec_length.is_empty() {
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("empty_multi_vector");
         err.add_param(Cow::from("message"), &"multi vector must not be empty");
@@ -165,7 +188,7 @@ pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErr
     }
 
     // check all individual vectors non-empty
-    if multivec.iter().any(|v| v.is_empty()) {
+    if multivec_length.contains(&0) {
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("empty_vector");
         err.add_param(Cow::from("message"), &"all vectors must be non-empty");
@@ -174,7 +197,7 @@ pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErr
     }
 
     // total size of all vectors must be less than MAX_MULTIVECTOR_FLATTENED_LEN
-    let flattened_len = multivec.iter().map(|v| v.len()).sum::<usize>();
+    let flattened_len = multivec_length.iter().sum::<usize>();
     if flattened_len >= MAX_MULTIVECTOR_FLATTENED_LEN {
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("multi_vector_too_large");
@@ -184,15 +207,14 @@ pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErr
     }
 
     // all vectors must have the same length
-    let dim = multivec[0].len();
-    if let Some(bad_vec) = multivec.iter().find(|v| v.len() != dim) {
+    let dim = multivec_length[0];
+    if let Some(bad_vec) = multivec_length.iter().find(|v| **v != dim) {
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("inconsistent_multi_vector");
         err.add_param(
             Cow::from("message"),
             &format!(
-                "all vectors must have the same dimension, found vector with dimension {}",
-                bad_vec.len()
+                "all vectors must have the same dimension, found vector with dimension {bad_vec}",
             ),
         );
         errors.add("data", err);
@@ -200,6 +222,11 @@ pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErr
     }
 
     Ok(())
+}
+
+pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErrors> {
+    let multivec_length: Vec<_> = multivec.iter().map(|v| v.len()).collect();
+    validate_multi_vector_by_length(&multivec_length)
 }
 
 pub fn validate_multi_vector_len(
@@ -227,7 +254,7 @@ pub fn validate_multi_vector_len(
         return Err(errors);
     }
 
-    if dense_vector_len % vectors_count as usize != 0 {
+    if !dense_vector_len.is_multiple_of(vectors_count as usize) {
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("invalid dense vector length for vectors count");
         err.add_param(Cow::from("vector_len"), &dense_vector_len);
@@ -299,6 +326,14 @@ mod tests {
         assert!(validate_collection_name("no/path").is_err());
         assert!(validate_collection_name("no*path").is_err());
         assert!(validate_collection_name("?").is_err());
+        assert!(validate_collection_name("\0").is_err());
+
+        assert!(validate_collection_name_legacy("test_collection").is_ok());
+        assert!(validate_collection_name_legacy("").is_ok());
+        assert!(validate_collection_name_legacy("no/path").is_err());
+        assert!(validate_collection_name_legacy("no*path").is_ok());
+        assert!(validate_collection_name_legacy("?").is_ok());
+        assert!(validate_collection_name_legacy("\0").is_err());
     }
 
     #[test]
@@ -330,21 +365,27 @@ mod tests {
 
     #[test]
     fn test_validate_sha256_hash() {
-        assert!(validate_sha256_hash(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        )
-        .is_ok());
-        assert!(validate_sha256_hash(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
-        )
-        .is_err());
-        assert!(validate_sha256_hash(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
-        )
-        .is_err());
-        assert!(validate_sha256_hash(
-            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEG"
-        )
-        .is_err());
+        assert!(
+            validate_sha256_hash(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .is_ok(),
+        );
+        assert!(
+            validate_sha256_hash("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde")
+                .is_err(),
+        );
+        assert!(
+            validate_sha256_hash(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+            )
+            .is_err(),
+        );
+        assert!(
+            validate_sha256_hash(
+                "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEG"
+            )
+            .is_err(),
+        );
     }
 }

@@ -1,14 +1,15 @@
 use std::borrow::Cow;
 
 use common::validation::validate_multi_vector;
+use segment::index::query_optimization::rescore_formula::parsed_formula::VariableId;
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use super::schema::BatchVectorStruct;
 use super::{
-    Batch, ContextInput, Fusion, OrderByInterface, PointVectors, Query, QueryInterface,
-    RecommendInput, Sample, VectorInput,
+    Batch, BatchVectorStruct, ContextInput, Expression, FormulaQuery, Fusion, NamedVectorStruct,
+    OrderByInterface, PointVectors, Query, QueryInterface, RecommendInput, RelevanceFeedbackInput,
+    Sample, VectorInput,
 };
-use crate::rest::NamedVectorStruct;
+use crate::rest::FeedbackStrategy;
 
 impl Validate for NamedVectorStruct {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
@@ -32,13 +33,16 @@ impl Validate for QueryInterface {
 impl Validate for Query {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
-            Query::Nearest(vector) => vector.nearest.validate(),
-            Query::Recommend(recommend) => recommend.recommend.validate(),
-            Query::Discover(discover) => discover.discover.validate(),
-            Query::Context(context) => context.context.validate(),
-            Query::Fusion(fusion) => fusion.fusion.validate(),
-            Query::OrderBy(order_by) => order_by.order_by.validate(),
-            Query::Sample(sample) => sample.sample.validate(),
+            Query::Nearest(vector) => vector.validate(),
+            Query::Recommend(recommend) => recommend.validate(),
+            Query::Discover(discover) => discover.validate(),
+            Query::Context(context) => context.validate(),
+            Query::Fusion(fusion) => fusion.validate(),
+            Query::Rrf(rrf) => rrf.validate(),
+            Query::Formula(formula) => formula.validate(),
+            Query::OrderBy(order_by) => order_by.validate(),
+            Query::Sample(sample) => sample.validate(),
+            Query::RelevanceFeedback(feedback) => feedback.validate(),
         }
     }
 }
@@ -91,11 +95,52 @@ impl Validate for ContextInput {
     }
 }
 
+impl Validate for FeedbackStrategy {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            FeedbackStrategy::Naive(simple_feedback_strategy) => {
+                simple_feedback_strategy.validate()
+            }
+        }
+    }
+}
 impl Validate for Fusion {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
             Fusion::Rrf | Fusion::Dbsf => Ok(()),
         }
+    }
+}
+
+impl Validate for FormulaQuery {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        let Self { formula, defaults } = self;
+
+        // validate formula Expression
+        formula.validate()?;
+        let mut errors = validator::ValidationErrors::new();
+
+        for (key, value) in defaults.iter() {
+            let var_id = match key.parse() {
+                Ok(var_id) => var_id,
+                Err(err) => {
+                    let validation =
+                        ValidationError::new("Invalid variable name").with_message(Cow::Owned(err));
+                    errors.add("defaults", validation);
+                    continue;
+                }
+            };
+
+            match var_id {
+                VariableId::Score(_) if value.as_number().is_none() => {
+                    let validation = ValidationError::new("Score default must be a number");
+                    errors.add("defaults", validation);
+                }
+                _ => (),
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -185,14 +230,14 @@ impl Validate for Batch {
             BatchVectorStruct::Image(_) => {}
             BatchVectorStruct::Object(_) => {}
         }
-        if let Some(payload_vector) = &batch.payloads {
-            if payload_vector.len() != batch.ids.len() {
-                return Err(create_error(format!(
-                    "number of ids and payloads must be equal ({} != {})",
-                    batch.ids.len(),
-                    payload_vector.len(),
-                )));
-            }
+        if let Some(payload_vector) = &batch.payloads
+            && payload_vector.len() != batch.ids.len()
+        {
+            return Err(create_error(format!(
+                "number of ids and payloads must be equal ({} != {})",
+                batch.ids.len(),
+                payload_vector.len(),
+            )));
         }
         Ok(())
     }
@@ -211,4 +256,43 @@ impl Validate for PointVectors {
             self.vector.validate()
         }
     }
+}
+
+impl Validate for Expression {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            Expression::Constant(_) => Ok(()),
+            Expression::Variable(_) => Ok(()),
+            Expression::Condition(condition) => condition.validate(),
+            Expression::GeoDistance(_) => Ok(()),
+            Expression::Datetime(_) => Ok(()),
+            Expression::DatetimeKey(_) => Ok(()),
+            Expression::Mult(mult_expression) => mult_expression.validate(),
+            Expression::Sum(sum_expression) => sum_expression.validate(),
+            Expression::Neg(neg_expression) => neg_expression.validate(),
+            Expression::Abs(abs_expression) => abs_expression.validate(),
+            Expression::Div(div_expression) => div_expression.validate(),
+            Expression::Sqrt(sqrt_expression) => sqrt_expression.validate(),
+            Expression::Pow(pow_expression) => pow_expression.validate(),
+            Expression::Exp(exp_expression) => exp_expression.validate(),
+            Expression::Log10(log10_expression) => log10_expression.validate(),
+            Expression::Ln(ln_expression) => ln_expression.validate(),
+            Expression::LinDecay(lin_decay_expression) => lin_decay_expression.validate(),
+            Expression::ExpDecay(exp_decay_expression) => exp_decay_expression.validate(),
+            Expression::GaussDecay(gauss_decay_expression) => gauss_decay_expression.validate(),
+        }
+    }
+}
+
+/// Struct level validation for `FeedbackInput`
+pub fn validate_relevance_feedback_input(
+    relevance_feedback_input: &RelevanceFeedbackInput,
+) -> Result<(), ValidationError> {
+    if relevance_feedback_input.feedback.is_empty() {
+        let mut err = ValidationError::new("feedback");
+        err.message = Some(Cow::from("feedback elements must be non-empty"));
+        return Err(err);
+    }
+
+    Ok(())
 }

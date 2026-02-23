@@ -221,6 +221,65 @@ def test_disable_indexing(on_disk_vectors):
     drop_collection(collection_name=unindexed_name)
 
 
+@pytest.mark.parametrize(
+    "config_name,vector_config,expected_warnings",
+    [
+        ("no_inline_storage", {}, 0),
+        (
+            "valid_config",
+            {
+                "hnsw_config": {"inline_storage": True},
+                "quantization_config": {"scalar": {"type": "int8"}},
+            },
+            0,
+        ),
+        (
+            "inline_storage_no_quant",
+            {"hnsw_config": {"inline_storage": True}},
+            1,
+        ),
+        (
+            "inline_storage_multivec",
+            {
+                "hnsw_config": {"inline_storage": True},
+                "multivector_config": {"comparator": "max_sim"},
+            },
+            1,
+        ),
+    ],
+)
+def test_configuration_warnings(config_name, vector_config, expected_warnings):
+    test_collection = f"test_{config_name}"
+    drop_collection(collection_name=test_collection)
+
+    # Create collection with specified configuration
+    base_vector_config = {"size": 4, "distance": "Dot"}
+    base_vector_config.update(vector_config)
+
+    response = request_with_validation(
+        api="/collections/{collection_name}",
+        method="PUT",
+        path_params={"collection_name": test_collection},
+        body={"vectors": {"test_vector": base_vector_config}},
+    )
+    assert response.ok
+
+    response = request_with_validation(
+        api="/collections/{collection_name}",
+        method="GET",
+        path_params={"collection_name": test_collection},
+    )
+    assert response.ok
+
+    if expected_warnings > 0:
+        warnings = response.json()["result"]["warnings"]
+        assert len(warnings) == expected_warnings
+    else:
+        assert "warnings" not in response.json()["result"]
+
+    drop_collection(collection_name=test_collection)
+
+
 def insert_vectors(collection_name='test_collection', count=2000, size=256):
     ids = [x for x in range(count)]
     vectors = [[random.random() for _ in range(size)] for _ in range(count)]

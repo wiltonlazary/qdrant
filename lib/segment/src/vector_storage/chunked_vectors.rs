@@ -1,12 +1,9 @@
 use std::cmp::max;
 use std::collections::TryReserveError;
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
 use std::mem;
-use std::path::Path;
 
 use crate::common::vector_utils::{TrySetCapacity, TrySetCapacityExact};
-use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
+use crate::vector_storage::VectorOffsetType;
 use crate::vector_storage::common::CHUNK_SIZE;
 
 #[derive(Debug)]
@@ -169,59 +166,6 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
     }
 }
 
-impl quantization::EncodedStorage for ChunkedVectors<u8> {
-    fn get_vector_data(&self, index: usize, _vector_size: usize) -> &[u8] {
-        self.get(index)
-    }
-
-    fn from_file(
-        path: &Path,
-        quantized_vector_size: usize,
-        vectors_count: usize,
-    ) -> std::io::Result<Self> {
-        let mut vectors = Self::new(quantized_vector_size);
-        vectors
-            .try_set_capacity_exact(vectors_count)
-            .map_err(|err| {
-                std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    format!("Failed to load quantized vectors from file: {err}"),
-                )
-            })?;
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut buffer = vec![0u8; quantized_vector_size];
-        while reader.read_exact(&mut buffer).is_ok() {
-            vectors.push(&buffer).map_err(|err| {
-                std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    format!("Failed to load quantized vectors from file: {err}"),
-                )
-            })?;
-        }
-        if vectors.len() == vectors_count {
-            Ok(vectors)
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Loaded vectors count {} is not equal to expected count {vectors_count}",
-                    vectors.len(),
-                ),
-            ))
-        }
-    }
-
-    fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
-        let mut buffer = File::create(path)?;
-        for i in 0..self.len() {
-            buffer.write_all(self.get(i))?;
-        }
-        buffer.sync_all()?;
-        Ok(())
-    }
-}
-
 impl<T: Clone> TrySetCapacityExact for ChunkedVectors<T> {
     fn try_set_capacity_exact(&mut self, capacity: usize) -> Result<(), TryReserveError> {
         let num_chunks = capacity.div_ceil(self.chunk_capacity);
@@ -238,18 +182,6 @@ impl<T: Clone> TrySetCapacityExact for ChunkedVectors<T> {
             }
         }
         Ok(())
-    }
-}
-
-impl quantization::EncodedStorageBuilder<ChunkedVectors<u8>> for ChunkedVectors<u8> {
-    fn build(self) -> ChunkedVectors<u8> {
-        self
-    }
-
-    fn push_vector_data(&mut self, other: &[u8]) {
-        // Memory for ChunkedVectors are already pre-allocated,
-        // so we do not expect any errors here.
-        self.push(other).unwrap();
     }
 }
 

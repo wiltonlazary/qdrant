@@ -17,6 +17,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: Codespell
-        uses: codespell-project/actions-codespell@v2
+        uses: actions/checkout@v6
+
+      - name: Install Codespell
+        run: python -m pip install --upgrade 'codespell[toml]'
+
+      - name: Run Codespell
+        run: codespell --toml tools/codespell.toml

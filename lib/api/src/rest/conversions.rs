@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use segment::data_types::order_by::OrderBy;
 use segment::data_types::vectors::{VectorInternal, VectorStructInternal};
 use uuid::Uuid;
@@ -7,7 +9,26 @@ use super::{
     FacetRequestInternal, FacetResponse, FacetValue, FacetValueHit, NearestQuery, OrderByInterface,
     Query, QueryInterface, VectorOutput, VectorStructOutput,
 };
+use crate::grpc;
+use crate::rest::models::InferenceUsage;
 use crate::rest::{DenseVector, NamedVectorStruct};
+
+impl From<InferenceUsage> for grpc::InferenceUsage {
+    fn from(value: InferenceUsage) -> Self {
+        let mut grpc_usage_models = HashMap::with_capacity(value.models.len());
+        for (model, usage) in value.models {
+            grpc_usage_models.insert(
+                model,
+                grpc::ModelUsage {
+                    tokens: usage.tokens,
+                },
+            );
+        }
+        grpc::InferenceUsage {
+            models: grpc_usage_models,
+        }
+    }
+}
 
 impl From<VectorInternal> for VectorOutput {
     fn from(value: VectorInternal) -> Self {
@@ -57,14 +78,23 @@ impl From<Vector> for VectorInternal {
 
 impl From<segment::types::ScoredPoint> for ScoredPoint {
     fn from(value: segment::types::ScoredPoint) -> Self {
+        let segment::types::ScoredPoint {
+            id,
+            version,
+            score,
+            payload,
+            vector,
+            shard_key,
+            order_value,
+        } = value;
         ScoredPoint {
-            id: value.id,
-            version: value.version,
-            score: value.score,
-            payload: value.payload,
-            vector: value.vector.map(VectorStructOutput::from),
-            shard_key: value.shard_key,
-            order_value: value.order_value.map(From::from),
+            id,
+            version,
+            score,
+            payload,
+            vector: vector.map(VectorStructOutput::from),
+            shard_key,
+            order_value,
         }
     }
 }
@@ -113,7 +143,10 @@ impl From<OrderByInterface> for OrderBy {
 impl From<QueryInterface> for Query {
     fn from(value: QueryInterface) -> Self {
         match value {
-            QueryInterface::Nearest(vector) => Query::Nearest(NearestQuery { nearest: vector }),
+            QueryInterface::Nearest(vector) => Query::Nearest(NearestQuery {
+                nearest: vector,
+                mmr: None,
+            }),
             QueryInterface::Query(query) => query,
         }
     }
@@ -134,28 +167,36 @@ impl From<segment::data_types::facets::FacetValue> for FacetValue {
 
 impl From<segment::data_types::facets::FacetValueHit> for FacetValueHit {
     fn from(value: segment::data_types::facets::FacetValueHit) -> Self {
+        let segment::data_types::facets::FacetValueHit { value, count } = value;
         Self {
-            value: From::from(value.value),
-            count: value.count,
+            value: From::from(value),
+            count,
         }
     }
 }
 
 impl From<segment::data_types::facets::FacetResponse> for FacetResponse {
     fn from(value: segment::data_types::facets::FacetResponse) -> Self {
+        let segment::data_types::facets::FacetResponse { hits } = value;
         Self {
-            hits: value.hits.into_iter().map(From::from).collect(),
+            hits: hits.into_iter().map(From::from).collect(),
         }
     }
 }
 
 impl From<FacetRequestInternal> for segment::data_types::facets::FacetParams {
     fn from(value: FacetRequestInternal) -> Self {
+        let FacetRequestInternal {
+            key,
+            limit,
+            filter,
+            exact,
+        } = value;
         Self {
-            key: value.key,
-            limit: value.limit.unwrap_or(Self::DEFAULT_LIMIT),
-            filter: value.filter,
-            exact: value.exact.unwrap_or(Self::DEFAULT_EXACT),
+            key,
+            limit: limit.unwrap_or(Self::DEFAULT_LIMIT),
+            filter,
+            exact: exact.unwrap_or(Self::DEFAULT_EXACT),
         }
     }
 }

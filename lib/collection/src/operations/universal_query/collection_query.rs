@@ -1,27 +1,33 @@
-use std::collections::HashSet;
-
+use ahash::AHashSet;
 use api::rest::LookupLocation;
 use common::types::ScoreType;
 use itertools::Itertools;
+use ordered_float::OrderedFloat;
 use segment::data_types::order_by::OrderBy;
-use segment::data_types::vectors::{
-    NamedQuery, NamedVectorStruct, VectorInternal, VectorRef, DEFAULT_VECTOR_NAME,
-};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, NamedQuery, VectorInternal, VectorRef};
+use segment::index::query_optimization::rescore_formula::parsed_formula::ParsedFormula;
 use segment::json_path::JsonPath;
 use segment::types::{
     Condition, ExtendedPointId, Filter, HasIdCondition, PointIdType, SearchParams, VectorName,
     VectorNameBuf, WithPayloadInterface, WithVector,
 };
-use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
+use segment::vector_storage::query::{
+    ContextPair, ContextQuery, DiscoveryQuery, FeedbackItem, NaiveFeedbackCoefficients, RecoQuery,
+};
+use serde::Serialize;
+use shard::query::query_enum::QueryEnum;
 
+use super::formula::FormulaInternal;
 use super::shard_query::{
     FusionInternal, SampleInternal, ScoringQuery, ShardPrefetch, ShardQueryRequest,
 };
 use crate::common::fetch_vectors::ReferencedVectors;
 use crate::lookup::WithLookup;
-use crate::operations::query_enum::QueryEnum;
 use crate::operations::types::{CollectionError, CollectionResult};
+use crate::operations::universal_query::shard_query::MmrInternal;
 use crate::recommendations::avg_vector_for_recommendation;
+
+const DEFAULT_MMR_LAMBDA: f32 = 0.5;
 
 /// Internal representation of a query request, used to converge from REST and gRPC. This can have IDs referencing vectors.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,8 +62,8 @@ impl CollectionQueryRequest {
 ///
 /// [`RetrieveRequest`]: crate::common::retrieve_request_trait::RetrieveRequest
 #[derive(Debug)]
-pub struct CollectionQueryResolveRequest<'a> {
-    pub vector_query: &'a VectorQuery<VectorInputInternal>,
+pub struct CollectionQueryResolveRequest {
+    pub referenced_ids: Vec<PointIdType>,
     pub lookup_from: Option<LookupLocation>,
     pub using: VectorNameBuf,
 }
@@ -91,6 +97,9 @@ pub enum Query {
     /// Order by a payload field
     OrderBy(OrderBy),
 
+    /// Score boosting via an arbitrary formula
+    Formula(FormulaInternal),
+
     /// Sample points
     Sample(SampleInternal),
 }
@@ -102,24 +111,38 @@ impl Query {
         lookup_vector_name: &VectorName,
         lookup_collection: Option<&String>,
         using: VectorNameBuf,
+        request_limit: usize,
     ) -> CollectionResult<ScoringQuery> {
         let scoring_query = match self {
             Query::Vector(vector_query) => {
-                let query_enum = vector_query
+                vector_query
                     // Homogenize the input into raw vectors
                     .ids_into_vectors(ids_to_vectors, lookup_vector_name, lookup_collection)?
+                    .preprocess_vectors()
                     // Turn into QueryEnum
-                    .into_query_enum(using)?;
-                ScoringQuery::Vector(query_enum)
+                    .into_scoring_query(using, request_limit)?
             }
             Query::Fusion(fusion) => ScoringQuery::Fusion(fusion),
             Query::OrderBy(order_by) => ScoringQuery::OrderBy(order_by),
+            Query::Formula(formula) => ScoringQuery::Formula(ParsedFormula::try_from(formula)?),
             Query::Sample(sample) => ScoringQuery::Sample(sample),
         };
 
         Ok(scoring_query)
     }
+
+    pub fn get_referenced_ids(&self) -> Vec<PointIdType> {
+        match self {
+            Self::Vector(vector_query) => vector_query
+                .get_referenced_ids()
+                .into_iter()
+                .copied()
+                .collect(),
+            Self::Fusion(_) | Self::OrderBy(_) | Self::Formula(_) | Self::Sample(_) => Vec::new(),
+        }
+    }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum VectorInputInternal {
     Id(PointIdType),
@@ -138,10 +161,13 @@ impl VectorInputInternal {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VectorQuery<T> {
     Nearest(T),
+    NearestWithMmr(NearestWithMmr<T>),
     RecommendAverageVector(RecoQuery<T>),
     RecommendBestScore(RecoQuery<T>),
+    RecommendSumScores(RecoQuery<T>),
     Discover(DiscoveryQuery<T>),
     Context(ContextQuery<T>),
+    Feedback(FeedbackInternal<T>),
 }
 
 impl<T> VectorQuery<T> {
@@ -149,12 +175,48 @@ impl<T> VectorQuery<T> {
     pub fn flat_iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
         match self {
             VectorQuery::Nearest(input) => Box::new(std::iter::once(input)),
-            VectorQuery::RecommendAverageVector(query) => Box::new(query.flat_iter()),
-            VectorQuery::RecommendBestScore(query) => Box::new(query.flat_iter()),
+            VectorQuery::NearestWithMmr(query) => Box::new(std::iter::once(&query.nearest)),
+            VectorQuery::RecommendAverageVector(query)
+            | VectorQuery::RecommendBestScore(query)
+            | VectorQuery::RecommendSumScores(query) => Box::new(query.flat_iter()),
             VectorQuery::Discover(query) => Box::new(query.flat_iter()),
             VectorQuery::Context(query) => Box::new(query.flat_iter()),
+            VectorQuery::Feedback(query) => Box::new(query.flat_iter()),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NearestWithMmr<T> {
+    pub nearest: T,
+    pub mmr: Mmr,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Mmr {
+    pub diversity: Option<f32>,
+    pub candidates_limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedbackInternal<T> {
+    pub target: T,
+    pub feedback: Vec<FeedbackItem<T>>,
+    pub strategy: FeedbackStrategy,
+}
+
+impl<T> FeedbackInternal<T> {
+    fn flat_iter(&self) -> impl Iterator<Item = &T> {
+        self.feedback
+            .iter()
+            .map(|item| &item.vector)
+            .chain(std::iter::once(&self.target))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeedbackStrategy {
+    Naive { a: f32, b: f32, c: f32 },
 }
 
 impl VectorQuery<VectorInputInternal> {
@@ -194,6 +256,17 @@ impl VectorQuery<VectorInputInternal> {
                     lookup_collection,
                 );
                 Ok(VectorQuery::RecommendBestScore(RecoQuery::new(
+                    positives, negatives,
+                )))
+            }
+            VectorQuery::RecommendSumScores(reco) => {
+                let (positives, negatives) = Self::resolve_reco_reference(
+                    reco,
+                    ids_to_vectors,
+                    lookup_vector_name,
+                    lookup_collection,
+                );
+                Ok(VectorQuery::RecommendSumScores(RecoQuery::new(
                     positives, negatives,
                 )))
             }
@@ -252,6 +325,40 @@ impl VectorQuery<VectorInputInternal> {
 
                 Ok(VectorQuery::Context(ContextQuery { pairs }))
             }
+            VectorQuery::NearestWithMmr(NearestWithMmr { nearest, mmr }) => {
+                let nearest = ids_to_vectors
+                    .resolve_reference(lookup_collection, lookup_vector_name, nearest)
+                    .ok_or_else(|| vector_not_found_error(lookup_vector_name))?;
+
+                Ok(VectorQuery::NearestWithMmr(NearestWithMmr { nearest, mmr }))
+            }
+            VectorQuery::Feedback(FeedbackInternal {
+                target,
+                feedback,
+                strategy,
+            }) => {
+                let target = ids_to_vectors
+                    .resolve_reference(lookup_collection, lookup_vector_name, target)
+                    .ok_or_else(|| vector_not_found_error(lookup_vector_name))?;
+
+                let feedback = feedback
+                    .into_iter()
+                    .map(|FeedbackItem { vector, score }| {
+                        Ok(FeedbackItem {
+                            vector: ids_to_vectors
+                                .resolve_reference(lookup_collection, lookup_vector_name, vector)
+                                .ok_or_else(|| vector_not_found_error(lookup_vector_name))?,
+                            score,
+                        })
+                    })
+                    .collect::<CollectionResult<_>>()?;
+
+                Ok(VectorQuery::Feedback(FeedbackInternal {
+                    target,
+                    feedback,
+                    strategy,
+                }))
+            }
         }
     }
 
@@ -293,34 +400,112 @@ fn vector_not_found_error(vector_name: &VectorName) -> CollectionError {
 }
 
 impl VectorQuery<VectorInternal> {
-    fn into_query_enum(self, using: VectorNameBuf) -> CollectionResult<QueryEnum> {
-        let query_enum = match self {
+    fn preprocess_vectors(mut self) -> Self {
+        match &mut self {
             VectorQuery::Nearest(vector) => {
-                QueryEnum::Nearest(NamedVectorStruct::new_from_vector(vector, using))
+                vector.preprocess();
             }
+            VectorQuery::RecommendAverageVector(reco) => {
+                reco.positives.iter_mut().for_each(|v| v.preprocess());
+                reco.negatives.iter_mut().for_each(|v| v.preprocess());
+            }
+            VectorQuery::RecommendBestScore(reco) => {
+                reco.positives.iter_mut().for_each(|v| v.preprocess());
+                reco.negatives.iter_mut().for_each(|v| v.preprocess());
+            }
+            VectorQuery::RecommendSumScores(reco) => {
+                reco.positives.iter_mut().for_each(|v| v.preprocess());
+                reco.negatives.iter_mut().for_each(|v| v.preprocess());
+            }
+            VectorQuery::Discover(discover) => {
+                discover.target.preprocess();
+                discover.pairs.iter_mut().for_each(|pair| {
+                    pair.positive.preprocess();
+                    pair.negative.preprocess();
+                });
+            }
+            VectorQuery::Context(context) => {
+                context.pairs.iter_mut().for_each(|pair| {
+                    pair.positive.preprocess();
+                    pair.negative.preprocess();
+                });
+            }
+            VectorQuery::NearestWithMmr(NearestWithMmr { nearest, mmr: _ }) => {
+                nearest.preprocess();
+            }
+            VectorQuery::Feedback(FeedbackInternal {
+                target,
+                feedback,
+                strategy: _,
+            }) => {
+                target.preprocess();
+                feedback
+                    .iter_mut()
+                    .for_each(|item| item.vector.preprocess());
+            }
+        }
+        self
+    }
+
+    fn into_scoring_query(
+        self,
+        using: VectorNameBuf,
+        request_limit: usize,
+    ) -> CollectionResult<ScoringQuery> {
+        let query_enum = match self {
+            VectorQuery::Nearest(vector) => QueryEnum::Nearest(NamedQuery::new(vector, using)),
             VectorQuery::RecommendAverageVector(reco) => {
                 // Get average vector
                 let search_vector = avg_vector_for_recommendation(
                     reco.positives.iter().map(VectorRef::from),
                     reco.negatives.iter().map(VectorRef::from).peekable(),
                 )?;
-                QueryEnum::Nearest(NamedVectorStruct::new_from_vector(search_vector, using))
+                QueryEnum::Nearest(NamedQuery::new(search_vector, using))
             }
-            VectorQuery::RecommendBestScore(reco) => QueryEnum::RecommendBestScore(NamedQuery {
-                query: reco,
-                using: Some(using),
-            }),
-            VectorQuery::Discover(discover) => QueryEnum::Discover(NamedQuery {
-                query: discover,
-                using: Some(using),
-            }),
-            VectorQuery::Context(context) => QueryEnum::Context(NamedQuery {
-                query: context,
-                using: Some(using),
-            }),
+            VectorQuery::RecommendBestScore(reco) => {
+                QueryEnum::RecommendBestScore(NamedQuery::new(reco, using))
+            }
+            VectorQuery::RecommendSumScores(reco) => {
+                QueryEnum::RecommendSumScores(NamedQuery::new(reco, using))
+            }
+            VectorQuery::Discover(discover) => {
+                QueryEnum::Discover(NamedQuery::new(discover, using))
+            }
+            VectorQuery::Context(context) => QueryEnum::Context(NamedQuery::new(context, using)),
+            VectorQuery::NearestWithMmr(NearestWithMmr { nearest, mmr }) => {
+                let Mmr {
+                    diversity,
+                    candidates_limit,
+                } = mmr;
+
+                return Ok(ScoringQuery::Mmr(MmrInternal {
+                    vector: nearest,
+                    using,
+                    lambda: OrderedFloat(diversity.map(|x| 1.0 - x).unwrap_or(DEFAULT_MMR_LAMBDA)),
+                    candidates_limit: candidates_limit.unwrap_or(request_limit),
+                }));
+            }
+            VectorQuery::Feedback(FeedbackInternal {
+                target,
+                feedback,
+                strategy,
+            }) => match strategy {
+                FeedbackStrategy::Naive { a, b, c } => QueryEnum::FeedbackNaive(NamedQuery::new(
+                    segment::vector_storage::query::NaiveFeedbackQuery {
+                        target,
+                        feedback,
+                        coefficients: NaiveFeedbackCoefficients {
+                            a: a.into(),
+                            b: b.into(),
+                            c: c.into(),
+                        },
+                    },
+                    using,
+                )),
+            },
         };
 
-        Ok(query_enum)
+        Ok(ScoringQuery::Vector(query_enum))
     }
 }
 
@@ -330,7 +515,7 @@ pub struct CollectionPrefetch {
     pub query: Option<Query>,
     pub using: VectorNameBuf,
     pub filter: Option<Filter>,
-    pub score_threshold: Option<ScoreType>,
+    pub score_threshold: Option<OrderedFloat<ScoreType>>,
     pub limit: usize,
     /// Search params for when there is no prefetch
     pub params: Option<SearchParams>,
@@ -339,7 +524,7 @@ pub struct CollectionPrefetch {
 
 /// Exclude the referenced ids by editing the filter.
 fn exclude_referenced_ids(ids: Vec<ExtendedPointId>, filter: Option<Filter>) -> Option<Filter> {
-    let ids: HashSet<_> = ids.into_iter().collect();
+    let ids: AHashSet<_> = ids.into_iter().collect();
 
     if ids.is_empty() {
         return filter;
@@ -370,14 +555,12 @@ impl CollectionPrefetch {
             lookup_other_collection = lookup_collection != collection
         };
 
-        if !lookup_other_collection {
-            if let Some(Query::Vector(vector_query)) = &self.query {
-                if let VectorQuery::Nearest(VectorInputInternal::Id(id)) = vector_query {
-                    refs.push(*id);
-                }
-                refs.extend(vector_query.get_referenced_ids())
-            };
-        }
+        if !lookup_other_collection && let Some(Query::Vector(vector_query)) = &self.query {
+            if let VectorQuery::Nearest(VectorInputInternal::Id(id)) = vector_query {
+                refs.push(*id);
+            }
+            refs.extend(vector_query.get_referenced_ids())
+        };
 
         for prefetch in &self.prefetch {
             refs.extend(prefetch.get_referenced_point_ids_on_collection(collection))
@@ -394,7 +577,7 @@ impl CollectionPrefetch {
             &self.query,
             &self.using,
             &self.prefetch,
-            self.score_threshold,
+            self.score_threshold.map(OrderedFloat::into_inner),
         )?;
 
         let lookup_vector_name = self.get_lookup_vector_name();
@@ -409,6 +592,7 @@ impl CollectionPrefetch {
                     &lookup_vector_name,
                     lookup_collection.as_ref(),
                     using,
+                    self.limit,
                 )
             })
             .transpose()?;
@@ -431,10 +615,16 @@ impl CollectionPrefetch {
 
     pub fn flatten_resolver_requests(&self) -> Vec<CollectionQueryResolveRequest> {
         let mut inner_queries = vec![];
-        // resolve query for root query
-        if let Some(Query::Vector(vector_query)) = &self.query {
+        // resolve ids for root query
+        let referenced_ids = self
+            .query
+            .as_ref()
+            .map(Query::get_referenced_ids)
+            .unwrap_or_default();
+
+        if !referenced_ids.is_empty() {
             let resolve_root = CollectionQueryResolveRequest {
-                vector_query,
+                referenced_ids,
                 lookup_from: self.lookup_from.clone(),
                 using: self.using.clone(),
             };
@@ -472,14 +662,12 @@ impl CollectionQueryRequest {
             lookup_other_collection = lookup_collection != collection
         };
 
-        if !lookup_other_collection {
-            if let Some(Query::Vector(vector_query)) = &self.query {
-                if let VectorQuery::Nearest(VectorInputInternal::Id(id)) = vector_query {
-                    refs.push(*id);
-                }
-                refs.extend(vector_query.get_referenced_ids())
-            };
-        }
+        if !lookup_other_collection && let Some(Query::Vector(vector_query)) = &self.query {
+            if let VectorQuery::Nearest(VectorInputInternal::Id(id)) = vector_query {
+                refs.push(*id);
+            }
+            refs.extend(vector_query.get_referenced_ids())
+        };
 
         for prefetch in &self.prefetch {
             refs.extend(prefetch.get_referenced_point_ids_on_collection(collection))
@@ -527,6 +715,7 @@ impl CollectionQueryRequest {
                     &query_lookup_vector_name,
                     query_lookup_collection.as_ref(),
                     using,
+                    self.limit,
                 )
             })
             .transpose()?;
@@ -541,7 +730,7 @@ impl CollectionQueryRequest {
             prefetches,
             query,
             filter,
-            score_threshold: self.score_threshold,
+            score_threshold: self.score_threshold.map(OrderedFloat),
             limit: self.limit,
             offset,
             params: self.params,
@@ -581,37 +770,14 @@ impl CollectionQueryRequest {
         }
 
         // Check that fusion queries are not combined with a using vector name
-        if let Some(Query::Fusion(_)) = query {
-            if using != DEFAULT_VECTOR_NAME {
-                return Err(CollectionError::bad_request(
-                    "Fusion queries cannot be combined with the 'using' field.",
-                ));
-            }
+        if let Some(Query::Fusion(_)) = query
+            && using != DEFAULT_VECTOR_NAME
+        {
+            return Err(CollectionError::bad_request(
+                "Fusion queries cannot be combined with the 'using' field.",
+            ));
         }
 
         Ok(())
-    }
-}
-
-mod from_rest {
-    use api::rest::schema as rest;
-
-    use super::*;
-
-    impl From<rest::Fusion> for FusionInternal {
-        fn from(value: rest::Fusion) -> Self {
-            match value {
-                rest::Fusion::Rrf => FusionInternal::Rrf,
-                rest::Fusion::Dbsf => FusionInternal::Dbsf,
-            }
-        }
-    }
-
-    impl From<rest::Sample> for SampleInternal {
-        fn from(value: rest::Sample) -> Self {
-            match value {
-                rest::Sample::Random => SampleInternal::Random,
-            }
-        }
     }
 }

@@ -1,4 +1,3 @@
-#[cfg(feature = "web")]
 mod actix;
 mod common;
 mod consensus;
@@ -17,19 +16,26 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ::common::cpu::{get_cpu_budget, CpuBudget};
+use ::common::budget::{ResourceBudget, get_io_budget};
+use ::common::cpu::get_cpu_budget;
+use ::common::flags::{feature_flags, init_feature_flags};
+use ::common::fs::{FsCheckResult, check_fs_info, check_mmap_functionality};
+use ::common::mmap::MULTI_MMAP_SUPPORT_CHECK_RESULT;
+use ::common::mmap::advice::set_global;
 use ::tonic::transport::Uri;
 use api::grpc::transport_channel_pool::TransportChannelPool;
 use clap::Parser;
+use collection::profiling::interface::init_requests_profile_collector;
 use collection::shards::channel_service::ChannelService;
 use consensus::Consensus;
+use fs_err as fs;
 use slog::Drain;
 use startup::setup_panic_hook;
 use storage::content_manager::consensus::operation_sender::OperationSender;
 use storage::content_manager::consensus::persistent::Persistent;
 use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
-use storage::content_manager::toc::dispatcher::TocDispatcher;
 use storage::content_manager::toc::TableOfContent;
+use storage::content_manager::toc::dispatcher::TocDispatcher;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 #[cfg(all(
@@ -144,23 +150,27 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    remove_started_file_indicator();
-
     let settings = Settings::new(args.config_path)?;
+
+    // Set global feature flags, sourced from configuration
+    init_feature_flags(settings.feature_flags);
 
     let reporting_enabled = !settings.telemetry_disabled && !args.disable_telemetry;
 
     let reporting_id = TelemetryCollector::generate_id();
 
+    // Setup logging (no logging before this point)
     let logger_handle = tracing::setup(
         settings
             .logger
             .with_top_level_directive(settings.log_level.clone()),
     )?;
 
+    remove_started_file_indicator();
+
     setup_panic_hook(reporting_enabled, reporting_id.to_string());
 
-    memory::madvise::set_global(settings.storage.mmap_advice);
+    set_global(settings.storage.mmap_advice);
     segment::vector_storage::common::set_async_scorer(
         settings
             .storage
@@ -168,8 +178,13 @@ fn main() -> anyhow::Result<()> {
             .async_scorer
             .unwrap_or_default(),
     );
-
     welcome(&settings);
+
+    // If audit logging is enabled, but failed to initialize,
+    // we should stop the service, as it may cause unlogged access to the data.
+    // The guard must be held alive until shutdown to flush remaining audit events.
+    let _audit_guard = common::audit::init_audit_logger(settings.audit.as_ref())
+        .expect("Audit logger must be initialized if audit logging is enabled");
 
     #[cfg(feature = "gpu")]
     if let Some(settings_gpu) = &settings.gpu {
@@ -199,7 +214,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(recovery_warning) = &settings.storage.recovery_mode {
-        log::warn!("Qdrant is loaded in recovery mode: {}", recovery_warning);
+        log::warn!("Qdrant is loaded in recovery mode: {recovery_warning}");
         log::warn!(
             "Read more: https://qdrant.tech/documentation/guides/administration/#recovery-mode"
         );
@@ -208,8 +223,61 @@ fn main() -> anyhow::Result<()> {
     // Validate as soon as possible, but we must initialize logging first
     settings.validate_and_warn();
 
+    fs::create_dir_all(&settings.storage.storage_path)?;
+
+    // Check if the filesystem is compatible with Qdrant
+    let mmaps_working;
+    match check_fs_info(&settings.storage.storage_path) {
+        FsCheckResult::Good => {
+            mmaps_working = true;
+        }
+        FsCheckResult::Unknown(details) => {
+            match check_mmap_functionality(&settings.storage.storage_path) {
+                Ok(true) => {
+                    log::warn!(
+                        "There is a potential issue with the filesystem for storage path {}. Details: {details}",
+                        settings.storage.storage_path.display(),
+                    );
+                    mmaps_working = true;
+                }
+                Ok(false) => {
+                    log::error!(
+                        "Filesystem check failed for storage path {}. Details: {details}",
+                        settings.storage.storage_path.display(),
+                    );
+                    mmaps_working = false;
+                }
+                Err(e) => {
+                    log::error!(
+                        "Unable to check mmap functionality for storage path {}. Details: {details}, error: {e}",
+                        settings.storage.storage_path.display(),
+                    );
+                    mmaps_working = false;
+                }
+            }
+        }
+        FsCheckResult::Bad(details) => {
+            log::error!(
+                "Filesystem check failed for storage path {}. Details: {details}",
+                settings.storage.storage_path.display(),
+            );
+            mmaps_working = false;
+        }
+    }
+    let _ = MULTI_MMAP_SUPPORT_CHECK_RESULT.set(mmaps_working);
+
+    // Report feature flags that are enabled for easier debugging
+    let flags = feature_flags();
+    if !flags.is_default() {
+        log::debug!("Feature flags: {flags:?}");
+    }
+
     let bootstrap = if args.bootstrap == args.uri {
-        log::warn!("Bootstrap URI is the same as this peer URI. Consider this peer as a first in a new deployment.");
+        if args.bootstrap.is_some() {
+            log::warn!(
+                "Bootstrap URI is the same as this peer URI. Consider this peer as a first in a new deployment.",
+            );
+        }
         None
     } else {
         args.bootstrap
@@ -220,6 +288,7 @@ fn main() -> anyhow::Result<()> {
         &settings.storage.storage_path,
         bootstrap.is_none(),
         args.reinit,
+        settings.cluster.peer_id,
     )?;
 
     let is_distributed_deployment = settings.cluster.enabled;
@@ -254,18 +323,22 @@ fn main() -> anyhow::Result<()> {
     let search_runtime = create_search_runtime(settings.storage.performance.max_search_threads)
         .expect("Can't search create runtime.");
 
-    let update_runtime =
-        create_update_runtime(settings.storage.performance.max_optimization_threads)
-            .expect("Can't optimizer create runtime.");
+    let update_runtime = create_update_runtime(
+        settings
+            .storage
+            .performance
+            .max_optimization_runtime_threads,
+    )
+    .expect("Can't optimizer create runtime.");
 
     let general_runtime =
         create_general_purpose_runtime().expect("Can't optimizer general purpose runtime.");
     let runtime_handle = general_runtime.handle().clone();
 
     // Use global CPU budget for optimizations based on settings
-    let optimizer_cpu_budget = CpuBudget::new(get_cpu_budget(
-        settings.storage.performance.optimizer_cpu_budget,
-    ));
+    let cpu_budget = get_cpu_budget(settings.storage.performance.optimizer_cpu_budget);
+    let io_budget = get_io_budget(settings.storage.performance.optimizer_io_budget, cpu_budget);
+    let optimizer_resource_budget = ResourceBudget::new(cpu_budget, io_budget);
 
     // Create a signal sender and receiver. It is used to communicate with the consensus thread.
     let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
@@ -280,8 +353,12 @@ fn main() -> anyhow::Result<()> {
 
     // Channel service is used to manage connections between peers.
     // It allocates required number of channels and manages proper reconnection handling
-    let mut channel_service =
-        ChannelService::new(settings.service.http_port, settings.service.api_key.clone());
+    let mut channel_service = ChannelService::new(
+        settings.service.http_port,
+        settings.service.enable_tls,
+        settings.service.api_key.clone(),
+        settings.service.alt_api_key.clone(),
+    );
 
     if is_distributed_deployment {
         // We only need channel_service in case if cluster is enabled.
@@ -308,7 +385,7 @@ fn main() -> anyhow::Result<()> {
         search_runtime,
         update_runtime,
         general_runtime,
-        optimizer_cpu_budget,
+        optimizer_resource_budget,
         channel_service.clone(),
         persistent_consensus_state.this_peer_id(),
         propose_operation_sender.clone(),
@@ -333,13 +410,15 @@ fn main() -> anyhow::Result<()> {
     // It decides if query should go directly to the ToC or through the consensus.
     let mut dispatcher = Dispatcher::new(toc_arc.clone());
 
-    let (telemetry_collector, dispatcher_arc, health_checker) = if is_distributed_deployment {
+    let (telemetry_collector, tonic_telemetry_collector, dispatcher_arc, health_checker);
+    if is_distributed_deployment {
         let consensus_state: ConsensusStateRef = ConsensusManager::new(
             persistent_consensus_state,
             toc_arc.clone(),
             propose_operation_sender.unwrap(),
             storage_path,
         )
+        .expect("initialize consensus manager")
         .into();
         let is_new_deployment = consensus_state.is_new_deployment();
 
@@ -349,12 +428,14 @@ fn main() -> anyhow::Result<()> {
         let toc_dispatcher = TocDispatcher::new(Arc::downgrade(&toc_arc), consensus_state.clone());
         toc_arc.with_toc_dispatcher(toc_dispatcher);
 
-        let dispatcher_arc = Arc::new(dispatcher);
+        dispatcher_arc = Arc::new(dispatcher);
 
         // Monitoring and telemetry.
-        let telemetry_collector =
+        let telemetry =
             TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
-        let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
+        tonic_telemetry_collector = telemetry.tonic_telemetry_collector.clone();
+
+        telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry));
 
         // `raft` crate uses `slog` crate so it is needed to use `slog_stdlog::StdLog` to forward
         // logs from it to `log` crate
@@ -362,13 +443,13 @@ fn main() -> anyhow::Result<()> {
 
         // Runs raft consensus in a separate thread.
         // Create a pipe `message_sender` to communicate with the consensus
-        let health_checker = Arc::new(common::health::HealthChecker::spawn(
+        health_checker = Some(Arc::new(common::health::HealthChecker::spawn(
             toc_arc.clone(),
             consensus_state.clone(),
             &runtime_handle,
             // NOTE: `wait_for_bootstrap` should be calculated *before* starting `Consensus` thread
             consensus_state.is_new_deployment() && bootstrap.is_some(),
-        ));
+        )));
 
         let handle = Consensus::run(
             &slog_logger,
@@ -378,7 +459,8 @@ fn main() -> anyhow::Result<()> {
             settings.clone(),
             channel_service,
             propose_receiver,
-            tonic_telemetry_collector,
+            telemetry_collector.clone(),
+            tonic_telemetry_collector.clone(),
             toc_arc.clone(),
             runtime_handle.clone(),
             args.reinit,
@@ -430,42 +512,43 @@ fn main() -> anyhow::Result<()> {
                 collections_to_recover_in_consensus,
             ));
         }
-
-        (telemetry_collector, dispatcher_arc, Some(health_checker))
     } else {
         log::info!("Distributed mode disabled");
-        let dispatcher_arc = Arc::new(dispatcher);
+        dispatcher_arc = Arc::new(dispatcher);
 
         // Monitoring and telemetry.
-        let telemetry_collector =
+        let telemetry =
             TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
-        (telemetry_collector, dispatcher_arc, None)
-    };
 
-    let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
+        tonic_telemetry_collector = telemetry.tonic_telemetry_collector.clone();
+        telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry));
+        health_checker = None;
+    };
 
     //
     // Telemetry reporting
     //
 
-    let reporting_id = telemetry_collector.reporting_id();
-    let telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry_collector));
-
     if reporting_enabled {
-        log::info!("Telemetry reporting enabled, id: {}", reporting_id);
+        log::info!("Telemetry reporting enabled, id: {reporting_id}");
 
         runtime_handle.spawn(TelemetryReporter::run(telemetry_collector.clone()));
     } else {
         log::info!("Telemetry reporting disabled");
     }
 
+    if settings.service.hardware_reporting == Some(true) {
+        log::info!("Hardware reporting enabled");
+    }
+
     // Setup subscribers to listen for issue-able events
     issues_setup::setup_subscribers(&settings);
+    init_requests_profile_collector(runtime_handle.clone());
 
     // Helper to better log start errors
     let log_err_if_any = |server_name, result| match result {
         Err(err) => {
-            log::error!("Error while starting {} server: {}", server_name, err);
+            log::error!("Error while starting {server_name} server: {err}");
             Err(err)
         }
         ok => ok,
@@ -474,26 +557,17 @@ fn main() -> anyhow::Result<()> {
     //
     // Inference Service
     //
-    if let Some(inference_config) = settings.inference.clone() {
-        match InferenceService::init_global(inference_config) {
-            Ok(_) => {
-                log::info!("Inference service is configured.");
-            }
-            Err(err) => {
-                log::error!("{err}");
-            }
-        }
-    } else {
-        log::info!("Inference service is not configured.");
+    if let Err(err) = InferenceService::init_global(settings.inference.clone()) {
+        log::error!("Inference service init failed: {err}");
     }
 
     //
     // REST API server
     //
 
-    #[cfg(feature = "web")]
     {
         let dispatcher_arc = dispatcher_arc.clone();
+        let telemetry_collector = telemetry_collector.clone();
         let settings = settings.clone();
         let handle = thread::Builder::new()
             .name("web".to_string())
@@ -506,6 +580,29 @@ fn main() -> anyhow::Result<()> {
                         health_checker,
                         settings,
                         logger_handle,
+                    ),
+                )
+            })
+            .unwrap();
+        handles.push(handle);
+    }
+
+    //
+    // Extra `/metrics` server
+    //
+
+    if let Some(metrics_port) = settings.service.metrics_port {
+        let telemetry_collector = telemetry_collector.clone();
+        let settings = settings.clone();
+        let handle = thread::Builder::new()
+            .name("metrics".to_string())
+            .spawn(move || {
+                log_err_if_any(
+                    "Metrics",
+                    actix::metrics_service::init_metrics(
+                        metrics_port,
+                        telemetry_collector,
+                        settings,
                     ),
                 )
             })
@@ -549,27 +646,29 @@ fn main() -> anyhow::Result<()> {
 
         thread::Builder::new()
             .name("deadlock_checker".to_string())
-            .spawn(move || loop {
-                thread::sleep(DEADLOCK_CHECK_PERIOD);
-                let deadlocks = deadlock::check_deadlock();
-                if deadlocks.is_empty() {
-                    continue;
-                }
-
-                let mut error = format!("{} deadlocks detected\n", deadlocks.len());
-                for (i, threads) in deadlocks.iter().enumerate() {
-                    writeln!(error, "Deadlock #{i}").expect("fail to writeln!");
-                    for t in threads {
-                        writeln!(
-                            error,
-                            "Thread Id {:#?}\n{:#?}",
-                            t.thread_id(),
-                            t.backtrace()
-                        )
-                        .expect("fail to writeln!");
+            .spawn(move || {
+                loop {
+                    thread::sleep(DEADLOCK_CHECK_PERIOD);
+                    let deadlocks = deadlock::check_deadlock();
+                    if deadlocks.is_empty() {
+                        continue;
                     }
+
+                    let mut error = format!("{} deadlocks detected\n", deadlocks.len());
+                    for (i, threads) in deadlocks.iter().enumerate() {
+                        writeln!(error, "Deadlock #{i}").expect("fail to writeln!");
+                        for t in threads {
+                            writeln!(
+                                error,
+                                "Thread Id {:#?}\n{:#?}",
+                                t.thread_id(),
+                                t.backtrace(),
+                            )
+                            .expect("fail to writeln!");
+                        }
+                    }
+                    log::error!("{error}");
                 }
-                log::error!("{}", error);
             })
             .unwrap();
     }

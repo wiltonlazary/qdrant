@@ -1,22 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InferenceConfig {
     pub address: Option<String>,
-    #[serde(default = "default_inference_timeout")]
-    pub timeout: u64,
+    pub timeout: Option<u64>,
     pub token: Option<String>,
-}
-
-fn default_inference_timeout() -> u64 {
-    10
 }
 
 impl InferenceConfig {
     pub fn new(address: Option<String>) -> Self {
         Self {
             address,
-            timeout: default_inference_timeout(),
+            timeout: None,
             token: None,
         }
     }

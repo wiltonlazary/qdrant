@@ -3,14 +3,18 @@ mod gaps;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use ahash::AHashSet;
 use bitvec::slice::BitSlice;
+use common::fs::clear_disk_cache;
+use common::mmap::{
+    Advice, AdviceSetting, MmapBitSlice, create_and_ensure_length, open_write_mmap,
+};
 use gaps::{BitmaskGaps, RegionGaps};
 use itertools::Itertools;
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_ops::{create_and_ensure_length, open_write_mmap};
-use memory::mmap_type::{self, MmapBitSlice};
 
+use crate::Result;
 use crate::config::StorageConfig;
+use crate::error::GridstoreError;
 use crate::tracker::{BlockOffset, PageId};
 
 const BITMASK_NAME: &str = "bitmask.dat";
@@ -68,7 +72,7 @@ impl Bitmask {
     }
 
     /// Create a bitmask for one page
-    pub(crate) fn create(dir: &Path, config: StorageConfig) -> Result<Self, String> {
+    pub(crate) fn create(dir: &Path, config: StorageConfig) -> Result<Self> {
         debug_assert!(
             config.page_size_bytes % config.block_size_bytes * config.region_size_blocks == 0,
             "Page size must be a multiple of block size * region size"
@@ -79,9 +83,8 @@ impl Bitmask {
         // create bitmask mmap
         let path = Self::bitmask_path(dir);
         create_and_ensure_length(&path, length).unwrap();
-        let mmap = open_write_mmap(&path, AdviceSetting::from(DEFAULT_ADVICE), false)
-            .map_err(|err| err.to_string())?;
-        let mmap_bitslice = MmapBitSlice::try_from(mmap, 0).map_err(|err| err.to_string())?;
+        let mmap = open_write_mmap(&path, AdviceSetting::from(DEFAULT_ADVICE), false)?;
+        let mmap_bitslice = MmapBitSlice::try_from(mmap, 0)?;
 
         assert_eq!(mmap_bitslice.len(), length * 8, "Bitmask length mismatch");
 
@@ -89,7 +92,7 @@ impl Bitmask {
         let num_regions = mmap_bitslice.len() / config.region_size_blocks;
         let region_gaps = vec![RegionGaps::all_free(config.region_size_blocks as u16); num_regions];
 
-        let mmap_region_gaps = BitmaskGaps::create(dir, region_gaps.into_iter(), config.clone());
+        let mmap_region_gaps = BitmaskGaps::create(dir, region_gaps.into_iter(), config);
 
         Ok(Self {
             config,
@@ -99,21 +102,25 @@ impl Bitmask {
         })
     }
 
-    pub(crate) fn open(dir: &Path, config: StorageConfig) -> Result<Self, String> {
+    pub(crate) fn open(dir: &Path, config: StorageConfig) -> Result<Self> {
         debug_assert!(
-            config.page_size_bytes % config.block_size_bytes == 0,
+            config
+                .page_size_bytes
+                .is_multiple_of(config.block_size_bytes),
             "Page size must be a multiple of block size"
         );
 
         let path = Self::bitmask_path(dir);
         if !path.exists() {
-            return Err(format!("Bitmask file does not exist: {}", path.display()));
+            return Err(GridstoreError::service_error(format!(
+                "Bitmask file does not exist: {}",
+                path.display()
+            )));
         }
-        let mmap = open_write_mmap(&path, AdviceSetting::from(DEFAULT_ADVICE), false)
-            .map_err(|err| err.to_string())?;
+        let mmap = open_write_mmap(&path, AdviceSetting::from(DEFAULT_ADVICE), false)?;
         let mmap_bitslice = MmapBitSlice::from(mmap, 0);
 
-        let bitmask_gaps = BitmaskGaps::open(dir, config.clone())?;
+        let bitmask_gaps = BitmaskGaps::open(dir, config)?;
 
         Ok(Self {
             config,
@@ -127,7 +134,7 @@ impl Bitmask {
         dir.join(BITMASK_NAME)
     }
 
-    pub fn flush(&self) -> Result<(), mmap_type::Error> {
+    pub fn flush(&self) -> Result<()> {
         self.bitslice.flusher()()?;
         self.regions_gaps.flush()?;
 
@@ -167,7 +174,7 @@ impl Bitmask {
     }
 
     /// Extend the bitslice to cover another page
-    pub fn cover_new_page(&mut self) -> Result<(), String> {
+    pub fn cover_new_page(&mut self) -> Result<()> {
         let extra_length = Self::length_for_page(&self.config);
 
         // flush outstanding changes
@@ -177,10 +184,9 @@ impl Bitmask {
         let previous_bitslice_len = self.bitslice.len();
         let new_length = (previous_bitslice_len / u8::BITS as usize) + extra_length;
         create_and_ensure_length(&self.path, new_length).unwrap();
-        let mmap = open_write_mmap(&self.path, AdviceSetting::from(DEFAULT_ADVICE), false)
-            .map_err(|err| err.to_string())?;
+        let mmap = open_write_mmap(&self.path, AdviceSetting::from(DEFAULT_ADVICE), false)?;
 
-        self.bitslice = MmapBitSlice::try_from(mmap, 0).map_err(|err| err.to_string())?;
+        self.bitslice = MmapBitSlice::try_from(mmap, 0)?;
 
         // extend the region gaps
         let current_total_regions = self.regions_gaps.len();
@@ -189,16 +195,15 @@ impl Bitmask {
             .len()
             .div_euclid(self.config.region_size_blocks);
         debug_assert!(
-            self.bitslice.len() % self.config.region_size_blocks == 0,
+            self.bitslice
+                .len()
+                .is_multiple_of(self.config.region_size_blocks),
             "Bitmask length must be a multiple of region size"
         );
         let new_regions = expected_total_full_regions.saturating_sub(current_total_regions);
         let new_gaps =
             vec![RegionGaps::all_free(self.config.region_size_blocks as u16); new_regions];
         self.regions_gaps.extend(new_gaps.into_iter())?;
-
-        // update the previous last region gaps
-        self.update_region_gaps(previous_bitslice_len - 1..previous_bitslice_len + 2);
 
         assert_eq!(
             self.regions_gaps.len() * self.config.region_size_blocks,
@@ -360,21 +365,45 @@ impl Bitmask {
         num_blocks: u32,
         used: bool,
     ) {
-        let page_start = self.range_of_page(page_id).start;
-
-        let offset = page_start + block_offset as usize;
-        let blocks_range = offset..offset + num_blocks as usize;
-
-        self.bitslice[blocks_range.clone()].fill(used);
-
-        self.update_region_gaps(blocks_range);
+        let relative_range = block_offset as usize..(block_offset as usize + num_blocks as usize);
+        self.mark_blocks_batch(page_id, std::iter::once(relative_range), used);
     }
 
-    fn update_region_gaps(&mut self, blocks_range: Range<usize>) {
-        let region_start_id = blocks_range.start / self.config.region_size_blocks;
-        let region_end_id = (blocks_range.end - 1) / self.config.region_size_blocks;
+    /// Marks blocks sharing the same page in batch. First updates all ranges in the bitmask, then updates the region gaps a single time.
+    ///
+    /// # Arguments
+    /// * `page_id` - The ID of the page to mark blocks on.
+    /// * `block_ranges` - An iterator over the ranges of blocks to mark, relative to the page start.
+    /// * `used` - Whether the blocks should be marked as used or free.
+    pub(crate) fn mark_blocks_batch(
+        &mut self,
+        page_id: PageId,
+        local_block_ranges: impl Iterator<Item = Range<usize>>,
+        used: bool,
+    ) {
+        let page_start = self.range_of_page(page_id).start;
 
-        for region_id in region_start_id..=region_end_id {
+        let est_num_ranges = local_block_ranges.size_hint().1.unwrap_or(1);
+        let mut dirty_regions = AHashSet::with_capacity(est_num_ranges);
+
+        for range in local_block_ranges {
+            let bitmask_range = (range.start + page_start)..(range.end + page_start);
+            self.bitslice[bitmask_range.clone()].fill(used);
+
+            let start_region_id =
+                (bitmask_range.start / self.config.region_size_blocks) as RegionId;
+            let end_region_id =
+                bitmask_range.end.div_ceil(self.config.region_size_blocks) as RegionId;
+
+            dirty_regions.extend(start_region_id..end_region_id);
+        }
+
+        self.update_region_gaps(dirty_regions);
+    }
+
+    fn update_region_gaps(&mut self, dirty_regions: AHashSet<RegionId>) {
+        for region_id in dirty_regions {
+            let region_id = region_id as usize;
             let region_start = region_id * self.config.region_size_blocks;
             let region_end = region_start + self.config.region_size_blocks;
 
@@ -500,6 +529,21 @@ impl Bitmask {
             RegionGaps::new(leading as u16, trailing as u16, max as u16)
         }
     }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> std::io::Result<()> {
+        self.bitslice.populate()?;
+        self.regions_gaps.populate()?;
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        clear_disk_cache(&self.path)?;
+        self.regions_gaps.clear_cache()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -508,9 +552,9 @@ mod tests {
     use bitvec::bits;
     use bitvec::vec::BitVec;
     use proptest::prelude::*;
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
-    use crate::config::{StorageOptions, DEFAULT_BLOCK_SIZE_BYTES, DEFAULT_REGION_SIZE_BLOCKS};
+    use crate::config::{DEFAULT_BLOCK_SIZE_BYTES, DEFAULT_REGION_SIZE_BLOCKS, StorageOptions};
 
     #[test]
     fn test_length_for_page() {

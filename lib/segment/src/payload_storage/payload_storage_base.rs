@@ -4,8 +4,8 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::json_path::JsonPath;
 use crate::types::{Filter, Payload};
 
@@ -42,6 +42,12 @@ pub trait PayloadStorage {
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Payload>;
 
+    fn get_sequential(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload>;
+
     /// Delete payload by point_id and key
     fn delete(
         &mut self,
@@ -57,8 +63,9 @@ pub trait PayloadStorage {
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<Payload>>;
 
-    /// Completely delete payload storage. Pufff!
-    fn wipe(&mut self, hw_counter: &HardwareCounterCell) -> OperationResult<()>;
+    /// Completely delete payload storage, without keeping allocated memory. Pufff!
+    #[cfg(test)]
+    fn clear_all(&mut self, hw_counter: &HardwareCounterCell) -> OperationResult<()>;
 
     /// Return function that forces persistence of current storage state.
     fn flusher(&self) -> Flusher;
@@ -67,7 +74,7 @@ pub trait PayloadStorage {
     /// Stop iteration if callback returns false or error.
     ///
     /// Required for building payload index.
-    fn iter<F>(&self, callback: F) -> OperationResult<()>
+    fn iter<F>(&self, callback: F, hw_counter: &HardwareCounterCell) -> OperationResult<()>
     where
         F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>;
 
@@ -75,8 +82,16 @@ pub trait PayloadStorage {
     /// RocksDB storages are captured outside of this trait.
     fn files(&self) -> Vec<PathBuf>;
 
+    /// Returns a list of files, that are immutable, to exclude from partial snapshots.
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Return storage size in bytes
     fn get_storage_size_bytes(&self) -> OperationResult<usize>;
+
+    /// Whether this storage is on-disk or in-memory.
+    fn is_on_disk(&self) -> bool;
 }
 
 pub trait ConditionChecker {

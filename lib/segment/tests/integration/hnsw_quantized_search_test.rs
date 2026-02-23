@@ -1,38 +1,41 @@
 use std::collections::BTreeSet;
 use std::ops::Deref;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cpu::CpuPermit;
+use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::{ScoreType, ScoredPointOffset};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
-use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
-use segment::entry::entry_point::SegmentEntry;
-use segment::fixtures::payload_fixtures::{random_vector, STR_KEY};
+use rand::rngs::StdRng;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
+use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
+use segment::fixtures::payload_fixtures::{STR_KEY, random_vector};
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{VectorIndex, VectorIndexEnum};
 use segment::json_path::JsonPath;
 use segment::payload_json;
 use segment::segment::Segment;
+use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
-use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::types::PayloadSchemaType::Keyword;
 use segment::types::{
-    CompressionRatio, Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes,
-    ProductQuantizationConfig, QuantizationConfig, QuantizationSearchParams,
+    CompressionRatio, Condition, Distance, FieldCondition, Filter, HnswConfig, HnswGlobalConfig,
+    Indexes, ProductQuantizationConfig, QuantizationConfig, QuantizationSearchParams,
     ScalarQuantizationConfig, SearchParams,
 };
-use segment::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use segment::vector_storage::quantized::quantized_vectors::{
+    QuantizedVectors, QuantizedVectorsStorageType,
+};
 use tempfile::Builder;
 
 use crate::fixtures::segment::build_segment_1;
 
-fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> usize {
+pub fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> usize {
     a[0].iter()
         .map(|x| x.idx)
         .collect::<BTreeSet<_>>()
@@ -57,7 +60,7 @@ fn hnsw_quantized_search_test(
     let top = 10;
     let attempts = 10;
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
     let mut op_num = 0;
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
@@ -68,7 +71,7 @@ fn hnsw_quantized_search_test(
     let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
+        let vector = random_vector(&mut rng, dim);
         segment
             .upsert_point(op_num, idx, only_default_vector(&vector), &hw_counter)
             .unwrap();
@@ -76,7 +79,12 @@ fn hnsw_quantized_search_test(
     }
 
     segment
-        .create_field_index(op_num, &JsonPath::new(STR_KEY), Some(&Keyword.into()))
+        .create_field_index(
+            op_num,
+            &JsonPath::new(STR_KEY),
+            Some(&Keyword.into()),
+            &hw_counter,
+        )
         .unwrap();
     op_num += 1;
     for n in 0..payloads_count {
@@ -92,6 +100,7 @@ fn hnsw_quantized_search_test(
         let quantized_vectors = QuantizedVectors::create(
             &vector_storage.vector_storage.borrow(),
             &quantization_config,
+            QuantizedVectorsStorageType::Immutable,
             quantized_data_path,
             4,
             &stopped,
@@ -107,10 +116,11 @@ fn hnsw_quantized_search_test(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit_cpu_count = 1; // single-threaded for deterministic build
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let hnsw_index = HNSWIndex::build(
         HnswIndexOpenArgs {
@@ -129,13 +139,17 @@ fn hnsw_quantized_search_test(
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
+            feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
 
     let query_vectors = (0..attempts)
-        .map(|_| random_vector(&mut rnd, dim).into())
+        .map(|_| random_vector(&mut rng, dim).into())
         .collect::<Vec<_>>();
     let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
         JsonPath::new(STR_KEY),
@@ -173,7 +187,7 @@ fn hnsw_quantized_search_test(
     check_rescoring(&query_vectors, &hnsw_index, Some(&filter), ef, top);
 }
 
-fn check_matches(
+pub fn check_matches(
     query_vectors: &[QueryVector],
     segment: &Segment,
     hnsw_index: &HNSWIndex,
@@ -409,22 +423,23 @@ fn test_build_hnsw_using_quantization() {
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     });
 
-    let permit_cpu_count = num_rayon_threads(0);
-    let permit = CpuPermit::dummy(permit_cpu_count as u32);
-
-    let mut builder = SegmentBuilder::new(dir.path(), temp_dir.path(), &config).unwrap();
+    let mut builder =
+        SegmentBuilder::new(temp_dir.path(), &config, &HnswGlobalConfig::default()).unwrap();
 
     builder.update(&[&segment1], &stopped).unwrap();
 
-    let built_segment: Segment = builder.build(permit, &stopped).unwrap();
+    let built_segment = builder.build_for_test(dir.path());
 
     // check if built segment has quantization and index
-    assert!(built_segment.vector_data[DEFAULT_VECTOR_NAME]
-        .quantized_vectors
-        .borrow()
-        .is_some());
+    assert!(
+        built_segment.vector_data[DEFAULT_VECTOR_NAME]
+            .quantized_vectors
+            .borrow()
+            .is_some(),
+    );
     let borrowed_index = built_segment.vector_data[DEFAULT_VECTOR_NAME]
         .vector_index
         .borrow();

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{self, BufRead as _, BufReader, Lines};
 use std::mem::size_of;
 use std::path::Path;
 
+use common::mmap::{Advice, AdviceSetting};
+#[expect(deprecated, reason = "legacy code")]
+use common::mmap::{open_read_mmap, transmute_from_u8, transmute_from_u8_to_slice};
+use fs_err::File;
 use memmap2::Mmap;
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_ops::{open_read_mmap, transmute_from_u8, transmute_from_u8_to_slice};
 use validator::ValidationErrors;
 
 use crate::common::sparse_vector::SparseVector;
@@ -31,7 +32,15 @@ pub struct Csr {
     intptr: Vec<u64>,
 }
 
-const CSR_HEADER_SIZE: usize = size_of::<u64>() * 3;
+const CSR_HEADER_SIZE: usize = size_of::<CsrHeader>();
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CsrHeader {
+    nrow: u64,
+    ncol: u64,
+    nnz: u64,
+}
 
 impl Csr {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -53,13 +62,19 @@ impl Csr {
     }
 
     fn from_mmap(mmap: Mmap) -> io::Result<Self> {
-        let (nrow, ncol, nnz) =
-            transmute_from_u8::<(u64, u64, u64)>(&mmap.as_ref()[..CSR_HEADER_SIZE]);
+        // Safety: CsrHeader is a POD type.
+        #[expect(deprecated, reason = "legacy code")]
+        let CsrHeader { nrow, ncol, nnz } =
+            unsafe { transmute_from_u8(&mmap.as_ref()[..CSR_HEADER_SIZE]) };
         let (nrow, _ncol, nnz) = (*nrow as usize, *ncol as usize, *nnz as usize);
 
-        let indptr = Vec::from(transmute_from_u8_to_slice::<u64>(
-            &mmap.as_ref()[CSR_HEADER_SIZE..CSR_HEADER_SIZE + size_of::<u64>() * (nrow + 1)],
-        ));
+        // Safety: correct alignment.
+        let indptr = Vec::from(unsafe {
+            #[expect(deprecated, reason = "legacy code")]
+            transmute_from_u8_to_slice::<u64>(
+                &mmap.as_ref()[CSR_HEADER_SIZE..CSR_HEADER_SIZE + size_of::<u64>() * (nrow + 1)],
+            )
+        });
         if !indptr.windows(2).all(|w| w[0] <= w[1]) || indptr.last() != Some(&(nnz as u64)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -77,25 +92,33 @@ impl Csr {
 
     #[inline]
     unsafe fn vec(&self, row: usize) -> Result<SparseVector, ValidationErrors> {
-        let start = *self.intptr.get_unchecked(row) as usize;
-        let end = *self.intptr.get_unchecked(row + 1) as usize;
-
-        let mut pos = CSR_HEADER_SIZE + size_of::<u64>() * (self.nrow + 1);
-
-        let indices = transmute_from_u8_to_slice::<u32>(
-            self.mmap
-                .as_ref()
-                .get_unchecked(pos + size_of::<u32>() * start..pos + size_of::<u32>() * end),
+        const _: () = assert!(
+            cfg!(feature = "testing"),
+            "This unsafe block should be used only in internal benchmarks"
         );
-        pos += size_of::<u32>() * self.nnz;
+        unsafe {
+            let start = *self.intptr.get_unchecked(row) as usize;
+            let end = *self.intptr.get_unchecked(row + 1) as usize;
 
-        let data = transmute_from_u8_to_slice::<f32>(
-            self.mmap
-                .as_ref()
-                .get_unchecked(pos + size_of::<f32>() * start..pos + size_of::<f32>() * end),
-        );
+            let mut pos = CSR_HEADER_SIZE + size_of::<u64>() * (self.nrow + 1);
 
-        SparseVector::new(indices.to_vec(), data.to_vec())
+            #[expect(deprecated, reason = "legacy code")]
+            let indices = transmute_from_u8_to_slice::<u32>(
+                self.mmap
+                    .as_ref()
+                    .get_unchecked(pos + size_of::<u32>() * start..pos + size_of::<u32>() * end),
+            );
+            pos += size_of::<u32>() * self.nnz;
+
+            #[expect(deprecated, reason = "legacy code")]
+            let data = transmute_from_u8_to_slice::<f32>(
+                self.mmap
+                    .as_ref()
+                    .get_unchecked(pos + size_of::<f32>() * start..pos + size_of::<f32>() * end),
+            );
+
+            SparseVector::new(indices.to_vec(), data.to_vec())
+        }
     }
 }
 
@@ -135,6 +158,7 @@ pub struct JsonReader(Lines<BufReader<File>>);
 
 impl JsonReader {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
         Ok(JsonReader(BufReader::new(File::open(path)?).lines()))
     }
 }

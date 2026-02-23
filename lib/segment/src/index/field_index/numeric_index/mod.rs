@@ -1,6 +1,6 @@
-mod immutable_numeric_index;
-mod mmap_numeric_index;
-mod mutable_numeric_index;
+pub mod immutable_numeric_index;
+pub mod mmap_numeric_index;
+pub mod mutable_numeric_index;
 
 #[cfg(test)]
 mod tests;
@@ -11,27 +11,33 @@ use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(feature = "rocksdb")]
 use std::sync::Arc;
 
 use chrono::DateTime;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use delegate::delegate;
+use gridstore::Blob;
 use mmap_numeric_index::MmapNumericIndex;
 use mutable_numeric_index::{InMemoryNumericIndex, MutableNumericIndex};
+use ordered_float::OrderedFloat;
+#[cfg(feature = "rocksdb")]
 use parking_lot::RwLock;
+#[cfg(feature = "rocksdb")]
 use rocksdb::DB;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
 use self::immutable_numeric_index::ImmutableNumericIndex;
+use super::FieldIndexBuilderTrait;
 use super::histogram::Point;
 use super::mmap_point_to_values::MmapValue;
-use super::utils::check_boundaries;
-use super::FieldIndexBuilderTrait;
-use crate::common::operation_error::{OperationError, OperationResult};
+use super::utils::{check_boundaries, value_to_integer};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::field_index::histogram::{Histogram, Numericable};
 use crate::index::field_index::stat_tools::estimate_multi_value_selection_cardinality;
 use crate::index::field_index::{
@@ -41,6 +47,7 @@ use crate::index::key_encoding::{
     decode_f64_key_ascending, decode_i64_key_ascending, decode_u128_key_ascending,
     encode_f64_key_ascending, encode_i64_key_ascending, encode_u128_key_ascending,
 };
+use crate::index::payload_config::{IndexMutability, StorageType};
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{
     DateTimePayloadType, FieldCondition, FloatPayloadType, IntPayloadType, Match, MatchValue,
@@ -158,23 +165,57 @@ impl<T: Encodable + Numericable> Range<T> {
     }
 }
 
-pub enum NumericIndexInner<T: Encodable + Numericable + MmapValue + Default> {
+pub enum NumericIndexInner<T: Encodable + Numericable + MmapValue + Send + Sync + Default>
+where
+    Vec<T>: Blob,
+{
     Mutable(MutableNumericIndex<T>),
     Immutable(ImmutableNumericIndex<T>),
     Mmap(MmapNumericIndex<T>),
 }
 
-impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
-    pub fn new_memory(db: Arc<RwLock<DB>>, field: &str, is_appendable: bool) -> Self {
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default> NumericIndexInner<T>
+where
+    Vec<T>: Blob,
+{
+    #[cfg(feature = "rocksdb")]
+    pub fn new_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+        is_appendable: bool,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
         if is_appendable {
-            NumericIndexInner::Mutable(MutableNumericIndex::new(db, field))
+            Ok(
+                MutableNumericIndex::open_rocksdb(db, field, create_if_missing)?
+                    .map(NumericIndexInner::Mutable),
+            )
         } else {
-            NumericIndexInner::Immutable(ImmutableNumericIndex::new(db, field))
+            Ok(ImmutableNumericIndex::open_rocksdb(db, field)?.map(NumericIndexInner::Immutable))
         }
     }
 
-    pub fn new_mmap(path: &Path) -> OperationResult<Self> {
-        Ok(NumericIndexInner::Mmap(MmapNumericIndex::load(path)?))
+    /// Load immutable mmap based index, either in RAM or on disk
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Option<Self>> {
+        let Some(mmap_index) = MmapNumericIndex::open(path, is_on_disk)? else {
+            // Files don't exist, cannot load
+            return Ok(None);
+        };
+
+        if is_on_disk {
+            // Use on mmap directly
+            Ok(Some(NumericIndexInner::Mmap(mmap_index)))
+        } else {
+            // Load into RAM, use mmap as backing storage
+            Ok(Some(NumericIndexInner::Immutable(
+                ImmutableNumericIndex::open_mmap(mmap_index),
+            )))
+        }
+    }
+
+    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        Ok(MutableNumericIndex::open_gridstore(dir, create_if_missing)?
+            .map(NumericIndexInner::Mutable))
     }
 
     fn get_histogram(&self) -> &Histogram<T> {
@@ -201,30 +242,27 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         }
     }
 
-    pub fn load(&mut self) -> OperationResult<bool> {
-        match self {
-            NumericIndexInner::Mutable(index) => index.load(),
-            NumericIndexInner::Immutable(index) => index.load(),
-            NumericIndexInner::Mmap(_) => {
-                // Mmap index is always loaded
-                Ok(true)
-            }
-        }
-    }
-
     pub fn flusher(&self) -> Flusher {
         match self {
-            NumericIndexInner::Mutable(index) => index.get_db_wrapper().flusher(),
-            NumericIndexInner::Immutable(index) => index.get_db_wrapper().flusher(),
+            NumericIndexInner::Mutable(index) => index.flusher(),
+            NumericIndexInner::Immutable(index) => index.flusher(),
             NumericIndexInner::Mmap(index) => index.flusher(),
         }
     }
 
     pub fn files(&self) -> Vec<PathBuf> {
         match self {
-            NumericIndexInner::Mutable(_) => vec![],
-            NumericIndexInner::Immutable(_) => vec![],
+            NumericIndexInner::Mutable(index) => index.files(),
+            NumericIndexInner::Immutable(index) => index.files(),
             NumericIndexInner::Mmap(index) => index.files(),
+        }
+    }
+
+    pub fn immutable_files(&self) -> Vec<PathBuf> {
+        match self {
+            NumericIndexInner::Mutable(_) => vec![],
+            NumericIndexInner::Immutable(index) => index.immutable_files(),
+            NumericIndexInner::Mmap(index) => index.immutable_files(),
         }
     }
 
@@ -239,11 +277,16 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         }
     }
 
-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+    pub fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         match self {
             NumericIndexInner::Mutable(index) => index.check_values_any(idx, check_fn),
             NumericIndexInner::Immutable(index) => index.check_values_any(idx, check_fn),
-            NumericIndexInner::Mmap(index) => index.check_values_any(idx, check_fn),
+            NumericIndexInner::Mmap(index) => index.check_values_any(idx, check_fn, hw_counter),
         }
     }
 
@@ -283,7 +326,7 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         }
 
         let range = match range {
-            RangeInterface::Float(float_range) => float_range.map(T::from_f64),
+            RangeInterface::Float(float_range) => float_range.map(|float| T::from_f64(float.0)),
             RangeInterface::DateTime(datetime_range) => {
                 datetime_range.map(|dt| T::from_u128(dt.timestamp() as u128))
             }
@@ -350,6 +393,11 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
             points_count: self.get_points_count(),
             points_values_count: self.get_histogram().get_total_count(),
             histogram_bucket_size: Some(self.get_histogram().current_bucket_size()),
+            index_type: match self {
+                NumericIndexInner::Mutable(_) => "mutable_numeric",
+                NumericIndexInner::Immutable(_) => "immutable_numeric",
+                NumericIndexInner::Mmap(_) => "mmap_numeric",
+            },
         }
     }
 
@@ -357,20 +405,29 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         self.values_count(idx) == 0
     }
 
-    pub fn point_ids_by_value(&self, value: &T) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        let start = Bound::Included(Point::new(*value, PointOffsetType::MIN));
-        let end = Bound::Included(Point::new(*value, PointOffsetType::MAX));
+    pub fn point_ids_by_value<'a>(
+        &'a self,
+        value: T,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
+        let start = Bound::Included(Point::new(value, PointOffsetType::MIN));
+        let end = Bound::Included(Point::new(value, PointOffsetType::MAX));
         match &self {
             NumericIndexInner::Mutable(mutable) => Box::new(mutable.values_range(start, end)),
             NumericIndexInner::Immutable(immutable) => Box::new(immutable.values_range(start, end)),
-            NumericIndexInner::Mmap(mmap) => Box::new(mmap.values_range(start, end)),
+            NumericIndexInner::Mmap(mmap) => Box::new(mmap.values_range(start, end, hw_counter)),
         }
     }
 
     /// Tries to estimate the amount of points for a given key.
-    pub fn estimate_points(&self, value: &T) -> usize {
+    pub fn estimate_points(&self, value: &T, hw_counter: &HardwareCounterCell) -> usize {
         let start = Bound::Included(Point::new(*value, PointOffsetType::MIN));
         let end = Bound::Included(Point::new(*value, PointOffsetType::MAX));
+
+        hw_counter
+            .payload_index_io_read_counter()
+            // We have to do 2 times binary search in mmap and immutable storage.
+            .incr_delta(2 * ((self.total_unique_values_count() as f32).log2().ceil() as usize));
 
         match &self {
             NumericIndexInner::Mutable(mutable) => {
@@ -404,9 +461,52 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
             }
         }
     }
+
+    pub fn is_on_disk(&self) -> bool {
+        match self {
+            NumericIndexInner::Mutable(_) => false,
+            NumericIndexInner::Immutable(_) => false,
+            NumericIndexInner::Mmap(index) => index.is_on_disk(),
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    pub fn is_rocksdb(&self) -> bool {
+        match self {
+            NumericIndexInner::Mutable(index) => index.is_rocksdb(),
+            NumericIndexInner::Immutable(index) => index.is_rocksdb(),
+            NumericIndexInner::Mmap(_) => false,
+        }
+    }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        match self {
+            NumericIndexInner::Mutable(_) => {}   // Not a mmap
+            NumericIndexInner::Immutable(_) => {} // Not a mmap
+            NumericIndexInner::Mmap(index) => index.populate()?,
+        }
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        match self {
+            // Only clears backing mmap storage if used, not in-memory representation
+            NumericIndexInner::Mutable(index) => index.clear_cache()?,
+            // Only clears backing mmap storage if used, not in-memory representation
+            NumericIndexInner::Immutable(index) => index.clear_cache()?,
+            NumericIndexInner::Mmap(index) => index.clear_cache()?,
+        }
+        Ok(())
+    }
 }
 
-pub struct NumericIndex<T: Encodable + Numericable + MmapValue + Default, P> {
+pub struct NumericIndex<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P>
+where
+    Vec<T>: Blob,
+{
     inner: NumericIndexInner<T>,
     _phantom: PhantomData<P>,
 }
@@ -415,49 +515,98 @@ pub trait NumericIndexIntoInnerValue<T, P> {
     fn into_inner_value(value: P) -> T;
 }
 
-impl<T: Encodable + Numericable + MmapValue + Default, P> NumericIndex<T, P> {
-    pub fn new(db: Arc<RwLock<DB>>, field: &str, is_appendable: bool) -> Self {
-        Self {
-            inner: NumericIndexInner::new_memory(db, field, is_appendable),
-            _phantom: PhantomData,
-        }
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P> NumericIndex<T, P>
+where
+    Vec<T>: Blob,
+{
+    #[cfg(feature = "rocksdb")]
+    pub fn new_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+        is_appendable: bool,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<Self>> {
+        Ok(
+            NumericIndexInner::new_rocksdb(db, field, is_appendable, create_if_missing)?.map(
+                |inner| Self {
+                    inner,
+                    _phantom: PhantomData,
+                },
+            ),
+        )
     }
 
-    pub fn new_mmap(path: &Path) -> OperationResult<Self> {
-        Ok(Self {
-            inner: NumericIndexInner::new_mmap(path)?,
+    /// Load immutable mmap based index, either in RAM or on disk
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Option<Self>> {
+        let index = NumericIndexInner::new_mmap(path, is_on_disk)?;
+
+        Ok(index.map(|inner| Self {
+            inner,
             _phantom: PhantomData,
-        })
+        }))
     }
 
-    pub fn builder(db: Arc<RwLock<DB>>, field: &str) -> NumericIndexBuilder<T, P>
+    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+        let index = NumericIndexInner::new_gridstore(dir, create_if_missing)?;
+
+        Ok(index.map(|inner| Self {
+            inner,
+            _phantom: PhantomData,
+        }))
+    }
+
+    #[cfg(feature = "rocksdb")]
+    pub fn builder_rocksdb(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+    ) -> OperationResult<NumericIndexBuilder<T, P>>
     where
         Self: ValueIndexer<ValueType = P>,
     {
-        NumericIndexBuilder(Self::new(db, field, true))
+        Ok(NumericIndexBuilder(
+            Self::new_rocksdb(db, field, true, true)?.ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "Failed to create and load mutable numeric index builder for field '{field}'",
+                ))
+            })?,
+        ))
     }
 
-    #[cfg(test)]
-    pub fn builder_immutable(db: Arc<RwLock<DB>>, field: &str) -> NumericIndexImmutableBuilder<T, P>
+    #[cfg(all(test, feature = "rocksdb"))]
+    pub fn builder_rocksdb_immutable(
+        db: Arc<RwLock<DB>>,
+        field: &str,
+    ) -> NumericIndexImmutableBuilder<T, P>
     where
         Self: ValueIndexer<ValueType = P>,
     {
         NumericIndexImmutableBuilder {
-            index: Self::new(db.clone(), field, true),
+            index: Self::new_rocksdb(db.clone(), field, true, true)
+                // unwrap safety: only used in testing
+                .unwrap()
+                .unwrap(),
             field: field.to_owned(),
             db,
         }
     }
 
-    pub fn builder_mmap(path: &Path) -> NumericIndexMmapBuilder<T, P>
+    pub fn builder_mmap(path: &Path, is_on_disk: bool) -> NumericIndexMmapBuilder<T, P>
     where
         Self: ValueIndexer<ValueType = P> + NumericIndexIntoInnerValue<T, P>,
     {
         NumericIndexMmapBuilder {
             path: path.to_owned(),
             in_memory_index: InMemoryNumericIndex::default(),
+            is_on_disk,
             _phantom: PhantomData,
         }
+    }
+
+    pub fn builder_gridstore(dir: PathBuf) -> NumericIndexGridstoreBuilder<T, P>
+    where
+        Self: ValueIndexer<ValueType = P>,
+    {
+        NumericIndexGridstoreBuilder::new(dir)
     }
 
     pub fn inner(&self) -> &NumericIndexInner<T> {
@@ -468,42 +617,76 @@ impl<T: Encodable + Numericable + MmapValue + Default, P> NumericIndex<T, P> {
         &mut self.inner
     }
 
+    pub fn get_mutability_type(&self) -> IndexMutability {
+        match &self.inner {
+            NumericIndexInner::Mutable(_) => IndexMutability::Mutable,
+            NumericIndexInner::Immutable(_) => IndexMutability::Immutable,
+            NumericIndexInner::Mmap(_) => IndexMutability::Immutable,
+        }
+    }
+
+    pub fn get_storage_type(&self) -> StorageType {
+        match &self.inner {
+            NumericIndexInner::Mutable(index) => index.storage_type(),
+            NumericIndexInner::Immutable(index) => index.storage_type(),
+            NumericIndexInner::Mmap(index) => StorageType::Mmap {
+                is_on_disk: index.is_on_disk(),
+            },
+        }
+    }
+
     delegate! {
         to self.inner {
-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
-            pub fn cleanup(self) -> OperationResult<()>;
+            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool, hw_counter: &HardwareCounterCell) -> bool;
+            pub fn wipe(self) -> OperationResult<()>;
             pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry;
-            pub fn load(&mut self) -> OperationResult<bool>;
             pub fn values_count(&self, idx: PointOffsetType) -> usize;
             pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
             pub fn values_is_empty(&self, idx: PointOffsetType) -> bool;
+            pub fn is_on_disk(&self) -> bool;
+            pub fn populate(&self) -> OperationResult<()>;
+            pub fn clear_cache(&self) -> OperationResult<()>;
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    delegate! {
+        to self.inner {
+            pub fn is_rocksdb(&self) -> bool;
         }
     }
 }
 
-pub struct NumericIndexBuilder<T: Encodable + Numericable + MmapValue + Default, P>(
+pub struct NumericIndexBuilder<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P>(
     NumericIndex<T, P>,
 )
 where
-    NumericIndex<T, P>: ValueIndexer<ValueType = P>;
+    NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob;
 
-impl<T: Encodable + Numericable + MmapValue + Default, P> FieldIndexBuilderTrait
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P> FieldIndexBuilderTrait
     for NumericIndexBuilder<T, P>
 where
     NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob,
 {
     type FieldIndexType = NumericIndex<T, P>;
 
     fn init(&mut self) -> OperationResult<()> {
         match &mut self.0.inner {
-            NumericIndexInner::Mutable(index) => index.get_db_wrapper().recreate_column_family(),
+            NumericIndexInner::Mutable(index) => index.clear(),
             NumericIndexInner::Immutable(_) => unreachable!(),
             NumericIndexInner::Mmap(_) => unreachable!(),
         }
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.0.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.0.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
@@ -512,42 +695,52 @@ where
     }
 }
 
-#[cfg(test)]
-pub struct NumericIndexImmutableBuilder<T: Encodable + Numericable + MmapValue + Default, P>
-where
+#[cfg(all(test, feature = "rocksdb"))]
+pub struct NumericIndexImmutableBuilder<
+    T: Encodable + Numericable + MmapValue + Send + Sync + Default,
+    P,
+> where
     NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob,
 {
     index: NumericIndex<T, P>,
     field: String,
     db: Arc<RwLock<DB>>,
 }
 
-#[cfg(test)]
-impl<T: Encodable + Numericable + MmapValue + Default, P> FieldIndexBuilderTrait
+#[cfg(all(test, feature = "rocksdb"))]
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P> FieldIndexBuilderTrait
     for NumericIndexImmutableBuilder<T, P>
 where
     NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob,
 {
     type FieldIndexType = NumericIndex<T, P>;
 
     fn init(&mut self) -> OperationResult<()> {
         match &mut self.index.inner {
-            NumericIndexInner::Mutable(index) => index.get_db_wrapper().recreate_column_family(),
+            NumericIndexInner::Mutable(index) => index.clear(),
             NumericIndexInner::Immutable(_) => unreachable!(),
             NumericIndexInner::Mmap(_) => unreachable!(),
         }
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.index.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.index.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
         self.index.inner.flusher()()?;
         drop(self.index);
-        let mut inner: NumericIndexInner<T> =
-            NumericIndexInner::new_memory(self.db, &self.field, false);
-        inner.load()?;
+        let inner: NumericIndexInner<T> =
+            NumericIndexInner::new_rocksdb(self.db, &self.field, false, false)?
+                // unwrap safety: only used in testing
+                .unwrap();
         Ok(NumericIndex {
             inner,
             _phantom: PhantomData,
@@ -557,18 +750,21 @@ where
 
 pub struct NumericIndexMmapBuilder<T, P>
 where
-    T: Encodable + Numericable + MmapValue + Default,
+    T: Encodable + Numericable + MmapValue + Send + Sync + Default,
     NumericIndex<T, P>: ValueIndexer<ValueType = P> + NumericIndexIntoInnerValue<T, P>,
+    Vec<T>: Blob,
 {
     path: PathBuf,
     in_memory_index: InMemoryNumericIndex<T>,
+    is_on_disk: bool,
     _phantom: PhantomData<P>,
 }
 
-impl<T: Encodable + Numericable + MmapValue + Default, P> FieldIndexBuilderTrait
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P> FieldIndexBuilderTrait
     for NumericIndexMmapBuilder<T, P>
 where
     NumericIndex<T, P>: ValueIndexer<ValueType = P> + NumericIndexIntoInnerValue<T, P>,
+    Vec<T>: Blob,
 {
     type FieldIndexType = NumericIndex<T, P>;
 
@@ -576,7 +772,12 @@ where
         Ok(())
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         self.in_memory_index.remove_point(id);
         let mut flatten_values: Vec<_> = vec![];
         for value in payload.iter() {
@@ -587,12 +788,17 @@ where
             .into_iter()
             .map(NumericIndex::into_inner_value)
             .collect();
+
+        hw_counter
+            .payload_index_io_write_counter()
+            .incr_delta(size_of_val(&flatten_values));
+
         self.in_memory_index.add_many_to_list(id, flatten_values);
         Ok(())
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
-        let inner = MmapNumericIndex::build(self.in_memory_index, &self.path)?;
+        let inner = MmapNumericIndex::build(self.in_memory_index, &self.path, self.is_on_disk)?;
         Ok(NumericIndex {
             inner: NumericIndexInner::Mmap(inner),
             _phantom: PhantomData,
@@ -600,20 +806,88 @@ where
     }
 }
 
-impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for NumericIndexInner<T> {
+pub struct NumericIndexGridstoreBuilder<
+    T: Encodable + Numericable + MmapValue + Send + Sync + Default,
+    P,
+> where
+    NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob,
+{
+    dir: PathBuf,
+    index: Option<NumericIndex<T, P>>,
+}
+
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P>
+    NumericIndexGridstoreBuilder<T, P>
+where
+    NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob,
+{
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, index: None }
+    }
+}
+
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default, P> FieldIndexBuilderTrait
+    for NumericIndexGridstoreBuilder<T, P>
+where
+    NumericIndex<T, P>: ValueIndexer<ValueType = P>,
+    Vec<T>: Blob,
+{
+    type FieldIndexType = NumericIndex<T, P>;
+
+    fn init(&mut self) -> OperationResult<()> {
+        assert!(
+            self.index.is_none(),
+            "index must be initialized exactly once",
+        );
+        self.index.replace(
+            NumericIndex::new_gridstore(self.dir.clone(), true)?
+                // unwrap safety: cannot fail because create_if_missing is true
+                .unwrap(),
+        );
+        Ok(())
+    }
+
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let Some(index) = &mut self.index else {
+            return Err(OperationError::service_error(
+                "NumericIndexGridstoreBuilder: index must be initialized before adding points",
+            ));
+        };
+        index.add_point(id, payload, hw_counter)
+    }
+
+    fn finalize(mut self) -> OperationResult<Self::FieldIndexType> {
+        let Some(index) = self.index.take() else {
+            return Err(OperationError::service_error(
+                "NumericIndexGridstoreBuilder: index must be initialized to finalize",
+            ));
+        };
+        index.inner.flusher()()?;
+        Ok(index)
+    }
+}
+
+impl<T: Encodable + Numericable + MmapValue + Send + Sync + Default> PayloadFieldIndex
+    for NumericIndexInner<T>
+where
+    Vec<T>: Blob,
+{
     fn count_indexed_points(&self) -> usize {
         self.get_points_count()
     }
 
-    fn load(&mut self) -> OperationResult<bool> {
-        NumericIndexInner::load(self)
-    }
-
-    fn cleanup(self) -> OperationResult<()> {
+    fn wipe(self) -> OperationResult<()> {
         match self {
-            NumericIndexInner::Mutable(index) => index.get_db_wrapper().recreate_column_family(),
-            NumericIndexInner::Immutable(index) => index.get_db_wrapper().recreate_column_family(),
-            NumericIndexInner::Mmap(index) => index.clear(),
+            NumericIndexInner::Mutable(index) => index.wipe(),
+            NumericIndexInner::Immutable(index) => index.wipe(),
+            NumericIndexInner::Mmap(index) => index.wipe(),
         }
     }
 
@@ -625,10 +899,15 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
         NumericIndexInner::files(self)
     }
 
-    fn filter(
-        &self,
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        NumericIndexInner::immutable_files(self)
+    }
+
+    fn filter<'a>(
+        &'a self,
         condition: &FieldCondition,
-    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
         if let Some(Match::Value(MatchValue {
             value: ValueVariants::String(keyword),
         })) = &condition.r#match
@@ -637,14 +916,14 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
 
             if let Ok(uuid) = Uuid::from_str(keyword) {
                 let value = T::from_u128(uuid.as_u128());
-                return Some(self.point_ids_by_value(&value));
+                return Some(self.point_ids_by_value(value, hw_counter));
             }
         }
 
         let range_cond = condition.range.as_ref()?;
 
         let (start_bound, end_bound) = match range_cond {
-            RangeInterface::Float(float_range) => float_range.map(T::from_f64),
+            RangeInterface::Float(float_range) => float_range.map(|float| T::from_f64(float.0)),
             RangeInterface::DateTime(datetime_range) => {
                 datetime_range.map(|dt| T::from_u128(dt.timestamp() as u128))
             }
@@ -664,11 +943,17 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
             NumericIndexInner::Immutable(index) => {
                 Box::new(index.values_range(start_bound, end_bound))
             }
-            NumericIndexInner::Mmap(index) => Box::new(index.values_range(start_bound, end_bound)),
+            NumericIndexInner::Mmap(index) => {
+                Box::new(index.values_range(start_bound, end_bound, hw_counter))
+            }
         })
     }
 
-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+    fn estimate_cardinality(
+        &self,
+        condition: &FieldCondition,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<CardinalityEstimation> {
         if let Some(Match::Value(MatchValue {
             value: ValueVariants::String(keyword),
         })) = &condition.r#match
@@ -677,7 +962,7 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
             if let Ok(uuid) = Uuid::from_str(keyword) {
                 let key = T::from_u128(uuid.as_u128());
 
-                let estimated_count = self.estimate_points(&key);
+                let estimated_count = self.estimate_points(&key, hw_counter);
                 return Some(
                     CardinalityEstimation::exact(estimated_count).with_primary_clause(
                         PrimaryCondition::Condition(Box::new(condition.clone())),
@@ -716,23 +1001,23 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
             if let Some(pre_lower_bound) = pre_lower_bound {
                 let range = Range {
                     lt: match upper_bound {
-                        Excluded(val) => Some(val.to_f64()),
+                        Excluded(val) => Some(OrderedFloat(val.to_f64())),
                         _ => None,
                     },
                     gt: match pre_lower_bound {
-                        Excluded(val) => Some(val.to_f64()),
+                        Excluded(val) => Some(OrderedFloat(val.to_f64())),
                         _ => None,
                     },
                     gte: match pre_lower_bound {
-                        Included(val) => Some(val.to_f64()),
+                        Included(val) => Some(OrderedFloat(val.to_f64())),
                         _ => None,
                     },
                     lte: match upper_bound {
-                        Included(val) => Some(val.to_f64()),
+                        Included(val) => Some(OrderedFloat(val.to_f64())),
                         _ => None,
                     },
                 };
-                let cardinality = self.range_cardinality(&RangeInterface::Float(range.clone()));
+                let cardinality = self.range_cardinality(&RangeInterface::Float(range));
                 let condition = PayloadBlockCondition {
                     condition: FieldCondition::new_range(key.clone(), range),
                     cardinality: cardinality.exp,
@@ -774,9 +1059,10 @@ impl ValueIndexer for NumericIndex<IntPayloadType, IntPayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<IntPayloadType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
-            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values),
+            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values, hw_counter),
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
             )),
@@ -787,7 +1073,7 @@ impl ValueIndexer for NumericIndex<IntPayloadType, IntPayloadType> {
     }
 
     fn get_value(value: &Value) -> Option<IntPayloadType> {
-        value.as_i64()
+        value_to_integer(value)
     }
 
     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
@@ -810,11 +1096,14 @@ impl ValueIndexer for NumericIndex<IntPayloadType, DateTimePayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<DateTimePayloadType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
-            NumericIndexInner::Mutable(index) => {
-                index.add_many_to_list(id, values.into_iter().map(Self::into_inner_value).collect())
-            }
+            NumericIndexInner::Mutable(index) => index.add_many_to_list(
+                id,
+                values.into_iter().map(Self::into_inner_value).collect(),
+                hw_counter,
+            ),
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
             )),
@@ -848,9 +1137,10 @@ impl ValueIndexer for NumericIndex<FloatPayloadType, FloatPayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<FloatPayloadType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
-            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values),
+            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values, hw_counter),
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
             )),
@@ -884,11 +1174,12 @@ impl ValueIndexer for NumericIndex<UuidIntType, UuidPayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<Self::ValueType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
             NumericIndexInner::Mutable(index) => {
                 let values: Vec<u128> = values.iter().map(|i| i.as_u128()).collect();
-                index.add_many_to_list(id, values)
+                index.add_many_to_list(id, values, hw_counter)
             }
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
@@ -918,14 +1209,15 @@ impl NumericIndexIntoInnerValue<UuidIntType, UuidPayloadType>
 
 impl<T> StreamRange<T> for NumericIndexInner<T>
 where
-    T: Encodable + Numericable + MmapValue + Default,
+    T: Encodable + Numericable + MmapValue + Send + Sync + Default,
+    Vec<T>: Blob,
 {
     fn stream_range(
         &self,
         range: &RangeInterface,
     ) -> Box<dyn DoubleEndedIterator<Item = (T, PointOffsetType)> + '_> {
         let range = match range {
-            RangeInterface::Float(float_range) => float_range.map(T::from_f64),
+            RangeInterface::Float(float_range) => float_range.map(|float| T::from_f64(float.0)),
             RangeInterface::DateTime(datetime_range) => {
                 datetime_range.map(|dt| T::from_u128(dt.timestamp() as u128))
             }
@@ -952,6 +1244,7 @@ where
     }
 }
 
+#[cfg(feature = "rocksdb")]
 fn numeric_index_storage_cf_name(field: &str) -> String {
     format!("{field}_numeric")
 }

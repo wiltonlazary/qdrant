@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use api::grpc::conversions::naive_date_time_to_proto;
 use chrono::{DateTime, NaiveDateTime};
+use fs_err::tokio as tokio_fs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -115,7 +116,7 @@ impl From<SnapshotDescription> for api::grpc::qdrant::SnapshotDescription {
 
 pub async fn get_snapshot_description(path: &Path) -> CollectionResult<SnapshotDescription> {
     let name = path.file_name().unwrap().to_str().unwrap();
-    let file_meta = tokio::fs::metadata(&path).await?;
+    let file_meta = tokio_fs::metadata(&path).await?;
     let creation_time = file_meta.created().ok().and_then(|created_time| {
         created_time
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -139,7 +140,7 @@ pub async fn get_snapshot_description(path: &Path) -> CollectionResult<SnapshotD
 
 async fn read_checksum_for_snapshot(snapshot_path: impl Into<PathBuf>) -> Option<String> {
     let checksum_path = get_checksum_path(snapshot_path);
-    tokio::fs::read_to_string(&checksum_path).await.ok()
+    tokio_fs::read_to_string(&checksum_path).await.ok()
 }
 
 pub fn get_checksum_path(snapshot_path: impl Into<PathBuf>) -> PathBuf {
@@ -194,7 +195,9 @@ impl TryFrom<api::grpc::qdrant::ShardSnapshotLocation> for ShardSnapshotLocation
     fn try_from(location: api::grpc::qdrant::ShardSnapshotLocation) -> Result<Self, Self::Error> {
         use api::grpc::qdrant::shard_snapshot_location;
 
-        let Some(location) = location.location else {
+        let api::grpc::qdrant::ShardSnapshotLocation { location } = location;
+
+        let Some(location) = location else {
             return Err(tonic::Status::invalid_argument(
                 "Malformed shard snapshot location",
             ));

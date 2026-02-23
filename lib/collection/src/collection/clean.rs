@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ahash::AHashMap;
 use cancel::{CancellationToken, DropGuard};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use parking_lot::RwLock;
-use segment::types::{Condition, Filter};
+use segment::types::ExtendedPointId;
 use tokio::sync::watch::{Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -14,7 +15,7 @@ use super::Collection;
 use crate::operations::types::{CollectionError, CollectionResult, UpdateResult, UpdateStatus};
 use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use crate::shards::shard::ShardId;
-use crate::shards::shard_holder::LockedShardHolder;
+use crate::shards::shard_holder::{SharedShardHolder, WeakShardHolder};
 use crate::telemetry::{
     ShardCleanStatusFailedTelemetry, ShardCleanStatusProgressTelemetry, ShardCleanStatusTelemetry,
 };
@@ -35,7 +36,7 @@ const CLEAN_BATCH_SIZE: usize = 5_000;
 /// completes. Once it completes it does not have to be run again on restart.
 #[derive(Default)]
 pub(super) struct ShardCleanTasks {
-    tasks: Arc<RwLock<HashMap<ShardId, ShardCleanTask>>>,
+    tasks: Arc<RwLock<AHashMap<ShardId, ShardCleanTask>>>,
 }
 
 impl ShardCleanTasks {
@@ -58,7 +59,7 @@ impl ShardCleanTasks {
     /// will not abort any ongoing task.
     async fn clean_and_await(
         &self,
-        shards_holder: &Arc<LockedShardHolder>,
+        shards_holder: &SharedShardHolder,
         shard_id: ShardId,
         wait: bool,
         timeout: Option<Duration>,
@@ -107,12 +108,12 @@ impl ShardCleanTasks {
                 ShardCleanStatus::Failed { reason } => {
                     return Err(CollectionError::service_error(format!(
                         "Failed to clean shard points: {reason}",
-                    )))
+                    )));
                 }
                 ShardCleanStatus::Cancelled => {
                     return Err(CollectionError::service_error(
                         "Failed to clean shard points due to cancellation, please try again",
-                    ))
+                    ));
                 }
             }
 
@@ -121,18 +122,19 @@ impl ShardCleanTasks {
             }
 
             let result = if let Some(timeout) = timeout {
-                tokio::time::timeout(timeout - start.elapsed(), receiver.changed()).await
+                tokio::time::timeout(timeout.saturating_sub(start.elapsed()), receiver.changed())
+                    .await
             } else {
                 Ok(receiver.changed().await)
             };
             match result {
                 // Status updated, loop again to check it another time
-                Ok(Ok(_)) => continue,
+                Ok(Ok(_)) => (),
                 // Channel dropped, return error
                 Ok(Err(_)) => {
                     return Err(CollectionError::service_error(
                         "Failed to clean shard points, notification channel dropped",
-                    ))
+                    ));
                 }
                 // Timeout elapsed, acknowledge so the client can probe again later
                 Err(_) => return Ok(UpdateStatus::Acknowledged),
@@ -171,7 +173,7 @@ impl ShardCleanTasks {
     ///
     /// Only includes shards we've triggered cleaning for. On restart, or when invalidating shards,
     /// items are removed from the list.
-    pub fn statuses(&self) -> HashMap<ShardId, ShardCleanStatus> {
+    pub fn statuses(&self) -> AHashMap<ShardId, ShardCleanStatus> {
         self.tasks
             .read()
             .iter()
@@ -195,16 +197,16 @@ pub(super) struct ShardCleanTask {
 
 impl ShardCleanTask {
     /// Create a new shard clean task and immediately execute it
-    pub fn new(shards_holder: &Arc<LockedShardHolder>, shard_id: ShardId) -> Self {
+    pub fn new(shards_holder: &SharedShardHolder, shard_id: ShardId) -> Self {
         let (sender, receiver) = tokio::sync::watch::channel(ShardCleanStatus::Started);
-        let shard_holder = Arc::downgrade(shards_holder);
+        let shard_holder = shards_holder.downgrade();
         let cancel = CancellationToken::default();
 
         let task = tokio::task::spawn(Self::task(shard_holder, shard_id, sender, cancel.clone()));
 
         ShardCleanTask {
             handle: task,
-            status: receiver.clone(),
+            status: receiver,
             cancel: cancel.drop_guard(),
         }
     }
@@ -223,7 +225,7 @@ impl ShardCleanTask {
     }
 
     async fn task(
-        shard_holder: Weak<LockedShardHolder>,
+        shard_holder: WeakShardHolder,
         shard_id: ShardId,
         sender: Sender<ShardCleanStatus>,
         cancel: CancellationToken,
@@ -252,10 +254,13 @@ impl ShardCleanTask {
 }
 
 async fn clean_task(
-    shard_holder: Weak<LockedShardHolder>,
+    shard_holder: WeakShardHolder,
     shard_id: ShardId,
     sender: Sender<ShardCleanStatus>,
-) -> Result<(), CollectionError> {
+) -> CollectionResult<()> {
+    // Do not measure the hardware usage of these deletes as clean the shard is always considered an internal operation
+    // users should not be billed for.
+
     let mut offset = None;
     let mut deleted_points = 0;
 
@@ -276,21 +281,14 @@ async fn clean_task(
             )));
         }
 
-        // Scroll batch of points with hash ring filter
-        let filter = shard_holder
-            .hash_ring_filter(shard_id)
-            .expect("hash ring filter");
-        let filter = Filter::new_must_not(Condition::CustomIdChecker(Arc::new(filter)));
+        // Scroll next batch of points
         let mut ids = match shard
-            // TODO(ratelimiter): do not rate limit or bill this scroll, part of internals
-            .scroll_by(
+            .local_scroll_by_id(
                 offset,
                 CLEAN_BATCH_SIZE + 1,
                 &false.into(),
                 &false.into(),
-                Some(&filter),
                 None,
-                true,
                 None,
                 None,
                 HwMeasurementAcc::disposable(), // Internal operation, no measurement needed!
@@ -310,13 +308,40 @@ async fn clean_task(
         deleted_points += ids.len();
         let last_batch = offset.is_none();
 
+        // Filter list of point IDs after scrolling, delete points that don't belong in this shard
+        // Checking the hash ring to determine if a point belongs in the shard is very expensive.
+        // We scroll all point IDs and only filter points by the hash ring after scrolling on
+        // purpose, this way we check each point ID against the hash ring only once. Naively we
+        // might pass a hash ring filter into the scroll operation itself, but that will make it
+        // significantly slower, because then we'll do the expensive hash ring check on every
+        // point, in every segment.
+        // See: <https://github.com/qdrant/qdrant/pull/6085>
+        let hashring = shard_holder.hash_ring_router(shard_id).ok_or_else(|| {
+            CollectionError::service_error(format!(
+                "Shard {shard_id} cannot be cleaned, failed to get shard hash ring"
+            ))
+        })?;
+        let ids: Vec<ExtendedPointId> = ids
+            .into_iter()
+            // TODO: run test with this inverted?
+            .filter(|id| !hashring.is_in_shard(id, shard_id))
+            .collect();
+
         // Delete points from local shard
-        // TODO(ratelimiter): do not rate limit or bill this delete, part of internals
         let delete_operation =
             OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
                 crate::operations::point_ops::PointOperations::DeletePoints { ids },
             ));
-        if let Err(err) = shard.update_local(delete_operation, true).await {
+        if let Err(err) = shard
+            .update_local(
+                delete_operation,
+                last_batch,
+                None,
+                HwMeasurementAcc::disposable(),
+                false,
+            )
+            .await
+        {
             return Err(CollectionError::service_error(format!(
                 "Failed to delete points from shard: {err}",
             )));

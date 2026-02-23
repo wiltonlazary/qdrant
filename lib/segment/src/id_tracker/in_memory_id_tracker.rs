@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use bitvec::prelude::BitSlice;
 use common::types::PointOffsetType;
 #[cfg(test)]
-use rand::rngs::StdRng;
-#[cfg(test)]
 use rand::Rng as _;
+#[cfg(test)]
+use rand::rngs::StdRng;
 
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::id_tracker::point_mappings::PointMappings;
-use crate::id_tracker::IdTracker;
+use crate::id_tracker::{DELETED_POINT_VERSION, IdTracker};
 use crate::types::{PointIdType, SeqNumberType};
 
 /// A non-persistent ID tracker for faster and more efficient building of `ImmutableIdTracker`.
@@ -32,10 +32,19 @@ impl InMemoryIdTracker {
     /// Generate a random [`InMemoryIdTracker`].
     #[cfg(test)]
     pub fn random(rand: &mut StdRng, size: u32, preserved_size: u32, bits_in_id: u8) -> Self {
-        Self {
+        let mappings = PointMappings::random_with_params(rand, size, bits_in_id);
+
+        let mut id_tracker = Self {
             internal_to_version: vec![rand.random(); size as usize],
-            mappings: PointMappings::random_with_params(rand, size, preserved_size, bits_in_id),
+            mappings,
+        };
+
+        // Delete points after creating the id tracker completely to maintain consistency.
+        for to_delete_internal_id in preserved_size..size {
+            id_tracker.drop_internal(to_delete_internal_id).unwrap();
         }
+
+        id_tracker
     }
 }
 
@@ -79,7 +88,20 @@ impl IdTracker for InMemoryIdTracker {
     }
 
     fn drop(&mut self, external_id: PointIdType) -> OperationResult<()> {
+        // Unset version first because it still requires the mapping to exist
+        if let Some(internal_id) = self.internal_id(external_id) {
+            self.set_internal_version(internal_id, DELETED_POINT_VERSION)?;
+        }
         self.mappings.drop(external_id);
+        Ok(())
+    }
+
+    fn drop_internal(&mut self, internal_id: PointOffsetType) -> OperationResult<()> {
+        // Unset version first because it still requires the mapping to exist
+        self.set_internal_version(internal_id, DELETED_POINT_VERSION)?;
+        if let Some(external_id) = self.mappings.external_id(internal_id) {
+            self.mappings.drop(external_id);
+        }
         Ok(())
     }
 
@@ -96,10 +118,6 @@ impl IdTracker for InMemoryIdTracker {
         external_id: Option<PointIdType>,
     ) -> Box<dyn Iterator<Item = (PointIdType, PointOffsetType)> + '_> {
         self.mappings.iter_from(external_id)
-    }
-
-    fn iter_ids(&self) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        self.iter_internal()
     }
 
     fn iter_random(&self) -> Box<dyn Iterator<Item = (PointIdType, PointOffsetType)> + '_> {
@@ -142,29 +160,66 @@ impl IdTracker for InMemoryIdTracker {
         "in memory id tracker"
     }
 
-    fn cleanup_versions(&mut self) -> OperationResult<()> {
-        let mut to_remove = Vec::new();
-        for internal_id in self.iter_internal() {
-            if self.internal_version(internal_id).is_none() {
-                if let Some(external_id) = self.external_id(internal_id) {
-                    to_remove.push(external_id);
-                } else {
-                    debug_assert!(false, "internal id {internal_id} has no external id");
-                }
-            }
-        }
-        for external_id in to_remove {
-            self.drop(external_id)?;
-            #[cfg(debug_assertions)] // Only for dev builds
-            {
-                log::debug!("dropped version for point {} without version", external_id);
-            }
-        }
-        Ok(())
+    fn iter_internal_versions(
+        &self,
+    ) -> Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_> {
+        Box::new(
+            self.internal_to_version
+                .iter()
+                .enumerate()
+                .map(|(i, version)| (i as PointOffsetType, *version)),
+        )
     }
 
     fn files(&self) -> Vec<PathBuf> {
         debug_assert!(false, "InMemoryIdTracker should not be persisted");
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use rand::SeedableRng;
+
+    use super::*;
+
+    /// This test checks that the deleted points in a randomly initialized `InMemoryTracker` are consistent with points
+    /// which were deleted using `.drop()`.
+    #[test]
+    fn test_random_id_tracker_drop_consistency() {
+        let mut rand = StdRng::seed_from_u64(42);
+
+        // Create a random ID tracker with 32 points and half of them deleted.
+        const ID_TRACKER_SIZE: u32 = 32;
+        let mut id_tracker =
+            InMemoryIdTracker::random(&mut rand, ID_TRACKER_SIZE, ID_TRACKER_SIZE / 2, 10);
+
+        // Find a deleted and a non-deleted point in the random id tracker.
+        let mut deleted_point_id = None;
+        let mut available_point_id = None;
+        for internal_id in 0..ID_TRACKER_SIZE {
+            let is_deleted = id_tracker.external_id(internal_id).is_none();
+            if is_deleted {
+                deleted_point_id = Some(internal_id);
+            } else {
+                available_point_id = Some(internal_id);
+            }
+        }
+
+        let available_point_id = available_point_id.unwrap();
+        let deleted_point_id = deleted_point_id.unwrap();
+
+        // We drop the available point and assert that it has the same `internal_version` as the deleted one from the `id_tracker`
+        // and that both don't have an external ID anymore.
+        id_tracker.drop_internal(available_point_id).unwrap();
+
+        for internal_id in [available_point_id, deleted_point_id] {
+            // Assert the dropped point's version has been set to `DELETED_POINT_VERSION`.
+            assert_eq!(
+                id_tracker.internal_version(internal_id).unwrap(),
+                DELETED_POINT_VERSION
+            );
+            assert!(id_tracker.external_id(internal_id).is_none());
+        }
     }
 }

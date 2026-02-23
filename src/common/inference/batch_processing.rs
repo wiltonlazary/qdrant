@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use api::rest::{
     ContextInput, ContextPair, DiscoverInput, Prefetch, Query, QueryGroupsRequestInternal,
-    QueryInterface, QueryRequestInternal, RecommendInput, VectorInput,
+    QueryInterface, QueryRequestInternal, RecommendInput, RelevanceFeedbackInput, VectorInput,
 };
 
 use super::service::{InferenceData, InferenceInput, InferenceRequest};
@@ -86,6 +86,13 @@ fn collect_recommend_input(recommend: &RecommendInput, batch: &mut BatchAccum) {
     }
 }
 
+fn collect_feedback_input(feedback: &RelevanceFeedbackInput, batch: &mut BatchAccum) {
+    collect_vector_input(&feedback.target, batch);
+    for item in &feedback.feedback {
+        collect_vector_input(&item.example, batch);
+    }
+}
+
 fn collect_query(query: &Query, batch: &mut BatchAccum) {
     match query {
         Query::Nearest(nearest) => collect_vector_input(&nearest.nearest, batch),
@@ -98,7 +105,14 @@ fn collect_query(query: &Query, batch: &mut BatchAccum) {
                 }
             }
         }
-        Query::OrderBy(_) | Query::Fusion(_) | Query::Sample(_) => {}
+        Query::RelevanceFeedback(relevance_feedback) => {
+            collect_feedback_input(&relevance_feedback.relevance_feedback, batch)
+        }
+        Query::OrderBy(_)
+        | Query::Fusion(_)
+        | Query::Rrf(_)
+        | Query::Formula(_)
+        | Query::Sample(_) => {}
     }
 }
 
@@ -193,8 +207,8 @@ pub fn collect_query_request(request: &QueryRequestInternal) -> BatchAccum {
 
 #[cfg(test)]
 mod tests {
-    use api::rest::schema::{DiscoverQuery, Document, Image, InferenceObject, NearestQuery};
     use api::rest::QueryBaseGroupRequest;
+    use api::rest::schema::{DiscoverQuery, Document, Image, InferenceObject, NearestQuery};
     use serde_json::json;
 
     use super::*;
@@ -315,6 +329,7 @@ mod tests {
         let request = QueryGroupsRequestInternal {
             query: Some(QueryInterface::Query(Query::Nearest(NearestQuery {
                 nearest: VectorInput::Document(create_test_document("test")),
+                mmr: None,
             }))),
             prefetch: Some(vec![Prefetch {
                 query: Some(QueryInterface::Query(Query::Discover(DiscoverQuery {

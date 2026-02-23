@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use collection::config::{CollectionConfigInternal, ShardingMethod};
+use collection::config::{CollectionConfigInternal, CollectionParams, ShardingMethod};
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
     WalConfigDiff,
@@ -8,20 +8,23 @@ use collection::operations::config_diff::{
 use collection::operations::types::{
     SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
 };
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
 use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
-use collection::shards::{replica_set, CollectionId};
+use collection::shards::{CollectionId, replica_set};
 use schemars::JsonSchema;
 use segment::types::{
-    PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+    Payload, PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
     VectorNameBuf,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// Re-export staging types when the feature is enabled
+#[cfg(feature = "staging")]
+pub use super::staging::TestSlowDown;
 use crate::content_manager::errors::{StorageError, StorageResult};
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 
@@ -100,13 +103,6 @@ impl From<RenameAlias> for AliasOperations {
 }
 
 /// Operation for creating new collection and (optionally) specify index params
-#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
-#[serde(rename_all = "snake_case")]
-pub struct InitFrom {
-    pub collection: CollectionId,
-}
-
-/// Operation for creating new collection and (optionally) specify index params
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, PartialEq, Eq, Hash, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateCollection {
@@ -163,9 +159,6 @@ pub struct CreateCollection {
     #[serde(alias = "optimizer_config")]
     #[validate(nested)]
     pub optimizers_config: Option<OptimizersConfigDiff>,
-    /// Specify other collection to copy data from.
-    #[serde(default)]
-    pub init_from: Option<InitFrom>,
     /// Quantization parameters. If none - quantization is disabled.
     #[serde(default, alias = "quantization")]
     #[validate(nested)]
@@ -179,6 +172,11 @@ pub struct CreateCollection {
     #[serde(default)]
     #[schemars(skip)]
     pub uuid: Option<Uuid>,
+    /// Arbitrary JSON metadata for the collection
+    /// This can be used to store application-specific information
+    /// such as creation time, migration data, inference model info, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Payload>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -200,9 +198,9 @@ impl CreateCollectionOperation {
             let mut dense_names = create_collection.vectors.params_iter().map(|p| p.0);
             if let Some(duplicate_name) = dense_names.find(|name| sparse_config.contains_key(*name))
             {
-                return Err(StorageError::bad_input(
-                    format!("Dense and sparse vector names must be unique - duplicate found with '{duplicate_name}'"),
-                ));
+                return Err(StorageError::bad_input(format!(
+                    "Dense and sparse vector names must be unique - duplicate found with '{duplicate_name}'",
+                )));
             }
         }
 
@@ -237,6 +235,7 @@ pub struct UpdateCollection {
     /// Custom params for Optimizers.  If none - it is left unchanged.
     /// This operation is blocking, it will only proceed once all current optimizations are complete
     #[serde(alias = "optimizer_config")]
+    #[validate(nested)]
     pub optimizers_config: Option<OptimizersConfigDiff>, // TODO: Allow updates for other configuration params as well
     /// Collection base params. If none - it is left unchanged.
     pub params: Option<CollectionParamsDiff>,
@@ -252,6 +251,10 @@ pub struct UpdateCollection {
     pub sparse_vectors: Option<SparseVectorsConfig>,
     #[validate(nested)]
     pub strict_mode_config: Option<StrictModeConfig>,
+    /// Metadata to update for the collection. If provided, this will merge with existing metadata.
+    /// To remove metadata, set it to an empty object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Payload>,
 }
 
 /// Operation for updating parameters of the existing collection
@@ -275,6 +278,7 @@ impl UpdateCollectionOperation {
                 quantization_config: None,
                 sparse_vectors: None,
                 strict_mode_config: None,
+                metadata: None,
             },
             shard_replica_changes: None,
         }
@@ -372,6 +376,7 @@ pub struct CreateShardKey {
     pub collection_name: String,
     pub shard_key: ShardKey,
     pub placement: ShardsPlacement,
+    pub initial_state: Option<ReplicaState>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
@@ -408,28 +413,56 @@ pub enum CollectionMetaOperations {
     DropShardKey(DropShardKey),
     CreatePayloadIndex(CreatePayloadIndex),
     DropPayloadIndex(DropPayloadIndex),
-    Nop { token: usize }, // Empty operation
+    Nop {
+        token: usize,
+    }, // Empty operation
+    /// Introduce artificial delay to a specific peer node
+    #[cfg(feature = "staging")]
+    TestSlowDown(TestSlowDown),
 }
 
 /// Use config of the existing collection to generate a create collection operation
 /// for the new collection
 impl From<CollectionConfigInternal> for CreateCollection {
     fn from(value: CollectionConfigInternal) -> Self {
+        let CollectionConfigInternal {
+            params,
+            hnsw_config,
+            optimizer_config,
+            wal_config,
+            quantization_config,
+            strict_mode_config,
+            uuid,
+            metadata,
+        } = value;
+
+        let CollectionParams {
+            vectors,
+            shard_number,
+            sharding_method,
+            replication_factor,
+            write_consistency_factor,
+            read_fan_out_factor: _,
+            read_fan_out_delay_ms: _,
+            on_disk_payload,
+            sparse_vectors,
+        } = params;
+
         Self {
-            vectors: value.params.vectors,
-            shard_number: Some(value.params.shard_number.get()),
-            sharding_method: value.params.sharding_method,
-            replication_factor: Some(value.params.replication_factor.get()),
-            write_consistency_factor: Some(value.params.write_consistency_factor.get()),
-            on_disk_payload: Some(value.params.on_disk_payload),
-            hnsw_config: Some(value.hnsw_config.into()),
-            wal_config: Some(value.wal_config.into()),
-            optimizers_config: Some(value.optimizer_config.into()),
-            init_from: None,
-            quantization_config: value.quantization_config,
-            sparse_vectors: value.params.sparse_vectors,
-            strict_mode_config: value.strict_mode_config,
-            uuid: value.uuid,
+            vectors,
+            shard_number: Some(shard_number.get()),
+            sharding_method,
+            replication_factor: Some(replication_factor.get()),
+            write_consistency_factor: Some(write_consistency_factor.get()),
+            on_disk_payload: Some(on_disk_payload),
+            hnsw_config: Some(hnsw_config.into()),
+            wal_config: Some(wal_config.into()),
+            optimizers_config: Some(optimizer_config.into()),
+            quantization_config,
+            sparse_vectors,
+            strict_mode_config,
+            uuid,
+            metadata,
         }
     }
 }

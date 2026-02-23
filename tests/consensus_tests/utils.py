@@ -2,9 +2,10 @@ import json
 import os
 import re
 import shutil
+import signal
 from subprocess import Popen
 import time
-from typing import Tuple, Callable, Dict, List
+from typing import Tuple, Callable, Dict, List, Optional
 import requests
 import socket
 from contextlib import closing
@@ -14,16 +15,16 @@ from .assertions import assert_http_ok
 
 
 WAIT_TIME_SEC = 30
-RETRY_INTERVAL_SEC = 0.5
-
+RETRY_INTERVAL_SEC = 0.2
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 # Tracks processes that need to be killed at the end of the test
-processes = []
+processes: List['PeerProcess'] = []
 busy_ports = {}
 
 
 class PeerProcess:
-    def __init__(self, proc, http_port, grpc_port, p2p_port):
+    def __init__(self, proc: Popen, http_port, grpc_port, p2p_port):
         self.proc = proc
         self.http_port = http_port
         self.grpc_port = grpc_port
@@ -32,8 +33,18 @@ class PeerProcess:
 
     def kill(self):
         self.proc.kill()
+        self.proc.wait()
+
         # remove allocated ports from the dictionary
         # so they can be used afterwards
+        del busy_ports[self.http_port]
+        del busy_ports[self.grpc_port]
+        del busy_ports[self.p2p_port]
+
+    def interrupt(self):
+        self.proc.send_signal(signal.SIGINT)
+        self.proc.wait()
+
         del busy_ports[self.http_port]
         del busy_ports[self.grpc_port]
         del busy_ports[self.p2p_port]
@@ -50,8 +61,12 @@ def kill_all_processes():
     print()
     while len(processes) > 0:
         p = processes.pop(0)
-        print(f"Killing {p.pid}")
-        p.kill()
+        if is_coverage_mode():
+            print(f"Interrupting {p.pid}")
+            p.interrupt()
+        else:
+            print(f"Killing {p.pid}")
+            p.kill()
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +86,9 @@ def get_port() -> int:
                 continue
             return allocated_port
 
+def is_coverage_mode() -> bool:
+    return os.getenv("COVERAGE") == "1"
+
 
 def get_env(p2p_port: int, grpc_port: int, http_port: int) -> Dict[str, str]:
     env = os.environ.copy()
@@ -78,7 +96,12 @@ def get_env(p2p_port: int, grpc_port: int, http_port: int) -> Dict[str, str]:
     env["QDRANT__CLUSTER__P2P__PORT"] = str(p2p_port)
     env["QDRANT__SERVICE__HTTP_PORT"] = str(http_port)
     env["QDRANT__SERVICE__GRPC_PORT"] = str(grpc_port)
-    env["QDRANT__LOG_LEVEL"] = "DEBUG,raft::raft=info"
+    env["QDRANT__LOG_LEVEL"] = "TRACE,raft::raft=info,actix_http=info,tonic=info,want=info,mio=info"
+    env["QDRANT__SERVICE__HARDWARE_REPORTING"] = "true"
+
+    if is_coverage_mode():
+        env["LLVM_PROFILE_FILE"] = get_llvm_profile_file()
+
     return env
 
 
@@ -87,15 +110,23 @@ def get_uri(port: int) -> str:
 
 
 def assert_project_root():
-    directory_path = os.getcwd()
-    folder_name = os.path.basename(directory_path)
-    assert folder_name == "qdrant"
+    """Deprecated: No longer needed as paths are resolved relative to __file__."""
+    pass
 
 
 def get_qdrant_exec() -> str:
-    directory_path = os.getcwd()
-    qdrant_exec = directory_path + "/target/debug/qdrant"
-    return qdrant_exec
+    if is_coverage_mode():
+        qdrant_exec = PROJECT_ROOT / "target" / "llvm-cov-target" / "debug" / "qdrant"
+    else:
+        qdrant_exec = PROJECT_ROOT / "target" / "debug" / "qdrant"
+    return str(qdrant_exec)
+
+def get_llvm_profile_file() -> str:
+    # %m: keep merging results from each test into the same file
+    # If you have multiple tests running in parallel, you can use -%p OR -%{thread_count}m to have different files
+    # Not using -%p since each test will generate a new file
+    llvm_profile_file = PROJECT_ROOT / "target" / "llvm-cov-target" / "qdrant-consensus-tests-%m.profraw"
+    return str(llvm_profile_file)
 
 
 def get_pytest_current_test_name() -> str:
@@ -143,6 +174,9 @@ def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, ext
     if reinit:
         args.append("--reinit")
 
+    # Wrap with systemd-run to throttle CPU to investigate issues
+    # wrapped_cmd = ["systemd-run", "--user", "--scope", "-p", "CPUQuota=20%", "--"] + args
+    # proc = Popen(wrapped_cmd, env=env, cwd=peer_dir, stdout=log_file)
     proc = Popen(args, env=env, cwd=peer_dir, stdout=log_file)
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port)
@@ -180,12 +214,15 @@ def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, r
     if reinit:
         args.append("--reinit")
 
+    # Wrap with systemd-run to throttle CPU to investigate issues
+    # wrapped_cmd = ["systemd-run", "--user", "--scope", "-p", "CPUQuota=20%", "--"] + args
+    # proc = Popen(wrapped_cmd, env=env, cwd=peer_dir, stdout=log_file)
     proc = Popen(args, env=env, cwd=peer_dir, stdout=log_file)
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port), bootstrap_uri
 
 
-def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={}, uris_in_env=False):
+def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={}, uris_in_env=False, log_file_prefix=""):
     assert_project_root()
     peer_dirs = make_peer_folders(tmp_path, num_peers)
 
@@ -193,7 +230,7 @@ def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={
     peer_api_uris = []
 
     # Start bootstrap
-    (bootstrap_api_uri, bootstrap_uri) = start_first_peer(peer_dirs[0], "peer_0_0.log", port=port_seed,
+    (bootstrap_api_uri, bootstrap_uri) = start_first_peer(peer_dirs[0], f"{log_file_prefix}peer_0_0.log", port=port_seed,
                                                           extra_env=extra_env, uris_in_env=uris_in_env)
     peer_api_uris.append(bootstrap_api_uri)
 
@@ -205,7 +242,7 @@ def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={
     for i in range(1, len(peer_dirs)):
         if port_seed is not None:
             port = port_seed + i * 100
-        peer_api_uris.append(start_peer(peer_dirs[i], f"peer_0_{i}.log", bootstrap_uri, port=port, extra_env=extra_env, uris_in_env=uris_in_env))
+        peer_api_uris.append(start_peer(peer_dirs[i], f"{log_file_prefix}peer_0_{i}.log", bootstrap_uri, port=port, extra_env=extra_env, uris_in_env=uris_in_env))
 
     # Wait for cluster
     wait_for_uniform_cluster_status(peer_api_uris, leader, headers=headers)
@@ -216,7 +253,7 @@ def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={
 def make_peer_folder(base_path: Path, peer_number: int) -> Path:
     peer_dir = base_path / f"peer{peer_number}"
     peer_dir.mkdir()
-    shutil.copytree("config", peer_dir / "config")
+    shutil.copytree(PROJECT_ROOT / "config", peer_dir / "config")
     return peer_dir
 
 
@@ -278,8 +315,9 @@ def get_collection_info(peer_api_uri: str, collection_name: str) -> dict:
     return res
 
 
-def get_collection_point_count(peer_api_uri: str, collection_name: str, exact: bool = False) -> int:
-    r = requests.post(f"{peer_api_uri}/collections/{collection_name}/points/count", json={"exact": exact})
+def get_collection_point_count(peer_api_uri: str, collection_name: str, exact: bool = False,
+                               shard_key: Optional[str] = None, filter: Optional[dict] = None) -> int:
+    r = requests.post(f"{peer_api_uri}/collections/{collection_name}/points/count", json={"exact": exact, "shard_key": shard_key, "filter": filter})
     assert_http_ok(r)
     res = r.json()["result"]["count"]
     return res
@@ -346,6 +384,28 @@ def all_nodes_cluster_info_consistent(peer_api_uris: [str], expected_leader: str
             return False
     return True
 
+def peers_have_version(peer_api_uris: [str]) -> bool:
+    for peer_api_uri in peer_api_uris:
+        try:
+            # Check versions in local telemetry of each peer
+            # Not using cluster level telemetry because it shows versions before
+            # they are fully propagated through consensus
+            r = requests.get(f"{peer_api_uri}/telemetry?details_level=3")
+            assert_http_ok(r)
+            cluster = r.json()["result"]["cluster"]
+            peers = cluster["peers"]
+            peer_metadata = cluster["peer_metadata"]
+
+            for peer_id in peers.keys():
+                # Peers without metadata are not listed
+                if peer_id not in peer_metadata:
+                    return False
+                if peer_metadata[peer_id].get("version") is None:
+                    return False
+        except requests.exceptions.ConnectionError:
+            print(f"Could not contact peer {peer_api_uri} to fetch versions")
+            return False
+    return True
 
 def all_nodes_have_same_commit(peer_api_uris: [str]) -> bool:
     commits = []
@@ -391,7 +451,7 @@ def check_collection_local_shards_count(peer_api_uri: str, collection_name: str,
     return get_collection_local_shards_count(peer_api_uri, collection_name) == expected_local_shard_count
 
 
-def get_collection_local_shards_count(peer_api_uri: str, collection_name: str) -> bool:
+def get_collection_local_shards_count(peer_api_uri: str, collection_name: str) -> int:
     collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name)
     return len(collection_cluster_info["local_shards"])
 
@@ -440,13 +500,21 @@ def check_collection_shard_transfer_method(peer_api_uri: str, collection_name: s
                                            expected_method: str) -> bool:
     collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name)
 
+    # Shortcut if no transfers
+    if len(collection_cluster_info["shard_transfers"]) == 0:
+        print(f"check_collection_shard_transfer_method: no transfers for collection '{collection_name}'")
+        return False
+
     # Check method on each transfer
     for transfer in collection_cluster_info["shard_transfers"]:
         if "method" not in transfer:
+            print(f"check_collection_shard_transfer_method: unknown method not match expected '{expected_method}'")
             continue
         method = transfer["method"]
         if method == expected_method:
             return True
+        else:
+            print(f"check_collection_shard_transfer_method: method '{method}' does not match expected '{expected_method}'")
 
     return False
 
@@ -463,7 +531,10 @@ def check_collection_shard_transfer_progress(peer_api_uri: str, collection_name:
         comment = transfer["comment"]
 
         # Compare progress or total
-        current, total = re.search(r"Transferring records \((\d+)/(\d+)\), started", comment).groups()
+        m = re.search(r"Transferring records \((\d+)/(\d+)\)", comment)
+        if m is None:
+            continue
+        current, total = m.groups()
         if current is not None and expected_transfer_progress is not None and int(
                 current) >= expected_transfer_progress:
             return True
@@ -474,13 +545,16 @@ def check_collection_shard_transfer_progress(peer_api_uri: str, collection_name:
 
 
 def check_all_replicas_active(peer_api_uri: str, collection_name: str, headers={}) -> bool:
-    collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
-    for shard in collection_cluster_info["local_shards"]:
-        if shard['state'] != 'Active':
-            return False
-    for shard in collection_cluster_info["remote_shards"]:
-        if shard['state'] != 'Active':
-            return False
+    try:
+        collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
+        for shard in collection_cluster_info["local_shards"]:
+            if shard['state'] != 'Active':
+                return False
+        for shard in collection_cluster_info["remote_shards"]:
+            if shard['state'] != 'Active':
+                return False
+    except requests.exceptions.ConnectionError:
+        return False
     return True
 
 
@@ -496,15 +570,35 @@ def check_collection_cluster(peer_url, collection_name):
 
 def check_strict_mode_enabled(peer_api_uri: str, collection_name: str) -> bool:
     collection_info = get_collection_info(peer_api_uri, collection_name)
+    if "strict_mode_config" not in collection_info["config"]:
+        return False
     strict_mode_enabled = collection_info["config"]["strict_mode_config"]["enabled"]
     return strict_mode_enabled == True
 
+def check_strict_mode_disabled(peer_api_uri: str, collection_name: str) -> bool:
+    collection_info = get_collection_info(peer_api_uri, collection_name)
+    if "strict_mode_config" not in collection_info["config"]:
+        return True
+    strict_mode_enabled = collection_info["config"]["strict_mode_config"]["enabled"]
+    return strict_mode_enabled == False
 
 def wait_peer_added(peer_api_uri: str, expected_size: int = 1, headers={}) -> str:
     wait_for(check_cluster_size, peer_api_uri, expected_size, headers=headers)
     wait_for(leader_is_defined, peer_api_uri, headers=headers)
     return get_leader(peer_api_uri, headers=headers)
 
+def wait_for_collection(peer_api_uri: str, collection_name: str):
+    def is_collection_listed() -> bool:
+        try:
+            res = requests.get(f"{peer_api_uri}/collections")
+            if not res.ok:
+                return False
+            collections = set(collection['name'] for collection in res.json()["result"]['collections'])
+            return collection_name in collections
+        except requests.exceptions.ConnectionError:
+            return False
+
+    wait_for(is_collection_listed)
 
 def wait_collection_green(peer_api_uri: str, collection_name: str):
     try:
@@ -537,6 +631,12 @@ def wait_for_uniform_cluster_status(peer_api_uris: [str], expected_leader: str, 
         print_clusters_info(peer_api_uris)
         raise e
 
+def wait_for_all_peers_versions(peer_api_uris: [str]):
+    try:
+        wait_for(peers_have_version, peer_api_uris)
+    except Exception as e:
+        print_clusters_info(peer_api_uris)
+        raise e
 
 def wait_for_same_commit(peer_api_uris: [str]):
     try:
@@ -625,6 +725,13 @@ def wait_for_strict_mode_enabled(peer_api_uri: str, collection_name: str):
         print_collection_cluster_info(peer_api_uri, collection_name)
         raise e
 
+def wait_for_strict_mode_disabled(peer_api_uri: str, collection_name: str):
+    try:
+        wait_for(check_strict_mode_disabled, peer_api_uri, collection_name)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name)
+        raise e
+
 
 def wait_for(condition: Callable[..., bool], *args, wait_for_timeout=WAIT_TIME_SEC, wait_for_interval=RETRY_INTERVAL_SEC, **kwargs):
     start = time.time()
@@ -635,7 +742,6 @@ def wait_for(condition: Callable[..., bool], *args, wait_for_timeout=WAIT_TIME_S
                 f"Timeout waiting for condition {condition.__name__} to be satisfied in {wait_for_timeout} seconds")
         else:
             time.sleep(wait_for_interval)
-
 
 def peer_is_online(peer_api_uri: str, path: str = "/readyz") -> bool:
     try:
@@ -699,15 +805,28 @@ def wait_collection_exists_and_active_on_all_peers(collection_name: str, peer_ap
         wait_for_all_replicas_active(collection_name=collection_name, peer_api_uri=peer_uri, headers=headers)
 
 
-def create_shard_key(shard_key, peer_url, collection="test_collection", placement=None):
-    r_batch = requests.put(
-        f"{peer_url}/collections/{collection}/shards",
+def create_shard_key(
+    shard_key,
+    peer_url,
+    collection="test_collection",
+    shard_number=None,
+    replication_factor=None,
+    placement=None,
+    timeout=10,
+    headers={},
+):
+    r_create = requests.put(
+        f"{peer_url}/collections/{collection}/shards?timeout={timeout}",
         json={
             "shard_key": shard_key,
+            "shards_number": shard_number,
+            "replication_factor": replication_factor,
             "placement": placement,
         },
+        headers=headers,
     )
-    assert_http_ok(r_batch)
+    assert_http_ok(r_create)
+
 
 def move_shard(source_uri, collection_name, shard_id, source_peer_id, target_peer_id):
     r = requests.post(
@@ -719,3 +838,56 @@ def move_shard(source_uri, collection_name, shard_id, source_peer_id, target_pee
             }
         })
     assert_http_ok(r)
+
+def replicate_shard(source_uri, collection_name, shard_id, source_peer_id, target_peer_id, method=None):
+    payload = {
+        "shard_id": shard_id,
+        "from_peer_id": source_peer_id,
+        "to_peer_id": target_peer_id
+    }
+    if method:
+        payload["method"] = method
+    r = requests.post(
+        f"{source_uri}/collections/{collection_name}/cluster", json={
+            "replicate_shard": payload
+        })
+    assert_http_ok(r)
+
+
+def check_data_consistency(data):
+
+    assert(len(data) > 1)
+
+    for i in range(len(data) - 1):
+        j = i + 1
+
+        data_i = data[i]
+        data_j = data[j]
+
+        if data_i != data_j:
+            ids_i = set(x.get("id") for x in data_i)
+            ids_j = set(x.get("id") for x in data_j)
+
+            diff = ids_i - ids_j
+
+            if len(diff) < 100:
+                print(f"Diff between {i} and {j}: {diff}")
+            else:
+                sample = list(diff)[:32]
+                print(f"Diff len between {i} and {j}: {len(diff)}, sample: {sample}")
+
+            assert False, "Data on all nodes should be consistent"
+
+
+def check_feature_enabled(peer_api_uri, feature) -> bool:
+    r = requests.get(f"{peer_api_uri}/telemetry", params={"details_level": 10})
+    assert_http_ok(r)
+    features = r.json()['result']['app']['features']
+    result = features[feature]
+    return result
+
+
+def skip_if_no_feature(peer_api_uri, feature):
+    feature_is_enabled = check_feature_enabled(peer_api_uri, feature)
+    if not feature_is_enabled:
+        pytest.skip(f"Skipping because the feature {feature} is disabled at runtime.")

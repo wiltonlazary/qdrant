@@ -1,11 +1,12 @@
+use std::hint::black_box;
 use std::iter;
 use std::sync::atomic::AtomicBool;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use segment::common::flags::dynamic_mmap_flags::DynamicMmapFlags;
 use segment::common::operation_error::check_process_stopped;
-use segment::vector_storage::dense::dynamic_mmap_flags::DynamicMmapFlags;
 use tempfile::tempdir;
 
 const FLAG_COUNT: usize = 50_000_000;
@@ -19,7 +20,7 @@ fn dynamic_mmap_flag_count(c: &mut Criterion) {
     let stopped = AtomicBool::new(false);
 
     // Build dynamic mmap flags with random deletions
-    let mut dynamic_flags = DynamicMmapFlags::open(dir.path()).unwrap();
+    let mut dynamic_flags = DynamicMmapFlags::open(dir.path(), false).unwrap();
     dynamic_flags.set_len(FLAG_COUNT).unwrap();
     random_flags
         .iter()

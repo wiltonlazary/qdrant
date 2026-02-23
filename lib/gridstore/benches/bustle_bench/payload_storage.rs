@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use bustle::Collection;
 use common::counter::hardware_counter::HardwareCounterCell;
-use gridstore::fixtures::{empty_storage, Payload};
+use gridstore::fixtures::{Payload, empty_storage};
 use parking_lot::RwLock;
 
-use crate::fixture::{ArcStorage, SequentialCollectionHandle, StorageProxy};
 use crate::PayloadStorage;
+use crate::fixture::{ArcStorage, SequentialCollectionHandle, StorageProxy};
 
 impl Collection for ArcStorage<PayloadStorage> {
     type Handle = Self;
@@ -31,12 +31,17 @@ impl Collection for ArcStorage<PayloadStorage> {
 
 impl SequentialCollectionHandle for PayloadStorage {
     fn get(&self, key: &u32) -> bool {
-        self.get_value(*key, &HardwareCounterCell::new()).is_some() // No measurements needed in benches
+        self.get_value::<false>(*key, &HardwareCounterCell::new()) // No measurements needed in benches
+            .is_some()
     }
 
     fn insert(&mut self, key: u32, payload: &Payload) -> bool {
         !self
-            .put_value(key, payload, &HardwareCounterCell::new())
+            .put_value(
+                key,
+                payload,
+                HardwareCounterCell::new().ref_payload_io_write_counter(),
+            )
             .unwrap()
     }
 
@@ -45,11 +50,15 @@ impl SequentialCollectionHandle for PayloadStorage {
     }
 
     fn update(&mut self, key: &u32, payload: &Payload) -> bool {
-        self.put_value(*key, payload, &HardwareCounterCell::new())
-            .unwrap()
+        self.put_value(
+            *key,
+            payload,
+            HardwareCounterCell::new().ref_payload_io_write_counter(),
+        )
+        .unwrap()
     }
 
     fn flush(&self) -> bool {
-        self.flush().is_ok()
+        self.flusher()().is_ok()
     }
 }

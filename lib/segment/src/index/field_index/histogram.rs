@@ -3,8 +3,8 @@ use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+use common::fs::{atomic_save_bin, atomic_save_json, read_bin, read_json};
 use common::types::PointOffsetType;
-use io::file_operations::{atomic_save_bin, atomic_save_json, read_bin, read_json};
 use itertools::Itertools;
 use num_traits::Num;
 use serde::de::DeserializeOwned;
@@ -23,6 +23,7 @@ pub struct Counts {
     pub right: usize,
 }
 
+#[allow(clippy::derive_ord_xor_partial_ord)]
 #[derive(PartialEq, PartialOrd, Debug, Clone, Serialize, Deserialize)]
 #[repr(C)]
 pub struct Point<T> {
@@ -38,7 +39,6 @@ impl<T> Point<T> {
 
 impl<T: PartialEq> Eq for Point<T> {}
 
-#[allow(clippy::derive_ord_xor_partial_ord)]
 impl<T: PartialOrd + Copy> Ord for Point<T> {
     fn cmp(&self, other: &Point<T>) -> std::cmp::Ordering {
         (self.val, self.idx)
@@ -56,25 +56,13 @@ pub trait Numericable: Num + PartialEq + PartialOrd + Copy {
     fn from_f64(x: f64) -> Self;
     fn from_u128(x: u128) -> Self;
     fn min(self, b: Self) -> Self {
-        if self < b {
-            self
-        } else {
-            b
-        }
+        if self < b { self } else { b }
     }
     fn max(self, b: Self) -> Self {
-        if self > b {
-            self
-        } else {
-            b
-        }
+        if self > b { self } else { b }
     }
     fn abs_diff(self, b: Self) -> Self {
-        if self > b {
-            self - b
-        } else {
-            b - self
-        }
+        if self > b { self - b } else { b - self }
     }
 }
 
@@ -143,7 +131,7 @@ impl Numericable for u128 {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 pub struct Histogram<T: Numericable + Serialize + DeserializeOwned> {
     max_bucket_size: usize,
     precision: f64,
@@ -209,6 +197,10 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
 
     pub fn files(path: &Path) -> Vec<PathBuf> {
         vec![path.join(CONFIG_PATH), path.join(BORDERS_PATH)]
+    }
+
+    pub fn immutable_files(path: &Path) -> Vec<PathBuf> {
+        vec![path.join(CONFIG_PATH)]
     }
 
     #[cfg(test)]
@@ -320,7 +312,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
             return (0, 0, 0);
         }
 
-        let estimation = left_border
+        left_border
             .into_iter()
             .chain(self.borders.range((from_, to_)))
             .chain(right_border)
@@ -356,9 +348,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                 },
             )
             .reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
-            .unwrap_or((0, 0, 0));
-
-        estimation
+            .unwrap_or((0, 0, 0))
     }
 
     pub fn remove<F, G>(&mut self, val: &Point<T>, left_neighbour: F, right_neighbour: G)
@@ -383,7 +373,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
 
         let (to_remove, to_create, removed) = match &mut close_neighbors {
             (None, None) => (None, None, false), // histogram is empty
-            (Some((left_border, ref mut left_border_count)), None) => {
+            (Some((left_border, left_border_count)), None) => {
                 if left_border == val {
                     // ....|
                     // ...|
@@ -394,7 +384,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     } else {
                         // ...|..|
                         // ...|.|
-                        if let Some((_fln, ref mut fln_count)) = &mut far_left_neighbor {
+                        if let Some((_fln, fln_count)) = &mut far_left_neighbor {
                             fln_count.right -= 1
                         }
                         let (new_border, new_border_count) = (
@@ -414,7 +404,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     (None, None, false)
                 }
             }
-            (None, Some((right_border, ref mut right_border_count))) => {
+            (None, Some((right_border, right_border_count))) => {
                 if right_border == val {
                     // |...
                     //  |..
@@ -425,7 +415,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     } else {
                         // |..|...
                         //  |.|...
-                        if let Some((_frn, ref mut frn_count)) = &mut far_right_neighbor {
+                        if let Some((_frn, frn_count)) = &mut far_right_neighbor {
                             frn_count.left -= 1
                         }
                         let (new_border, new_border_count) = (
@@ -445,10 +435,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     (None, None, false)
                 }
             }
-            (
-                Some((left_border, ref mut left_border_count)),
-                Some((right_border, ref mut right_border_count)),
-            ) => {
+            (Some((left_border, left_border_count)), Some((right_border, right_border_count))) => {
                 // ...|...x.|...
                 if left_border == val {
                     // ...|....|...
@@ -464,7 +451,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     {
                         // ...|.l..r...
                         // ...|. ..r...
-                        if let Some((_fln, ref mut fln_count)) = &mut far_left_neighbor {
+                        if let Some((_fln, fln_count)) = &mut far_left_neighbor {
                             fln_count.right += right_border_count.left;
                             right_border_count.left = fln_count.right;
                         }
@@ -500,7 +487,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                     {
                         // ...l..r.|...
                         // ...l.. .|...
-                        if let Some((_frn, ref mut frn_count)) = &mut far_right_neighbor {
+                        if let Some((_frn, frn_count)) = &mut far_right_neighbor {
                             frn_count.left += left_border_count.right;
                             left_border_count.right = frn_count.left;
                         }
@@ -644,7 +631,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                 } else {
                     // ...|.....|x
                     // ...|......|
-                    if let Some((_fln, ref mut fln_count)) = &mut far_left_neighbor {
+                    if let Some((_fln, fln_count)) = &mut far_left_neighbor {
                         fln_count.right = new_count
                     }
                     (
@@ -679,7 +666,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
                             //we can move
                             //  ...|..x.........|...
                             //  ....|.x.........|...
-                            if let Some((_fln, ref mut fln_count)) = &mut far_left_neighbor {
+                            if let Some((_fln, fln_count)) = &mut far_left_neighbor {
                                 fln_count.right = new_border_count.left
                             }
                             (

@@ -1,33 +1,33 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cpu::CpuPermit;
-use rand::prelude::StdRng;
+use common::flags::FeatureFlags;
+use common::mmap::AdviceSetting;
+use common::progress_tracker::ProgressTracker;
 use rand::SeedableRng;
-use segment::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use rand::prelude::StdRng;
 use segment::data_types::vectors::{
-    only_default_vector, MultiDenseVectorInternal, QueryVector, TypedMultiDenseVectorRef,
-    VectorElementType, VectorRef, DEFAULT_VECTOR_NAME,
+    DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, QueryVector, TypedMultiDenseVectorRef,
+    VectorElementType, VectorRef, only_default_vector,
 };
-use segment::entry::entry_point::SegmentEntry;
+use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
 use segment::fixtures::index_fixtures::random_vector;
 use segment::fixtures::payload_fixtures::random_int_payload;
-use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::VectorIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::json_path::JsonPath;
 use segment::payload_json;
-use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::segment_constructor::VectorIndexBuildArgs;
-use segment::spaces::metric::Metric;
-use segment::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, MultiVectorConfig, PayloadSchemaType,
-    SeqNumberType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, HnswGlobalConfig, MultiVectorConfig,
+    PayloadSchemaType, SeqNumberType,
 };
-use segment::vector_storage::multi_dense::simple_multi_dense_vector_storage::open_simple_multi_dense_vector_storage;
 use segment::vector_storage::VectorStorage;
+use segment::vector_storage::multi_dense::appendable_mmap_multi_dense_vector_storage::open_appendable_memmap_multi_vector_storage_full;
 use tempfile::Builder;
 
 #[test]
@@ -37,7 +37,7 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
     let num_payload_values = 2;
     let dim = 8;
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 
@@ -45,48 +45,35 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
 
     let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     segment
         .create_field_index(
             0,
             &JsonPath::new(int_key),
             Some(&PayloadSchemaType::Integer.into()),
+            &hw_counter,
         )
         .unwrap();
 
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
-    let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
-    let mut multi_storage = open_simple_multi_dense_vector_storage(
-        db,
-        DB_VECTOR_CF,
+    let mut multi_storage = open_appendable_memmap_multi_vector_storage_full(
+        dir.path(),
         dim,
         distance,
         MultiVectorConfig::default(),
-        &AtomicBool::new(false),
+        AdviceSetting::Global,
+        true,
     )
     .unwrap();
 
-    let hw_counter = HardwareCounterCell::new();
-
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
-        let preprocessed_vector = match distance {
-            Distance::Cosine => {
-                <CosineMetric as Metric<VectorElementType>>::preprocess(vector.clone())
-            }
-            Distance::Euclid => {
-                <EuclidMetric as Metric<VectorElementType>>::preprocess(vector.clone())
-            }
-            Distance::Dot => {
-                <DotProductMetric as Metric<VectorElementType>>::preprocess(vector.clone())
-            }
-            Distance::Manhattan => {
-                <ManhattanMetric as Metric<VectorElementType>>::preprocess(vector.clone())
-            }
-        };
+        let vector = random_vector(&mut rng, dim);
+        let preprocessed_vector = distance.preprocess_vector::<VectorElementType>(vector.clone());
         let vector_multi = MultiDenseVectorInternal::new(preprocessed_vector, vector.len());
 
-        let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
+        let int_payload = random_int_payload(&mut rng, num_payload_values..=num_payload_values);
         let payload = payload_json! {int_key: int_payload};
 
         segment
@@ -106,6 +93,7 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
             .insert_vector(
                 internal_id,
                 VectorRef::MultiDense(TypedMultiDenseVectorRef::from(&vector_multi)),
+                &hw_counter,
             )
             .unwrap();
     }
@@ -125,10 +113,11 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
     // single threaded mode to guarantee equivalency between single and multi hnsw
-    let permit = Arc::new(CpuPermit::dummy(1));
+    let permit = Arc::new(ResourcePermit::dummy(1));
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
@@ -139,13 +128,17 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
             vector_storage: vector_storage.clone(),
             quantized_vectors: quantized_vectors.clone(),
             payload_index: segment.payload_index.clone(),
-            hnsw_config: hnsw_config.clone(),
+            hnsw_config,
         },
         VectorIndexBuildArgs {
             permit: permit.clone(),
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
+            feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -163,11 +156,11 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
     .unwrap();
 
     for _ in 0..10 {
-        let random_vector = random_vector(&mut rnd, dim);
+        let random_vector = random_vector(&mut rng, dim);
         let query_vector = random_vector.clone().into();
         let query_vector_multi = QueryVector::Nearest(vec![random_vector].try_into().unwrap());
 
-        let payload_value = random_int_payload(&mut rnd, 1..=1).pop().unwrap();
+        let payload_value = random_int_payload(&mut rng, 1..=1).pop().unwrap();
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
             JsonPath::new(int_key),

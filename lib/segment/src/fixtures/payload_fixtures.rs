@@ -3,10 +3,11 @@ use std::ops::{Range, RangeInclusive};
 use fnv::FnvBuildHasher;
 use indexmap::IndexSet;
 use itertools::Itertools;
+use ordered_float::OrderedFloat;
+use rand::Rng;
 use rand::distr::{Alphanumeric, SampleString};
 use rand::seq::IndexedRandom;
-use rand::Rng;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::data_types::vectors::{DenseVector, MultiDenseVectorInternal, VectorElementType};
 use crate::payload_json;
@@ -109,6 +110,24 @@ pub fn random_geo_payload<R: Rng + ?Sized>(
         .collect_vec()
 }
 
+pub fn random_full_text_payload<R: Rng + ?Sized>(
+    rnd_gen: &mut R,
+    num_values: RangeInclusive<usize>,
+    value_size: RangeInclusive<usize>,
+) -> Vec<Value> {
+    (0..rnd_gen.random_range(num_values))
+        .map(|_| {
+            let size = rnd_gen.random_range(value_size.clone());
+            let keyword = rnd_gen
+                .sample_iter(rand::distr::Alphabetic)
+                .map(|c| c as char)
+                .take(size)
+                .collect::<String>();
+            Value::from(keyword)
+        })
+        .collect_vec()
+}
+
 pub fn random_bool_payload<R: Rng + ?Sized>(
     rnd_gen: &mut R,
     num_values: RangeInclusive<usize>,
@@ -118,8 +137,8 @@ pub fn random_bool_payload<R: Rng + ?Sized>(
         .collect_vec()
 }
 
-pub fn random_vector<R: Rng + ?Sized>(rnd_gen: &mut R, size: usize) -> DenseVector {
-    (0..size).map(|_| rnd_gen.random()).collect()
+pub fn random_vector<R: Rng + ?Sized>(rng: &mut R, size: usize) -> DenseVector {
+    (0..size).map(|_| rng.random()).collect()
 }
 
 pub fn random_dense_byte_vector<R: Rng + ?Sized>(rnd_gen: &mut R, size: usize) -> DenseVector {
@@ -133,13 +152,13 @@ pub fn random_dense_byte_vector<R: Rng + ?Sized>(rnd_gen: &mut R, size: usize) -
 }
 
 pub fn random_multi_vector<R: Rng + ?Sized>(
-    rnd_gen: &mut R,
+    rng: &mut R,
     vector_size: usize,
     num_vector_per_points: usize,
 ) -> MultiDenseVectorInternal {
     let mut vectors = vec![];
     for _ in 0..num_vector_per_points {
-        let vec = random_vector(rnd_gen, vector_size);
+        let vec = random_vector(rng, vector_size);
         vectors.extend(vec);
     }
     MultiDenseVectorInternal::new(vectors, vector_size)
@@ -201,8 +220,8 @@ pub fn random_simple_condition<R: Rng + ?Sized>(rnd_gen: &mut R) -> Condition {
             RangeCondition {
                 lt: None,
                 gt: None,
-                gte: Some(rnd_gen.random_range(INT_RANGE) as f64),
-                lte: Some(rnd_gen.random_range(INT_RANGE) as f64),
+                gte: Some(OrderedFloat(rnd_gen.random_range(INT_RANGE) as f64)),
+                lte: Some(OrderedFloat(rnd_gen.random_range(INT_RANGE) as f64)),
             },
         ))
     }

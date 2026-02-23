@@ -1,6 +1,5 @@
 #[cfg(any(test, feature = "testing"))]
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::hash::Hash;
 use std::io::{self, Cursor, Write};
 use std::marker::PhantomData;
@@ -8,14 +7,16 @@ use std::mem::{align_of, size_of};
 use std::path::Path;
 use std::str;
 
+use fs_err::File;
 use memmap2::Mmap;
 use ph::fmph::Function;
 #[cfg(any(test, feature = "testing"))]
-use rand::rngs::StdRng;
-#[cfg(any(test, feature = "testing"))]
 use rand::Rng as _;
+#[cfg(any(test, feature = "testing"))]
+use rand::rngs::StdRng;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::mmap::{AdviceSetting, Madviseable, open_read_mmap};
 use crate::zeros::WriteZerosExt as _;
 
 type ValuesLen = u32;
@@ -24,9 +25,9 @@ type ValuesLen = u32;
 ///
 /// The layout of the memory-mapped file is as follows:
 ///
-/// | header     | phf | padding       | buckets | entries   |
-/// |------------|-----|---------------|---------|-----------|
-/// | [`Header`] |     | `u8[0..4095]` | `u32[]` | See below |
+/// | header     | phf | padding       | alignment | buckets | entries   |
+/// |------------|-----|---------------|-----------|---------|-----------|
+/// | [`Header`] |     | `u8[0..4095]` |  `u8[]`   | `u32[]` | See below |
 ///
 /// ## Entry format for the `str` key
 ///
@@ -56,6 +57,15 @@ struct Header {
 }
 
 const PADDING_SIZE: usize = 4096;
+
+pub const BUCKET_OFFSET_OVERHEAD: usize = size_of::<BucketOffset>();
+
+/// Overhead of reading a bucket in mmap hashmap.
+const SIZE_OF_LENGTH_FIELD: usize = size_of::<u32>();
+const SIZE_OF_KEY: usize = size_of::<u64>();
+
+/// How many bytes we need to read from disk to locate an entry.
+pub const READ_ENTRY_OVERHEAD: usize = SIZE_OF_LENGTH_FIELD + SIZE_OF_KEY + BUCKET_OFFSET_OVERHEAD;
 
 type BucketOffset = u64;
 
@@ -88,8 +98,12 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
         file_size += padding_len;
 
         // 4. Buckets
+        let buckets_size = keys_count * size_of::<BucketOffset>();
+        let bucket_align = buckets_size.next_multiple_of(K::ALIGN) - buckets_size;
+        file_size += bucket_align;
+        // Important: Bucket Position points after the alignment for backward compatibility.
         let buckets_pos = file_size;
-        file_size += keys_count * size_of::<BucketOffset>();
+        file_size += buckets_size;
 
         // 5. Data
         let mut buckets = vec![0 as BucketOffset; keys_count];
@@ -104,10 +118,12 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
         _ = file_size;
 
         // == Second pass ==
-        let file = tempfile::Builder::new()
+        let (file, temp_path) = tempfile::Builder::new()
             .prefix(path.file_name().ok_or(io::ErrorKind::InvalidInput)?)
-            .tempfile_in(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-        let mut bufw = io::BufWriter::new(&file);
+            .tempfile_in(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?
+            .into_parts();
+        let file = File::from_parts::<&Path>(file, temp_path.as_ref());
+        let mut bufw = io::BufWriter::new(file);
 
         // 1. Header
         let header = Header {
@@ -124,6 +140,8 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
         bufw.write_zeros(padding_len)?;
 
         // 4. Buckets
+        // Align the buckets to `K::ALIGN`, to make sure Entry.key is aligned.
+        bufw.write_zeros(bucket_align)?;
         bufw.write_all(buckets.as_bytes())?;
 
         // 5. Data
@@ -147,9 +165,13 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
             }
         }
 
-        drop(bufw);
-        file.as_file().sync_all()?;
-        file.persist(path)?;
+        // Explicitly flush write buffer so we can catch IO errors
+        bufw.flush()?;
+        let file = bufw.into_inner().unwrap();
+
+        file.sync_all()?;
+        drop(file);
+        temp_path.persist(path)?;
 
         Ok(())
     }
@@ -184,12 +206,8 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
     }
 
     /// Load the hash map from file.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-
-        // SAFETY: Assume other processes do not modify the file.
-        // See https://docs.rs/memmap2/latest/memmap2/struct.Mmap.html#safety
-        let mmap = unsafe { Mmap::map(&file)? };
+    pub fn open(path: &Path, populate: bool) -> io::Result<Self> {
+        let mmap = open_read_mmap(path, AdviceSetting::Global, populate)?;
 
         let (header, _) =
             Header::read_from_prefix(mmap.as_ref()).map_err(|_| io::ErrorKind::InvalidData)?;
@@ -330,6 +348,13 @@ impl<K: Key + ?Sized, V: Sized + FromBytes + Immutable + IntoBytes + KnownLayout
             )
         })
     }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> io::Result<()> {
+        self.mmap.populate();
+        Ok(())
+    }
 }
 
 /// A key that can be stored in the hash map.
@@ -425,7 +450,7 @@ impl Key for i64 {
 }
 
 impl Key for u128 {
-    const ALIGN: usize = align_of::<u128>();
+    const ALIGN: usize = size_of::<u128>();
 
     const NAME: [u8; 8] = *b"u128\0\0\0\0";
 
@@ -442,7 +467,14 @@ impl Key for u128 {
     }
 
     fn from_bytes(buf: &[u8]) -> Option<&Self> {
-        Some(u128::ref_from_prefix(buf).ok()?.0)
+        match u128::ref_from_prefix(buf) {
+            Ok(res) => Some(res.0),
+            Err(err) => {
+                debug_assert!(false, "Error reading u128 from mmap: {err}");
+                log::error!("Error reading u128 from mmap: {err}");
+                None
+            }
+        }
     }
 }
 
@@ -489,27 +521,28 @@ mod tests {
     fn test_mmap_hash() {
         test_mmap_hash_impl(gen_ident, |s| s.as_str(), |s| s.to_owned());
         test_mmap_hash_impl(|rng| rng.random::<i64>(), |i| i, |i| *i);
+        test_mmap_hash_impl(|rng| rng.random::<u128>(), |i| i, |i| *i);
     }
 
     fn test_mmap_hash_impl<K: Key + ?Sized, K1: Ord + Hash>(
-        gen: impl Clone + Fn(&mut StdRng) -> K1,
+        generator: impl Clone + Fn(&mut StdRng) -> K1,
         as_ref: impl Fn(&K1) -> &K,
         from_ref: impl Fn(&K) -> K1,
     ) {
         let mut rng = StdRng::seed_from_u64(42);
         let tmpdir = tempfile::Builder::new().tempdir().unwrap();
 
-        let map = gen_map(&mut rng, gen.clone(), 1000);
+        let map = gen_map(&mut rng, generator.clone(), 1000);
         MmapHashMap::<K, u32>::create(
             &tmpdir.path().join("map"),
             map.iter().map(|(k, v)| (as_ref(k), v.iter().copied())),
         )
         .unwrap();
-        let mmap = MmapHashMap::<K, u32>::open(&tmpdir.path().join("map")).unwrap();
+        let mmap = MmapHashMap::<K, u32>::open(&tmpdir.path().join("map"), false).unwrap();
 
         // Non-existing keys should return None
         for _ in 0..1000 {
-            let key = repeat_until(|| gen(&mut rng), |key| !map.contains_key(key));
+            let key = repeat_until(|| generator(&mut rng), |key| !map.contains_key(key));
             assert!(mmap.get(as_ref(&key)).unwrap().is_none());
         }
 
@@ -525,6 +558,9 @@ mod tests {
             let v = v.iter().copied().collect::<BTreeSet<_>>();
             assert_eq!(map.get(&from_ref(k)).unwrap(), &v);
         }
+
+        let keys: Vec<_> = mmap.keys().collect();
+        assert_eq!(keys.len(), map.len());
 
         // Existing keys should return the correct values
         for (k, v) in map {
@@ -552,7 +588,7 @@ mod tests {
         )
         .unwrap();
 
-        let mmap = MmapHashMap::<i64, u64>::open(&tmpdir.path().join("map")).unwrap();
+        let mmap = MmapHashMap::<i64, u64>::open(&tmpdir.path().join("map"), true).unwrap();
 
         for (k, v) in map {
             assert_eq!(
@@ -561,6 +597,38 @@ mod tests {
             );
         }
 
+        assert!(mmap.get(&100).unwrap().is_none())
+    }
+
+    #[test]
+    fn test_mmap_hash_impl_u128_value() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let tmpdir = tempfile::Builder::new().tempdir().unwrap();
+
+        let mut map: HashMap<u128, BTreeSet<u32>> = Default::default();
+
+        map.insert(
+            9812384971724u128,
+            (0..100).map(|_| rng.random_range(0..=1000)).collect(),
+        );
+
+        MmapHashMap::<u128, u32>::create(
+            &tmpdir.path().join("map"),
+            map.iter().map(|(k, v)| (k, v.iter().copied())),
+        )
+        .unwrap();
+
+        let mmap = MmapHashMap::<u128, u32>::open(&tmpdir.path().join("map"), true).unwrap();
+
+        let keys: Vec<_> = mmap.keys().collect();
+        assert_eq!(keys.len(), map.len());
+
+        for (k, v) in map {
+            assert_eq!(
+                mmap.get(&k).unwrap().unwrap(),
+                &v.into_iter().collect::<Vec<_>>()
+            );
+        }
         assert!(mmap.get(&100).unwrap().is_none())
     }
 }

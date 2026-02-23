@@ -37,7 +37,7 @@ impl RateLimiter {
         // Consumer wants more than maximum capacity, that's impossible
         if tokens > self.capacity_per_minute as f64 {
             return Err(RateLimitError::AlwaysOverBudget(
-                "request larger than than rate limiter capacity, please try to split your request",
+                "request larger than rate limiter capacity, please try to split your request",
             ));
         }
 
@@ -57,6 +57,7 @@ impl RateLimiter {
         } else {
             let missing_tokens = tokens - self.tokens;
             let retry_after = Duration::from_secs_f64(missing_tokens / self.tokens_per_sec);
+            debug_assert!(retry_after > Duration::from_secs(0));
             let retry_error = RetryError {
                 tokens_available: self.tokens,
                 retry_after,
@@ -120,7 +121,7 @@ mod tests {
         assert_eq!(limiter.tokens, 599.0);
 
         assert_eq!(limiter.try_consume(10.0), Ok(()));
-        assert_eq_floats(limiter.tokens, 589.0, 0.001);
+        assert!((589.0..=590.0).contains(&limiter.tokens));
     }
 
     #[test]

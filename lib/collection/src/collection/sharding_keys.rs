@@ -1,14 +1,16 @@
 use std::collections::HashSet;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::ShardKey;
 
 use crate::collection::Collection;
 use crate::config::ShardingMethod;
-use crate::operations::types::CollectionError;
+use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::{
     CollectionUpdateOperations, CreateIndex, FieldIndexOperations, OperationWithClockTag,
 };
-use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
+use crate::shards::replica_set::ShardReplicaSet;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId, ShardsPlacement};
 
 impl Collection {
@@ -18,7 +20,7 @@ impl Collection {
         shard_key: Option<ShardKey>,
         replicas: &[PeerId],
         init_state: Option<ReplicaState>,
-    ) -> Result<ShardReplicaSet, CollectionError> {
+    ) -> CollectionResult<ShardReplicaSet> {
         let is_local = replicas.contains(&self.this_peer_id);
 
         let peers = replicas
@@ -32,7 +34,7 @@ impl Collection {
         ShardReplicaSet::build(
             shard_id,
             shard_key,
-            self.name(),
+            self.name().to_string(),
             self.this_peer_id,
             is_local,
             peers,
@@ -46,7 +48,7 @@ impl Collection {
             self.channel_service.clone(),
             self.update_runtime.clone(),
             self.search_runtime.clone(),
-            self.optimizer_cpu_budget.clone(),
+            self.optimizer_resource_budget.clone(),
             Some(init_state.unwrap_or(ReplicaState::Active)),
         )
         .await
@@ -59,7 +61,10 @@ impl Collection {
         &self,
         shard_key: ShardKey,
         placement: ShardsPlacement,
-    ) -> Result<(), CollectionError> {
+        init_state: ReplicaState,
+    ) -> CollectionResult<()> {
+        let hw_counter = HwMeasurementAcc::disposable(); // Internal operation. No measurement needed.
+
         let state = self.state().await;
         match state.config.params.sharding_method.unwrap_or_default() {
             ShardingMethod::Auto => {
@@ -97,7 +102,6 @@ impl Collection {
         }
 
         let max_shard_id = state.max_shard_id();
-
         let payload_schema = self.payload_index_schema.read().schema.clone();
 
         for (idx, shard_replicas_placement) in placement.iter().enumerate() {
@@ -108,7 +112,7 @@ impl Collection {
                     shard_id,
                     Some(shard_key.clone()),
                     shard_replicas_placement,
-                    None,
+                    Some(init_state),
                 )
                 .await?;
 
@@ -121,20 +125,27 @@ impl Collection {
                 );
 
                 replica_set
-                    .update_local(OperationWithClockTag::from(create_index_op), true) // TODO: Assign clock tag!? 🤔
+                    .update_local(
+                        OperationWithClockTag::from(create_index_op),
+                        true,
+                        None,
+                        hw_counter.clone(),
+                        false,
+                    ) // TODO: Assign clock tag!? 🤔
                     .await?;
             }
 
-            self.shards_holder.write().await.add_shard(
-                shard_id,
-                replica_set,
-                Some(shard_key.clone()),
-            )?;
+            self.shards_holder
+                .write()
+                .await
+                .add_shard(shard_id, replica_set, Some(shard_key.clone()))
+                .await?;
         }
+
         Ok(())
     }
 
-    pub async fn drop_shard_key(&self, shard_key: ShardKey) -> Result<(), CollectionError> {
+    pub async fn drop_shard_key(&self, shard_key: ShardKey) -> CollectionResult<()> {
         let state = self.state().await;
 
         match state.config.params.sharding_method.unwrap_or_default() {
@@ -151,13 +162,13 @@ impl Collection {
             .await
             .filter(|state| state.shard_key.as_ref() == Some(&shard_key));
 
-        if let Some(state) = resharding_state {
-            if let Err(err) = self.abort_resharding(state.key(), true).await {
-                log::error!(
-                    "failed to abort resharding {} while deleting shard key {shard_key}: {err}",
-                    state.key(),
-                );
-            }
+        if let Some(state) = resharding_state
+            && let Err(err) = self.abort_resharding(state.key(), true).await
+        {
+            log::error!(
+                "failed to abort resharding {} while deleting shard key {shard_key}: {err}",
+                state.key(),
+            );
         }
 
         // Invalidate local shard cleaning tasks
@@ -178,5 +189,37 @@ impl Collection {
             .await
             .remove_shard_key(&shard_key)
             .await
+    }
+
+    pub async fn get_shard_ids(&self, shard_key: &ShardKey) -> CollectionResult<Vec<ShardId>> {
+        self.shards_holder
+            .read()
+            .await
+            .get_shard_key_to_ids_mapping()
+            .get(shard_key)
+            .map(|ids| ids.iter().cloned().collect())
+            .ok_or_else(|| {
+                CollectionError::bad_input(format!(
+                    "Shard key {shard_key} does not exist for collection {}",
+                    self.name()
+                ))
+            })
+    }
+
+    pub async fn get_replicas(
+        &self,
+        shard_key: &ShardKey,
+    ) -> CollectionResult<Vec<(ShardId, PeerId)>> {
+        let shard_ids = self.get_shard_ids(shard_key).await?;
+        let shard_holder = self.shards_holder.read().await;
+        let mut replicas = Vec::new();
+        for shard_id in shard_ids {
+            if let Some(replica_set) = shard_holder.get_shard(shard_id) {
+                for (peer_id, _) in replica_set.peers() {
+                    replicas.push((shard_id, peer_id));
+                }
+            }
+        }
+        Ok(replicas)
     }
 }

@@ -30,7 +30,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -68,7 +68,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -87,6 +87,82 @@
                     },
                     "result": {
                       "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Distributed"
+        ],
+        "summary": "List shard keys",
+        "operationId": "list_shard_keys",
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection to list shard keys for",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "usage": {
+                      "default": null,
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Usage"
+                        },
+                        {
+                          "nullable": true
+                        }
+                      ]
+                    },
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request",
+                      "example": 0.002
+                    },
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/ShardKeysResponse"
                     }
                   }
                 }
@@ -126,7 +202,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -164,7 +240,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -244,6 +320,17 @@
               "type": "integer",
               "minimum": 0
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for this request",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 60
+            }
           }
         ],
         "responses": {
@@ -278,7 +365,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -323,6 +410,17 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for this request",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 60
+            }
           }
         ],
         "responses": {
@@ -339,150 +437,6 @@
           },
           "4XX": {
             "description": "error"
-          }
-        }
-      }
-    },
-    "/locks": {
-      "post": {
-        "summary": "Set lock options",
-        "description": "Set lock options. If write is locked, all write operations and collection creation are forbidden. Returns previous lock options",
-        "operationId": "post_locks",
-        "tags": [
-          "Service"
-        ],
-        "requestBody": {
-          "description": "Lock options and optional error message",
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LocksOption"
-              }
-            }
-          }
-        },
-        "responses": {
-          "default": {
-            "description": "error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "description": "error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "usage": {
-                      "default": null,
-                      "anyOf": [
-                        {
-                          "$ref": "#/components/schemas/HardwareUsage"
-                        },
-                        {
-                          "nullable": true
-                        }
-                      ]
-                    },
-                    "time": {
-                      "type": "number",
-                      "format": "float",
-                      "description": "Time spent to process this request",
-                      "example": 0.002
-                    },
-                    "status": {
-                      "type": "string",
-                      "example": "ok"
-                    },
-                    "result": {
-                      "$ref": "#/components/schemas/LocksOption"
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "get": {
-        "summary": "Get lock options",
-        "description": "Get lock options. If write is locked, all write operations and collection creation are forbidden",
-        "operationId": "get_locks",
-        "tags": [
-          "Service"
-        ],
-        "responses": {
-          "default": {
-            "description": "error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "description": "error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "usage": {
-                      "default": null,
-                      "anyOf": [
-                        {
-                          "$ref": "#/components/schemas/HardwareUsage"
-                        },
-                        {
-                          "nullable": true
-                        }
-                      ]
-                    },
-                    "time": {
-                      "type": "number",
-                      "format": "float",
-                      "description": "Time spent to process this request",
-                      "example": 0.002
-                    },
-                    "status": {
-                      "type": "string",
-                      "example": "ok"
-                    },
-                    "result": {
-                      "$ref": "#/components/schemas/LocksOption"
-                    }
-                  }
-                }
-              }
-            }
           }
         }
       }
@@ -597,18 +551,61 @@
           "Beta"
         ],
         "responses": {
-          "200": {
-            "description": "Successful response",
+          "default": {
+            "description": "error",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "boolean"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
           },
           "4XX": {
-            "description": "error"
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "usage": {
+                      "default": null,
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Usage"
+                        },
+                        {
+                          "nullable": true
+                        }
+                      ]
+                    },
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request",
+                      "example": 0.002
+                    },
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "result": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -653,7 +650,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -672,6 +669,96 @@
                     },
                     "result": {
                       "$ref": "#/components/schemas/ClusterStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cluster/telemetry": {
+      "get": {
+        "tags": [
+          "Distributed"
+        ],
+        "summary": "Collect cluster telemetry data",
+        "description": "Get telemetry data, from the point of view of the cluster. This includes peers info, collections info, shard transfers, and resharding status",
+        "operationId": "cluster_telemetry",
+        "parameters": [
+          {
+            "name": "details_level",
+            "in": "query",
+            "description": "The level of detail to include in the response",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for this request",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 60
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "usage": {
+                      "default": null,
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Usage"
+                        },
+                        {
+                          "nullable": true
+                        }
+                      ]
+                    },
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request",
+                      "example": 0.002
+                    },
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/DistributedTelemetryData"
                     }
                   }
                 }
@@ -720,7 +807,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -767,6 +854,14 @@
             }
           },
           {
+            "name": "timeout",
+            "in": "query",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
             "name": "force",
             "in": "query",
             "description": "If true - removes peer even if it has shards/replicas on it.",
@@ -808,7 +903,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -876,7 +971,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -955,7 +1050,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1012,7 +1107,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -1050,7 +1145,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1107,7 +1202,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -1145,7 +1240,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1192,7 +1287,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -1230,7 +1325,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1279,7 +1374,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -1317,7 +1412,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1380,6 +1475,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "requestBody": {
@@ -1424,7 +1529,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1503,7 +1608,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1575,6 +1680,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -1609,7 +1724,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1688,7 +1803,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1744,7 +1859,7 @@
           {
             "name": "timeout",
             "in": "query",
-            "description": "Wait for operation commit timeout in seconds. \nIf timeout is reached - request will return with service error.\n",
+            "description": "Wait for operation commit timeout in seconds.\nIf timeout is reached - request will return with service error.\n",
             "schema": {
               "type": "integer"
             }
@@ -1782,7 +1897,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1801,6 +1916,105 @@
                     },
                     "result": {
                       "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/collections/{collection_name}/optimizations": {
+      "get": {
+        "tags": [
+          "Collections"
+        ],
+        "summary": "Get optimization progress",
+        "description": "Get progress of ongoing and completed optimizations for a collection",
+        "operationId": "get_optimizations",
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "with",
+            "in": "query",
+            "description": "Comma-separated list of optional fields to include in the response.\nPossible values: queued, completed, idle_segments.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "completed_limit",
+            "in": "query",
+            "description": "Maximum number of completed optimizations to return.\nIgnored if `completed` is not in the `with` parameter.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 16
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "usage": {
+                      "default": null,
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/Usage"
+                        },
+                        {
+                          "nullable": true
+                        }
+                      ]
+                    },
+                    "time": {
+                      "type": "number",
+                      "format": "float",
+                      "description": "Time spent to process this request",
+                      "example": 0.002
+                    },
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/OptimizationsResponse"
                     }
                   }
                 }
@@ -1861,7 +2075,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -1929,7 +2143,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -2246,7 +2460,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -2579,7 +2793,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -2807,6 +3021,69 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Snapshot file",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/collections/{collection_name}/shards/{shard_id}/snapshot": {
+      "get": {
+        "tags": [
+          "Snapshots"
+        ],
+        "summary": "Download shard snapshot",
+        "description": "Stream the current state of a shard as a snapshot file",
+        "operationId": "stream_shard_snapshot",
+        "parameters": [
+          {
+            "name": "collection_name",
+            "in": "path",
+            "description": "Name of the collection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "shard_id",
+            "in": "path",
+            "description": "Id of the shard",
+            "required": true,
+            "schema": {
+              "type": "integer"
             }
           }
         ],
@@ -3161,7 +3438,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -3550,7 +3827,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -3658,7 +3935,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -3732,6 +4009,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -3766,7 +4053,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -3839,6 +4126,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -3873,7 +4170,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -3946,6 +4243,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -3980,7 +4287,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4053,6 +4360,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -4087,7 +4404,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4160,6 +4477,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -4194,7 +4521,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4265,6 +4592,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -4299,7 +4636,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4372,6 +4709,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -4406,7 +4753,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4479,6 +4826,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -4513,7 +4870,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4586,6 +4943,16 @@
             "schema": {
               "$ref": "#/components/schemas/WriteOrdering"
             }
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "description": "Timeout for the operation",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -4620,7 +4987,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4731,7 +5098,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4840,7 +5207,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -4952,7 +5319,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5067,7 +5434,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5176,7 +5543,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5288,7 +5655,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5403,7 +5770,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5438,7 +5805,7 @@
           "Search"
         ],
         "summary": "Discover points",
-        "description": "Use context and a target to find the most similar points to the target, constrained by the context.\nWhen using only the context (without a target), a special search - called context search - is performed where pairs of points are used to generate a loss that guides the search towards the zone where most positive examples overlap. This means that the score minimizes the scenario of finding a point closer to a negative than to a positive part of a pair.\nSince the score of a context relates to loss, the maximum score a point can get is 0.0, and it becomes normal that many points can have a score of 0.0.\nWhen using target (with or without context), the score behaves a little different: The  integer part of the score represents the rank with respect to the context, while the decimal part of the score relates to the distance to the target. The context part of the score for  each pair is calculated +1 if the point is closer to a positive than to a negative part of a pair,  and -1 otherwise.\n",
+        "description": "Use context and a target to find the most similar points to the target, constrained by the context.\nWhen using only the context (without a target), a special search - called context search - is performed where pairs of points are used to generate a loss that guides the search towards the zone where most positive examples overlap. This means that the score minimizes the scenario of finding a point closer to a negative than to a positive part of a pair.\nSince the score of a context relates to loss, the maximum score a point can get is 0.0, and it becomes normal that many points can have a score of 0.0.\nWhen using target (with or without context), the score behaves a little different: The integer part of the score represents the rank with respect to the context, while the decimal part of the score relates to the distance to the target. The context part of the score for each pair is calculated +1 if the point is closer to a positive than to a negative part of a pair, and -1 otherwise.\n",
         "operationId": "discover_points",
         "requestBody": {
           "description": "Request points based on {positive, negative} pairs of examples, and/or a target",
@@ -5512,7 +5879,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5624,7 +5991,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5687,6 +6054,15 @@
             }
           },
           {
+            "name": "consistency",
+            "in": "query",
+            "description": "Define read consistency guarantees for the operation",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ReadConsistency"
+            }
+          },
+          {
             "name": "timeout",
             "in": "query",
             "description": "If set, overrides global timeout for this request. Unit is seconds.",
@@ -5729,7 +6105,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5786,6 +6162,15 @@
             }
           },
           {
+            "name": "consistency",
+            "in": "query",
+            "description": "Define read consistency guarantees for the operation",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ReadConsistency"
+            }
+          },
+          {
             "name": "timeout",
             "in": "query",
             "description": "If set, overrides global timeout for this request. Unit is seconds.",
@@ -5793,15 +6178,6 @@
             "schema": {
               "type": "integer",
               "minimum": 1
-            }
-          },
-          {
-            "name": "consistency",
-            "in": "query",
-            "description": "Define read consistency guarantees for the operation",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/ReadConsistency"
             }
           }
         ],
@@ -5837,7 +6213,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -5945,7 +6321,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -6053,7 +6429,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -6164,7 +6540,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -6272,7 +6648,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -6380,7 +6756,7 @@
                       "default": null,
                       "anyOf": [
                         {
-                          "$ref": "#/components/schemas/HardwareUsage"
+                          "$ref": "#/components/schemas/Usage"
                         },
                         {
                           "nullable": true
@@ -6421,7 +6797,7 @@
   ],
   "info": {
     "title": "Qdrant API",
-    "description": "API description for Qdrant vector search engine.\n\nThis document describes CRUD and search operations on collections of points (vectors with payload).\n\nQdrant supports any combinations of `should`, `min_should`, `must` and `must_not` conditions, which makes it possible to use in applications when object could not be described solely by vector. It could be location features, availability flags, and other custom properties businesses should take into account.\n## Examples\nThis examples cover the most basic use-cases - collection creation and basic vector search.\n### Create collection\nFirst - let's create a collection with dot-production metric.\n```\ncurl -X PUT 'http://localhost:6333/collections/test_collection' \\\n  -H 'Content-Type: application/json' \\\n  --data-raw '{\n    \"vectors\": {\n      \"size\": 4,\n      \"distance\": \"Dot\"\n    }\n  }'\n\n```\nExpected response:\n```\n{\n    \"result\": true,\n    \"status\": \"ok\",\n    \"time\": 0.031095451\n}\n```\nWe can ensure that collection was created:\n```\ncurl 'http://localhost:6333/collections/test_collection'\n```\nExpected response:\n```\n{\n  \"result\": {\n    \"status\": \"green\",\n    \"vectors_count\": 0,\n    \"segments_count\": 5,\n    \"disk_data_size\": 0,\n    \"ram_data_size\": 0,\n    \"config\": {\n      \"params\": {\n        \"vectors\": {\n          \"size\": 4,\n          \"distance\": \"Dot\"\n        }\n      },\n      \"hnsw_config\": {\n        \"m\": 16,\n        \"ef_construct\": 100,\n        \"full_scan_threshold\": 10000\n      },\n      \"optimizer_config\": {\n        \"deleted_threshold\": 0.2,\n        \"vacuum_min_vector_number\": 1000,\n        \"default_segment_number\": 2,\n        \"max_segment_size\": null,\n        \"memmap_threshold\": null,\n        \"indexing_threshold\": 20000,\n        \"flush_interval_sec\": 5,\n        \"max_optimization_threads\": null\n      },\n      \"wal_config\": {\n        \"wal_capacity_mb\": 32,\n        \"wal_segments_ahead\": 0\n      }\n    }\n  },\n  \"status\": \"ok\",\n  \"time\": 2.1199e-05\n}\n```\n\n### Add points\nLet's now add vectors with some payload:\n```\ncurl -L -X PUT 'http://localhost:6333/collections/test_collection/points?wait=true' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n  \"points\": [\n    {\"id\": 1, \"vector\": [0.05, 0.61, 0.76, 0.74], \"payload\": {\"city\": \"Berlin\"}},\n    {\"id\": 2, \"vector\": [0.19, 0.81, 0.75, 0.11], \"payload\": {\"city\": [\"Berlin\", \"London\"] }},\n    {\"id\": 3, \"vector\": [0.36, 0.55, 0.47, 0.94], \"payload\": {\"city\": [\"Berlin\", \"Moscow\"] }},\n    {\"id\": 4, \"vector\": [0.18, 0.01, 0.85, 0.80], \"payload\": {\"city\": [\"London\", \"Moscow\"] }},\n    {\"id\": 5, \"vector\": [0.24, 0.18, 0.22, 0.44], \"payload\": {\"count\": [0]}},\n    {\"id\": 6, \"vector\": [0.35, 0.08, 0.11, 0.44]}\n  ]\n}'\n```\nExpected response:\n```\n{\n    \"result\": {\n        \"operation_id\": 0,\n        \"status\": \"completed\"\n    },\n    \"status\": \"ok\",\n    \"time\": 0.000206061\n}\n```\n### Search with filtering\nLet's start with a basic request:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"vector\": [0.2,0.1,0.9,0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 1, \"score\": 1.273, \"payload\": null, \"version\": 0 },\n        { \"id\": 3, \"score\": 1.208, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000055785\n}\n```\nBut result is different if we add a filter:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"filter\": {\n        \"should\": [\n            {\n                \"key\": \"city\",\n                \"match\": {\n                    \"value\": \"London\"\n                }\n            }\n        ]\n    },\n    \"vector\": [0.2, 0.1, 0.9, 0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 2, \"score\": 0.871, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000093972\n}\n```\n",
+    "description": "API description for Qdrant vector search engine.\n\nThis document describes CRUD and search operations on collections of points (vectors with payload).\n\nQdrant supports any combinations of `should`, `min_should`, `must` and `must_not` conditions, which makes it possible to use in applications when object could not be described solely by vector. It could be location features, availability flags, and other custom properties businesses should take into account.\n## Examples\nThis examples cover the most basic use-cases - collection creation and basic vector search.\n### Create collection\nFirst - let's create a collection with dot-production metric.\n```\ncurl -X PUT 'http://localhost:6333/collections/test_collection' \\\n  -H 'Content-Type: application/json' \\\n  --data-raw '{\n    \"vectors\": {\n      \"size\": 4,\n      \"distance\": \"Dot\"\n    }\n  }'\n\n```\nExpected response:\n```\n{\n    \"result\": true,\n    \"status\": \"ok\",\n    \"time\": 0.031095451\n}\n```\nWe can ensure that collection was created:\n```\ncurl 'http://localhost:6333/collections/test_collection'\n```\nExpected response:\n```\n{\n  \"result\": {\n    \"status\": \"green\",\n    \"segments_count\": 5,\n    \"disk_data_size\": 0,\n    \"ram_data_size\": 0,\n    \"config\": {\n      \"params\": {\n        \"vectors\": {\n          \"size\": 4,\n          \"distance\": \"Dot\"\n        }\n      },\n      \"hnsw_config\": {\n        \"m\": 16,\n        \"ef_construct\": 100,\n        \"full_scan_threshold\": 10000\n      },\n      \"optimizer_config\": {\n        \"deleted_threshold\": 0.2,\n        \"vacuum_min_vector_number\": 1000,\n        \"default_segment_number\": 2,\n        \"max_segment_size\": null,\n        \"memmap_threshold\": null,\n        \"indexing_threshold\": 20000,\n        \"flush_interval_sec\": 5,\n        \"max_optimization_threads\": null\n      },\n      \"wal_config\": {\n        \"wal_capacity_mb\": 32,\n        \"wal_segments_ahead\": 0\n      }\n    }\n  },\n  \"status\": \"ok\",\n  \"time\": 2.1199e-05\n}\n```\n\n### Add points\nLet's now add vectors with some payload:\n```\ncurl -L -X PUT 'http://localhost:6333/collections/test_collection/points?wait=true' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n  \"points\": [\n    {\"id\": 1, \"vector\": [0.05, 0.61, 0.76, 0.74], \"payload\": {\"city\": \"Berlin\"}},\n    {\"id\": 2, \"vector\": [0.19, 0.81, 0.75, 0.11], \"payload\": {\"city\": [\"Berlin\", \"London\"] }},\n    {\"id\": 3, \"vector\": [0.36, 0.55, 0.47, 0.94], \"payload\": {\"city\": [\"Berlin\", \"Moscow\"] }},\n    {\"id\": 4, \"vector\": [0.18, 0.01, 0.85, 0.80], \"payload\": {\"city\": [\"London\", \"Moscow\"] }},\n    {\"id\": 5, \"vector\": [0.24, 0.18, 0.22, 0.44], \"payload\": {\"count\": [0]}},\n    {\"id\": 6, \"vector\": [0.35, 0.08, 0.11, 0.44]}\n  ]\n}'\n```\nExpected response:\n```\n{\n    \"result\": {\n        \"operation_id\": 0,\n        \"status\": \"completed\"\n    },\n    \"status\": \"ok\",\n    \"time\": 0.000206061\n}\n```\n### Search with filtering\nLet's start with a basic request:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"vector\": [0.2,0.1,0.9,0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 1, \"score\": 1.273, \"payload\": null, \"version\": 0 },\n        { \"id\": 3, \"score\": 1.208, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000055785\n}\n```\nBut result is different if we add a filter:\n```\ncurl -L -X POST 'http://localhost:6333/collections/test_collection/points/search' \\ -H 'Content-Type: application/json' \\ --data-raw '{\n    \"filter\": {\n        \"should\": [\n            {\n                \"key\": \"city\",\n                \"match\": {\n                    \"value\": \"London\"\n                }\n            }\n        ]\n    },\n    \"vector\": [0.2, 0.1, 0.9, 0.7],\n    \"top\": 3\n}'\n```\nExpected response:\n```\n{\n    \"result\": [\n        { \"id\": 4, \"score\": 1.362, \"payload\": null, \"version\": 0 },\n        { \"id\": 2, \"score\": 0.871, \"payload\": null, \"version\": 0 }\n    ],\n    \"status\": \"ok\",\n    \"time\": 0.000093972\n}\n```\n",
     "contact": {
       "email": "andrey@vasnetsov.com"
     },
@@ -6546,10 +6922,10 @@
         "example": {
           "collections": [
             {
-              "name": "arivx-title"
+              "name": "arxiv-title"
             },
             {
-              "name": "arivx-abstract"
+              "name": "arxiv-abstract"
             },
             {
               "name": "medium-title"
@@ -6588,12 +6964,12 @@
           "optimizer_status": {
             "$ref": "#/components/schemas/OptimizersStatus"
           },
-          "vectors_count": {
-            "description": "DEPRECATED: Approximate number of vectors in collection. All vectors in collection are available for querying. Calculated as `points_count x vectors_per_point`. Where `vectors_per_point` is a number of named vectors in schema.",
-            "type": "integer",
-            "format": "uint",
-            "minimum": 0,
-            "nullable": true
+          "warnings": {
+            "description": "Warnings related to the collection",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CollectionWarning"
+            }
           },
           "indexed_vectors_count": {
             "description": "Approximate number of indexed vectors in the collection. Indexed vectors in large segments are faster to query, as it is stored in a specialized vector index.",
@@ -6624,6 +7000,17 @@
             "additionalProperties": {
               "$ref": "#/components/schemas/PayloadIndexInfo"
             }
+          },
+          "update_queue": {
+            "description": "Update queue info",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpdateQueueInfo"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -6661,6 +7048,18 @@
             "additionalProperties": false
           }
         ]
+      },
+      "CollectionWarning": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "description": "Warning message",
+            "type": "string"
+          }
+        }
       },
       "CollectionConfig": {
         "description": "Information about the collection configuration",
@@ -6704,7 +7103,18 @@
           "strict_mode_config": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/StrictModeConfig"
+                "$ref": "#/components/schemas/StrictModeConfigOutput"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "metadata": {
+            "description": "Arbitrary JSON metadata for the collection This can be used to store application-specific information such as creation time, migration data, inference model info, etc.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Payload"
               },
               {
                 "nullable": true
@@ -6755,6 +7165,13 @@
             "description": "Defines how many additional replicas should be processing read request at the same time. Default value is Auto, which means that fan-out will be determined automatically based on the busyness of the local replica. Having more than 0 might be useful to smooth latency spikes of individual nodes.",
             "type": "integer",
             "format": "uint32",
+            "minimum": 0,
+            "nullable": true
+          },
+          "read_fan_out_delay_ms": {
+            "description": "Define number of milliseconds to wait before attempting to read from another replica. This setting can help to reduce latency spikes in case of occasional slow replicas. Default is 0, which means delayed fan out request is disabled.",
+            "type": "integer",
+            "format": "uint64",
             "minimum": 0,
             "nullable": true
           },
@@ -6882,7 +7299,7 @@
             "nullable": true
           },
           "full_scan_threshold": {
-            "description": "Minimal size (in kilobytes) of vectors for additional payload-based indexing. If payload chunk is smaller than `full_scan_threshold_kb` additional indexing won't be used - in this case full-scan search should be preferred by query planner and additional indexing is not required. Note: 1Kb = 1 vector of size 256",
+            "description": "Minimal size threshold (in KiloBytes) below which full-scan is preferred over HNSW search. This measures the total size of vectors being queried against. When the maximum estimated amount of points that a condition satisfies is smaller than `full_scan_threshold_kb`, the query planner will use full-scan search instead of HNSW index traversal for better performance. Note: 1Kb = 1 vector of size 256",
             "type": "integer",
             "format": "uint",
             "minimum": 10,
@@ -6905,6 +7322,11 @@
             "type": "integer",
             "format": "uint",
             "minimum": 0,
+            "nullable": true
+          },
+          "inline_storage": {
+            "description": "Store copies of original and quantized vectors within the HNSW index file. Default: false. Enabling this option will trade the search speed for disk usage by reducing amount of random seeks during the search. Requires quantized vectors to be enabled. Multi-vectors are not supported.",
+            "type": "boolean",
             "nullable": true
           }
         }
@@ -7016,8 +7438,46 @@
           "always_ram": {
             "type": "boolean",
             "nullable": true
+          },
+          "encoding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BinaryQuantizationEncoding"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "query_encoding": {
+            "description": "Asymmetric quantization configuration allows a query to have different quantization than stored vectors. It can increase the accuracy of search at the cost of performance.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BinaryQuantizationQueryEncoding"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
+      },
+      "BinaryQuantizationEncoding": {
+        "type": "string",
+        "enum": [
+          "one_bit",
+          "two_bits",
+          "one_and_half_bits"
+        ]
+      },
+      "BinaryQuantizationQueryEncoding": {
+        "type": "string",
+        "enum": [
+          "default",
+          "binary",
+          "scalar4bits",
+          "scalar8bits"
+        ]
       },
       "Datatype": {
         "type": "string",
@@ -7138,7 +7598,7 @@
             "minimum": 4
           },
           "full_scan_threshold": {
-            "description": "Minimal size (in KiloBytes) of vectors for additional payload-based indexing. If payload chunk is smaller than `full_scan_threshold_kb` additional indexing won't be used - in this case full-scan search should be preferred by query planner and additional indexing is not required. Note: 1Kb = 1 vector of size 256",
+            "description": "Minimal size threshold (in KiloBytes) below which full-scan is preferred over HNSW search. This measures the total size of vectors being queried against. When the maximum estimated amount of points that a condition satisfies is smaller than `full_scan_threshold_kb`, the query planner will use full-scan search instead of HNSW index traversal for better performance. Note: 1Kb = 1 vector of size 256",
             "type": "integer",
             "format": "uint",
             "minimum": 0
@@ -7160,6 +7620,11 @@
             "type": "integer",
             "format": "uint",
             "minimum": 0,
+            "nullable": true
+          },
+          "inline_storage": {
+            "description": "Store copies of original and quantized vectors within the HNSW index file. Default: false. Enabling this option will trade the search speed for disk usage by reducing amount of random seeks during the search. Requires quantized vectors to be enabled. Multi-vectors are not supported.",
+            "type": "boolean",
             "nullable": true
           }
         }
@@ -7203,13 +7668,14 @@
           "memmap_threshold": {
             "description": "Maximum size (in kilobytes) of vectors to store in-memory per segment. Segments larger than this threshold will be stored as read-only memmapped file.\n\nMemmap storage is disabled by default, to enable it, set this threshold to a reasonable value.\n\nTo disable memmap storage, set this to `0`. Internally it will use the largest threshold possible.\n\nNote: 1Kb = 1 vector of size 256",
             "default": null,
+            "deprecated": true,
             "type": "integer",
             "format": "uint",
             "minimum": 0,
             "nullable": true
           },
           "indexing_threshold": {
-            "description": "Maximum size (in kilobytes) of vectors allowed for plain index, exceeding this threshold will enable vector indexing\n\nDefault value is 20,000, based on <https://github.com/google-research/google-research/blob/master/scann/docs/algorithms.md>.\n\nTo disable vector indexing, set to `0`.\n\nNote: 1kB = 1 vector of size 256.",
+            "description": "Maximum size (in kilobytes) of vectors allowed for plain index, exceeding this threshold will enable vector indexing\n\nDefault value is 10,000, based on experiments and observations.\n\nTo disable vector indexing, set to `0`.\n\nNote: 1kB = 1 vector of size 256.",
             "default": null,
             "type": "integer",
             "format": "uint",
@@ -7228,6 +7694,12 @@
             "type": "integer",
             "format": "uint",
             "minimum": 0,
+            "nullable": true
+          },
+          "prevent_unoptimized": {
+            "description": "If this option is set, service will try to prevent creation of large unoptimized segments. When enabled, updates may be blocked at request level if there are unoptimized segments larger than indexing threshold. Updates will be resumed when optimization is completed and segments are optimized below the threshold. Using this option may lead to increased delay between submitting an update and its application. Default is disabled.",
+            "default": null,
+            "type": "boolean",
             "nullable": true
           }
         }
@@ -7250,10 +7722,17 @@
             "type": "integer",
             "format": "uint",
             "minimum": 0
+          },
+          "wal_retain_closed": {
+            "description": "Number of closed WAL segments to keep",
+            "default": 1,
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1
           }
         }
       },
-      "StrictModeConfig": {
+      "StrictModeConfigOutput": {
         "type": "object",
         "properties": {
           "enabled": {
@@ -7276,12 +7755,12 @@
             "nullable": true
           },
           "unindexed_filtering_retrieve": {
-            "description": "Allow usage of unindexed fields in retrieval based (eg. search) filters.",
+            "description": "Allow usage of unindexed fields in retrieval based (e.g. search) filters.",
             "type": "boolean",
             "nullable": true
           },
           "unindexed_filtering_update": {
-            "description": "Allow usage of unindexed fields in filtered updates (eg. delete by payload).",
+            "description": "Allow usage of unindexed fields in filtered updates (e.g. delete by payload).",
             "type": "boolean",
             "nullable": true
           },
@@ -7321,14 +7800,14 @@
             "description": "Max number of read operations per minute per replica",
             "type": "integer",
             "format": "uint",
-            "minimum": 1,
+            "minimum": 0,
             "nullable": true
           },
           "write_rate_limit": {
             "description": "Max number of write operations per minute per replica",
             "type": "integer",
             "format": "uint",
-            "minimum": 1,
+            "minimum": 0,
             "nullable": true
           },
           "max_collection_payload_size_bytes": {
@@ -7342,7 +7821,7 @@
             "description": "Max number of points estimated in a collection",
             "type": "integer",
             "format": "uint",
-            "minimum": 1,
+            "minimum": 0,
             "nullable": true
           },
           "filter_max_conditions": {
@@ -7363,7 +7842,7 @@
             "description": "Multivector configuration",
             "anyOf": [
               {
-                "$ref": "#/components/schemas/StrictModeMultivectorConfig"
+                "$ref": "#/components/schemas/StrictModeMultivectorConfigOutput"
               },
               {
                 "nullable": true
@@ -7374,49 +7853,64 @@
             "description": "Sparse vector configuration",
             "anyOf": [
               {
-                "$ref": "#/components/schemas/StrictModeSparseConfig"
+                "$ref": "#/components/schemas/StrictModeSparseConfigOutput"
               },
               {
                 "nullable": true
               }
             ]
+          },
+          "max_payload_index_count": {
+            "description": "Max number of payload indexes in a collection",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
           }
         }
       },
-      "StrictModeMultivectorConfig": {
+      "StrictModeMultivectorConfigOutput": {
         "type": "object",
         "additionalProperties": {
-          "$ref": "#/components/schemas/StrictModeMultivector"
+          "$ref": "#/components/schemas/StrictModeMultivectorOutput"
         }
       },
-      "StrictModeMultivector": {
+      "StrictModeMultivectorOutput": {
         "type": "object",
         "properties": {
           "max_vectors": {
             "description": "Max number of vectors in a multivector",
             "type": "integer",
             "format": "uint",
-            "minimum": 1,
+            "minimum": 0,
             "nullable": true
           }
         }
       },
-      "StrictModeSparseConfig": {
+      "StrictModeSparseConfigOutput": {
         "type": "object",
         "additionalProperties": {
-          "$ref": "#/components/schemas/StrictModeSparse"
+          "$ref": "#/components/schemas/StrictModeSparseOutput"
         }
       },
-      "StrictModeSparse": {
+      "StrictModeSparseOutput": {
         "type": "object",
         "properties": {
           "max_length": {
             "description": "Max length of sparse vector",
             "type": "integer",
             "format": "uint",
-            "minimum": 1,
+            "minimum": 0,
             "nullable": true
           }
+        }
+      },
+      "Payload": {
+        "type": "object",
+        "additionalProperties": true,
+        "example": {
+          "city": "London",
+          "color": "green"
         }
       },
       "PayloadIndexInfo": {
@@ -7509,6 +8003,11 @@
             "description": "If true, store the index on disk. Default: false.",
             "type": "boolean",
             "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -7528,22 +8027,27 @@
             "$ref": "#/components/schemas/IntegerIndexType"
           },
           "lookup": {
-            "description": "If true - support direct lookups.",
+            "description": "If true - support direct lookups. Default is true.",
             "type": "boolean",
             "nullable": true
           },
           "range": {
-            "description": "If true - support ranges filters.",
+            "description": "If true - support ranges filters. Default is true.",
             "type": "boolean",
             "nullable": true
           },
           "is_principal": {
-            "description": "If true - use this key to organize storage of the collection data. This option assumes that this key will be used in majority of filtered requests.",
+            "description": "If true - use this key to organize storage of the collection data. This option assumes that this key will be used in majority of filtered requests. Default is false.",
             "type": "boolean",
             "nullable": true
           },
           "on_disk": {
-            "description": "If true, store the index on disk. Default: false.",
+            "description": "If true, store the index on disk. Default: false. Default is false.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
             "type": "boolean",
             "nullable": true
           }
@@ -7573,6 +8077,11 @@
             "description": "If true, store the index on disk. Default: false.",
             "type": "boolean",
             "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -7593,6 +8102,11 @@
           },
           "on_disk": {
             "description": "If true, store the index on disk. Default: false.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
             "type": "boolean",
             "nullable": true
           }
@@ -7635,8 +8149,45 @@
             "type": "boolean",
             "nullable": true
           },
+          "ascii_folding": {
+            "description": "If true, normalize tokens by folding accented characters to ASCII (e.g., \"ação\" -> \"acao\"). Default: false.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "phrase_matching": {
+            "description": "If true, support phrase matching. Default: false.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "stopwords": {
+            "description": "Ignore this set of tokens. Can select from predefined languages and/or provide a custom set.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StopwordsInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
           "on_disk": {
             "description": "If true, store the index on disk. Default: false.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "stemmer": {
+            "description": "Algorithm for stemming. Default: disabled.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StemmingAlgorithm"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
             "type": "boolean",
             "nullable": true
           }
@@ -7657,6 +8208,128 @@
           "multilingual"
         ]
       },
+      "StopwordsInterface": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Language"
+          },
+          {
+            "$ref": "#/components/schemas/StopwordsSet"
+          }
+        ]
+      },
+      "Language": {
+        "type": "string",
+        "enum": [
+          "arabic",
+          "azerbaijani",
+          "basque",
+          "bengali",
+          "catalan",
+          "chinese",
+          "danish",
+          "dutch",
+          "english",
+          "finnish",
+          "french",
+          "german",
+          "greek",
+          "hebrew",
+          "hinglish",
+          "hungarian",
+          "indonesian",
+          "italian",
+          "japanese",
+          "kazakh",
+          "nepali",
+          "norwegian",
+          "portuguese",
+          "romanian",
+          "russian",
+          "slovene",
+          "spanish",
+          "swedish",
+          "tajik",
+          "turkish"
+        ]
+      },
+      "StopwordsSet": {
+        "type": "object",
+        "properties": {
+          "languages": {
+            "description": "Set of languages to use for stopwords. Multiple pre-defined lists of stopwords can be combined.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Language"
+            },
+            "uniqueItems": true,
+            "nullable": true
+          },
+          "custom": {
+            "description": "Custom stopwords set. Will be merged with the languages set.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true,
+            "nullable": true
+          }
+        }
+      },
+      "StemmingAlgorithm": {
+        "description": "Different stemming algorithms with their configs.",
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/SnowballParams"
+          }
+        ]
+      },
+      "SnowballParams": {
+        "type": "object",
+        "required": [
+          "language",
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/Snowball"
+          },
+          "language": {
+            "$ref": "#/components/schemas/SnowballLanguage"
+          }
+        }
+      },
+      "Snowball": {
+        "type": "string",
+        "enum": [
+          "snowball"
+        ]
+      },
+      "SnowballLanguage": {
+        "description": "Languages supported by snowball stemmer.",
+        "type": "string",
+        "enum": [
+          "arabic",
+          "armenian",
+          "danish",
+          "dutch",
+          "english",
+          "finnish",
+          "french",
+          "german",
+          "greek",
+          "hungarian",
+          "italian",
+          "norwegian",
+          "portuguese",
+          "romanian",
+          "russian",
+          "spanish",
+          "swedish",
+          "tamil",
+          "turkish"
+        ]
+      },
       "BoolIndexParams": {
         "type": "object",
         "required": [
@@ -7668,6 +8341,11 @@
           },
           "on_disk": {
             "description": "If true, store the index on disk. Default: false.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
             "type": "boolean",
             "nullable": true
           }
@@ -7697,6 +8375,11 @@
             "description": "If true, store the index on disk. Default: false.",
             "type": "boolean",
             "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -7724,6 +8407,11 @@
             "description": "If true, store the index on disk. Default: false.",
             "type": "boolean",
             "nullable": true
+          },
+          "enable_hnsw": {
+            "description": "Enable HNSW graph building for this payload field. If true, builds additional HNSW links (Need payload_m > 0). Default: true.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -7732,6 +8420,20 @@
         "enum": [
           "uuid"
         ]
+      },
+      "UpdateQueueInfo": {
+        "type": "object",
+        "required": [
+          "length"
+        ],
+        "properties": {
+          "length": {
+            "description": "Number of elements in the queue",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
       },
       "PointRequest": {
         "type": "object",
@@ -7783,6 +8485,9 @@
             "items": {
               "$ref": "#/components/schemas/ShardKey"
             }
+          },
+          {
+            "$ref": "#/components/schemas/ShardKeyWithFallback"
           }
         ]
       },
@@ -7799,6 +8504,21 @@
             "example": 12
           }
         ]
+      },
+      "ShardKeyWithFallback": {
+        "type": "object",
+        "required": [
+          "fallback",
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/ShardKey"
+          },
+          "fallback": {
+            "$ref": "#/components/schemas/ShardKey"
+          }
+        }
       },
       "ExtendedPointId": {
         "description": "Type, used for specifying point ID in user interface",
@@ -7947,14 +8667,6 @@
               }
             ]
           }
-        }
-      },
-      "Payload": {
-        "type": "object",
-        "additionalProperties": true,
-        "example": {
-          "city": "London",
-          "color": "green"
         }
       },
       "VectorStructOutput": {
@@ -8230,7 +8942,6 @@
         "properties": {
           "should": {
             "description": "At least one of those conditions should match",
-            "default": null,
             "anyOf": [
               {
                 "$ref": "#/components/schemas/Condition"
@@ -8259,7 +8970,6 @@
           },
           "must": {
             "description": "All conditions must match",
-            "default": null,
             "anyOf": [
               {
                 "$ref": "#/components/schemas/Condition"
@@ -8277,7 +8987,6 @@
           },
           "must_not": {
             "description": "All conditions must NOT match",
-            "default": null,
             "anyOf": [
               {
                 "$ref": "#/components/schemas/Condition"
@@ -8355,7 +9064,7 @@
             ]
           },
           "geo_bounding_box": {
-            "description": "Check if points geo location lies in a given area",
+            "description": "Check if points geolocation lies in a given area",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/GeoBoundingBox"
@@ -8397,6 +9106,16 @@
                 "nullable": true
               }
             ]
+          },
+          "is_empty": {
+            "description": "Check that the field is empty, alternative syntax for `is_empty: \"field_name\"`",
+            "type": "boolean",
+            "nullable": true
+          },
+          "is_null": {
+            "description": "Check that the field is null, alternative syntax for `is_null: \"field_name\"`",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -8408,6 +9127,12 @@
           },
           {
             "$ref": "#/components/schemas/MatchText"
+          },
+          {
+            "$ref": "#/components/schemas/MatchTextAny"
+          },
+          {
+            "$ref": "#/components/schemas/MatchPhrase"
           },
           {
             "$ref": "#/components/schemas/MatchAny"
@@ -8451,6 +9176,30 @@
         ],
         "properties": {
           "text": {
+            "type": "string"
+          }
+        }
+      },
+      "MatchTextAny": {
+        "description": "Full-text match of at least one token of the string.",
+        "type": "object",
+        "required": [
+          "text_any"
+        ],
+        "properties": {
+          "text_any": {
+            "type": "string"
+          }
+        }
+      },
+      "MatchPhrase": {
+        "description": "Full-text phrase match of the string.",
+        "type": "object",
+        "required": [
+          "phrase"
+        ],
+        "properties": {
+          "phrase": {
             "type": "string"
           }
         }
@@ -8819,7 +9568,6 @@
           },
           "quantization": {
             "description": "Quantization params",
-            "default": null,
             "anyOf": [
               {
                 "$ref": "#/components/schemas/QuantizationSearchParams"
@@ -8833,6 +9581,17 @@
             "description": "If enabled, the engine will only perform search among indexed or small segments. Using this option prevents slow searches in case of delayed index, but does not guarantee that all uploaded vectors will be included in search results",
             "default": false,
             "type": "boolean"
+          },
+          "acorn": {
+            "description": "ACORN search params",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcornSearchParams"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -8847,16 +9606,33 @@
           },
           "rescore": {
             "description": "If true, use original vectors to re-score top-k results. Might require more time in case if original vectors are stored on disk. If not set, qdrant decides automatically apply rescoring or not.",
-            "default": null,
             "type": "boolean",
             "nullable": true
           },
           "oversampling": {
             "description": "Oversampling factor for quantization. Default is 1.0.\n\nDefines how many extra vectors should be pre-selected using quantized index, and then re-scored using original vectors.\n\nFor example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will be pre-selected using quantized index, and then top-100 will be returned after re-scoring.",
-            "default": null,
             "type": "number",
             "format": "double",
             "minimum": 1,
+            "nullable": true
+          }
+        }
+      },
+      "AcornSearchParams": {
+        "description": "ACORN-related search parameters",
+        "type": "object",
+        "properties": {
+          "enable": {
+            "description": "If true, then ACORN may be used for the HNSW search based on filters selectivity. Improves search recall for searches with multiple low-selectivity payload filters, at cost of performance.",
+            "default": false,
+            "type": "boolean"
+          },
+          "max_selectivity": {
+            "description": "Maximum selectivity of filters to enable ACORN.\n\nIf estimated filters selectivity is higher than this value, ACORN will not be used. Selectivity is estimated as: `estimated number of points satisfying the filters / total number of points`.\n\n0.0 for never, 1.0 for always. Default is 0.4.",
+            "type": "number",
+            "format": "double",
+            "maximum": 1,
+            "minimum": 0,
             "nullable": true
           }
         }
@@ -8951,11 +9727,12 @@
         }
       },
       "UpdateStatus": {
-        "description": "`Acknowledged` - Request is saved to WAL and will be process in a queue. `Completed` - Request is completed, changes are actual.",
+        "description": "`Acknowledged` - Request is saved to WAL and will be process in a queue. `Completed` - Request is completed, changes are actual. `WaitTimeout` - Request is waiting for timeout.",
         "type": "string",
         "enum": [
           "acknowledged",
-          "completed"
+          "completed",
+          "wait_timeout"
         ]
       },
       "RecommendRequest": {
@@ -9111,11 +9888,12 @@
         ]
       },
       "RecommendStrategy": {
-        "description": "How to use positive and negative examples to find the results, default is `average_vector`:\n\n* `average_vector` - Average positive and negative vectors and create a single query with the formula `query = avg_pos + avg_pos - avg_neg`. Then performs normal search.\n\n* `best_score` - Uses custom search objective. Each candidate is compared against all examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`. If the `max_neg_score` is chosen then it is squared and negated, otherwise it is just the `max_pos_score`.",
+        "description": "How to use positive and negative examples to find the results, default is `average_vector`:\n\n* `average_vector` - Average positive and negative vectors and create a single query with the formula `query = avg_pos + avg_pos - avg_neg`. Then performs normal search.\n\n* `best_score` - Uses custom search objective. Each candidate is compared against all examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`. If the `max_neg_score` is chosen then it is squared and negated, otherwise it is just the `max_pos_score`.\n\n* `sum_scores` - Uses custom search objective. Compares against all inputs, sums all the scores. Scores against positive vectors are added, against negatives are subtracted.",
         "type": "string",
         "enum": [
           "average_vector",
-          "best_score"
+          "best_score",
+          "sum_scores"
         ]
       },
       "UsingVector": {
@@ -9430,18 +10208,6 @@
               }
             ]
           },
-          "init_from": {
-            "description": "Specify other collection to copy data from.",
-            "default": null,
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/InitFrom"
-              },
-              {
-                "nullable": true
-              }
-            ]
-          },
           "quantization_config": {
             "description": "Quantization parameters. If none - quantization is disabled.",
             "default": null,
@@ -9472,6 +10238,17 @@
                 "nullable": true
               }
             ]
+          },
+          "metadata": {
+            "description": "Arbitrary JSON metadata for the collection This can be used to store application-specific information such as creation time, migration data, inference model info, etc.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Payload"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -9491,6 +10268,13 @@
             "format": "uint",
             "minimum": 0,
             "nullable": true
+          },
+          "wal_retain_closed": {
+            "description": "Number of closed WAL segments to retain",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
           }
         }
       },
@@ -9501,13 +10285,15 @@
             "description": "The minimal fraction of deleted vectors in a segment, required to perform segment optimization",
             "type": "number",
             "format": "double",
+            "maximum": 1,
+            "minimum": 0,
             "nullable": true
           },
           "vacuum_min_vector_number": {
             "description": "The minimal number of vectors in a segment, required to perform segment optimization",
             "type": "integer",
             "format": "uint",
-            "minimum": 0,
+            "minimum": 100,
             "nullable": true
           },
           "default_segment_number": {
@@ -9525,7 +10311,8 @@
             "nullable": true
           },
           "memmap_threshold": {
-            "description": "Maximum size (in kilobytes) of vectors to store in-memory per segment. Segments larger than this threshold will be stored as read-only memmapped file.\n\nMemmap storage is disabled by default, to enable it, set this threshold to a reasonable value.\n\nTo disable memmap storage, set this to `0`.\n\nNote: 1Kb = 1 vector of size 256",
+            "description": "Maximum size (in kilobytes) of vectors to store in-memory per segment. Segments larger than this threshold will be stored as read-only memmapped file.\n\nMemmap storage is disabled by default, to enable it, set this threshold to a reasonable value.\n\nTo disable memmap storage, set this to `0`.\n\nNote: 1Kb = 1 vector of size 256\n\nDeprecated since Qdrant 1.15.0",
+            "deprecated": true,
             "type": "integer",
             "format": "uint",
             "minimum": 0,
@@ -9555,6 +10342,12 @@
                 "nullable": true
               }
             ]
+          },
+          "prevent_unoptimized": {
+            "description": "If this option is set, service will try to prevent creation of large unoptimized segments. When enabled, updates may be blocked at request level if there are unoptimized segments larger than indexing threshold. Updates will be resumed when optimization is completed and segments are optimized below the threshold. Using this option may lead to increased delay between submitting an update and its application. Default is disabled.",
+            "default": null,
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -9576,15 +10369,176 @@
           "auto"
         ]
       },
-      "InitFrom": {
-        "description": "Operation for creating new collection and (optionally) specify index params",
+      "StrictModeConfig": {
         "type": "object",
-        "required": [
-          "collection"
-        ],
         "properties": {
-          "collection": {
-            "type": "string"
+          "enabled": {
+            "description": "Whether strict mode is enabled for a collection or not.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "max_query_limit": {
+            "description": "Max allowed `limit` parameter for all APIs that don't have their own max limit.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "max_timeout": {
+            "description": "Max allowed `timeout` parameter.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "unindexed_filtering_retrieve": {
+            "description": "Allow usage of unindexed fields in retrieval based (e.g. search) filters.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "unindexed_filtering_update": {
+            "description": "Allow usage of unindexed fields in filtered updates (e.g. delete by payload).",
+            "type": "boolean",
+            "nullable": true
+          },
+          "search_max_hnsw_ef": {
+            "description": "Max HNSW ef value allowed in search parameters.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "search_allow_exact": {
+            "description": "Whether exact search is allowed.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "search_max_oversampling": {
+            "description": "Max oversampling value allowed in search.",
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "upsert_max_batchsize": {
+            "description": "Max batchsize when upserting",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_collection_vector_size_bytes": {
+            "description": "Max size of a collections vector storage in bytes, ignoring replicas.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "read_rate_limit": {
+            "description": "Max number of read operations per minute per replica",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "write_rate_limit": {
+            "description": "Max number of write operations per minute per replica",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "max_collection_payload_size_bytes": {
+            "description": "Max size of a collections payload storage in bytes",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_points_count": {
+            "description": "Max number of points estimated in a collection",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "filter_max_conditions": {
+            "description": "Max conditions a filter can have.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "condition_max_size": {
+            "description": "Max size of a condition, eg. items in `MatchAny`.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "multivector_config": {
+            "description": "Multivector strict mode configuration",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrictModeMultivectorConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "sparse_config": {
+            "description": "Sparse vector strict mode configuration",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrictModeSparseConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "max_payload_index_count": {
+            "description": "Max number of payload indexes in a collection",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
+      "StrictModeMultivectorConfig": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/StrictModeMultivector"
+        }
+      },
+      "StrictModeMultivector": {
+        "type": "object",
+        "properties": {
+          "max_vectors": {
+            "description": "Max number of vectors in a multivector",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          }
+        }
+      },
+      "StrictModeSparseConfig": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/StrictModeSparse"
+        }
+      },
+      "StrictModeSparse": {
+        "type": "object",
+        "properties": {
+          "max_length": {
+            "description": "Max length of sparse vector",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
           }
         }
       },
@@ -9663,6 +10617,17 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/StrictModeConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "metadata": {
+            "description": "Metadata to update for the collection. If provided, this will merge with existing metadata. To remove metadata, set it to an empty object.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Payload"
               },
               {
                 "nullable": true
@@ -9753,6 +10718,13 @@
             "description": "Fan-out every read request to these many additional remote nodes (and return first available response)",
             "type": "integer",
             "format": "uint32",
+            "minimum": 0,
+            "nullable": true
+          },
+          "read_fan_out_delay_ms": {
+            "description": "Delay in milliseconds before sending read requests to remote nodes",
+            "type": "integer",
+            "format": "uint64",
             "minimum": 0,
             "nullable": true
           },
@@ -9992,6 +10964,28 @@
                 "nullable": true
               }
             ]
+          },
+          "update_filter": {
+            "description": "Filter to apply when updating existing points. Only points matching this filter will be updated. Points that don't match will keep their current state. New points will be inserted regardless of the filter.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "update_mode": {
+            "description": "Mode of the upsert operation: insert_only, upsert (default), update_only",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpdateMode"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -10124,20 +11118,115 @@
         ],
         "properties": {
           "text": {
-            "description": "Text of the document This field will be used as input for the embedding model",
+            "description": "Text of the document. This field will be used as input for the embedding model.",
             "type": "string",
             "example": "This is a document text"
           },
           "model": {
-            "description": "Name of the model used to generate the vector List of available models depends on a provider",
+            "description": "Name of the model used to generate the vector. List of available models depends on a provider.",
             "type": "string",
             "minLength": 1,
             "example": "jinaai/jina-embeddings-v2-base-en"
           },
           "options": {
-            "description": "Parameters for the model Values of the parameters are model-specific",
+            "description": "Additional options for the model, will be passed to the inference service as-is. See model cards for available options.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DocumentOptions"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "DocumentOptions": {
+        "description": "Option variants for text documents. Ether general-purpose options or BM25-specific options. BM25-specific will only take effect if the `qdrant/bm25` is specified as a model.",
+        "anyOf": [
+          {
             "type": "object",
-            "additionalProperties": true,
+            "additionalProperties": true
+          },
+          {
+            "$ref": "#/components/schemas/Bm25Config"
+          }
+        ]
+      },
+      "Bm25Config": {
+        "description": "Configuration of the local bm25 models.",
+        "type": "object",
+        "properties": {
+          "k": {
+            "description": "Controls term frequency saturation. Higher values mean term frequency has more impact. Default is 1.2",
+            "default": 1.2,
+            "type": "number",
+            "format": "double"
+          },
+          "b": {
+            "description": "Controls document length normalization. Ranges from 0 (no normalization) to 1 (full normalization). Higher values mean longer documents have less impact. Default is 0.75.",
+            "default": 0.75,
+            "type": "number",
+            "format": "double"
+          },
+          "avg_len": {
+            "description": "Expected average document length in the collection. Default is 256.",
+            "default": 256,
+            "type": "number",
+            "format": "double"
+          },
+          "tokenizer": {
+            "$ref": "#/components/schemas/TokenizerType"
+          },
+          "language": {
+            "description": "Defines which language to use for text preprocessing. This parameter is used to construct default stopwords filter and stemmer. To disable language-specific processing, set this to `\"language\": \"none\"`. If not specified, English is assumed.",
+            "type": "string",
+            "nullable": true
+          },
+          "lowercase": {
+            "description": "Lowercase the text before tokenization. Default is `true`.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "ascii_folding": {
+            "description": "If true, normalize tokens by folding accented characters to ASCII (e.g., \"ação\" -> \"acao\"). Default is `false`.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "stopwords": {
+            "description": "Configuration of the stopwords filter. Supports list of pre-defined languages and custom stopwords. Default: initialized for specified `language` or English if not specified.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StopwordsInterface"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "stemmer": {
+            "description": "Configuration of the stemmer. Processes tokens to their root form. Default: initialized Snowball stemmer for specified `language` or English if not specified.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StemmingAlgorithm"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "min_token_len": {
+            "description": "Minimum token length to keep. If token is shorter than this, it will be discarded. Default is `None`, which means no minimum length.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_token_len": {
+            "description": "Maximum token length to keep. If token is longer than this, it will be discarded. Default is `None`, which means no maximum length.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
             "nullable": true
           }
         }
@@ -10155,7 +11244,7 @@
             "example": "https://example.com/image.jpg"
           },
           "model": {
-            "description": "Name of the model used to generate the vector List of available models depends on a provider",
+            "description": "Name of the model used to generate the vector. List of available models depends on a provider.",
             "type": "string",
             "minLength": 1,
             "example": "Qdrant/clip-ViT-B-32-vision"
@@ -10177,10 +11266,10 @@
         ],
         "properties": {
           "object": {
-            "description": "Arbitrary data, used as input for the embedding model Used if the model requires more than one input or a custom input"
+            "description": "Arbitrary data, used as input for the embedding model. Used if the model requires more than one input or a custom input."
           },
           "model": {
-            "description": "Name of the model used to generate the vector List of available models depends on a provider",
+            "description": "Name of the model used to generate the vector. List of available models depends on a provider.",
             "type": "string",
             "minLength": 1,
             "example": "jinaai/jina-embeddings-v2-base-en"
@@ -10192,6 +11281,15 @@
             "nullable": true
           }
         }
+      },
+      "UpdateMode": {
+        "description": "Defines the mode of the upsert operation\n\n* `upsert` - default mode, insert new points, update existing points * `insert_only` - only insert new points, do not update existing points * `update_only` - only update existing points, do not insert new points",
+        "type": "string",
+        "enum": [
+          "upsert",
+          "insert_only",
+          "update_only"
+        ]
       },
       "PointsList": {
         "type": "object",
@@ -10209,6 +11307,28 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/ShardKeySelector"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "update_filter": {
+            "description": "Filter to apply when updating existing points. Only points matching this filter will be updated. Points that don't match will keep their current state. New points will be inserted regardless of the filter.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "update_mode": {
+            "description": "Mode of the upsert operation: insert_only, upsert (default), update_only",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpdateMode"
               },
               {
                 "nullable": true
@@ -10800,7 +11920,9 @@
           "PartialSnapshot",
           "Recovery",
           "Resharding",
-          "ReshardingScaleDown"
+          "ReshardingScaleDown",
+          "ActiveRead",
+          "ManualRecovery"
         ]
       },
       "RemoteShardInfo": {
@@ -10854,7 +11976,7 @@
             "minimum": 0
           },
           "to_shard_id": {
-            "description": "Target shard ID if different than source shard ID\n\nUsed exclusively with `ReshardStreamRecords` transfer method.",
+            "description": "Target shard ID if different than source shard ID\n\nUsed exclusively with `ReshardingStreamRecords` transfer method.",
             "type": "integer",
             "format": "uint32",
             "minimum": 0,
@@ -10894,36 +12016,13 @@
         }
       },
       "ShardTransferMethod": {
-        "description": "Methods for transferring a shard from one node to another.",
-        "oneOf": [
-          {
-            "description": "Stream all shard records in batches until the whole shard is transferred.",
-            "type": "string",
-            "enum": [
-              "stream_records"
-            ]
-          },
-          {
-            "description": "Snapshot the shard, transfer and restore it on the receiver.",
-            "type": "string",
-            "enum": [
-              "snapshot"
-            ]
-          },
-          {
-            "description": "Attempt to transfer shard difference by WAL delta.",
-            "type": "string",
-            "enum": [
-              "wal_delta"
-            ]
-          },
-          {
-            "description": "Shard transfer for resharding: stream all records in batches until all points are transferred.",
-            "type": "string",
-            "enum": [
-              "resharding_stream_records"
-            ]
-          }
+        "description": "Methods for transferring a shard from one node to another.\n\n- `stream_records` - Stream all shard records in batches until the whole shard is transferred.\n\n- `snapshot` - Snapshot the shard, transfer and restore it on the receiver.\n\n- `wal_delta` - Attempt to transfer shard difference by WAL delta.\n\n- `resharding_stream_records` - Shard transfer for resharding: stream all records in batches until all points are transferred.",
+        "type": "string",
+        "enum": [
+          "stream_records",
+          "snapshot",
+          "wal_delta",
+          "resharding_stream_records"
         ]
       },
       "ReshardingInfo": {
@@ -10960,28 +12059,16 @@
         }
       },
       "ReshardingDirection": {
-        "description": "Resharding direction, scale up or down in number of shards",
-        "oneOf": [
-          {
-            "description": "Scale up, add a new shard",
-            "type": "string",
-            "enum": [
-              "up"
-            ]
-          },
-          {
-            "description": "Scale down, remove a shard",
-            "type": "string",
-            "enum": [
-              "down"
-            ]
-          }
+        "description": "Resharding direction, scale up or down in number of shards\n\n- `up` - Scale up, add a new shard\n\n- `down` - Scale down, remove a shard",
+        "type": "string",
+        "enum": [
+          "up",
+          "down"
         ]
       },
       "TelemetryData": {
         "type": "object",
         "required": [
-          "app",
           "collections",
           "id"
         ],
@@ -10990,7 +12077,14 @@
             "type": "string"
           },
           "app": {
-            "$ref": "#/components/schemas/AppBuildTelemetry"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AppBuildTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "collections": {
             "$ref": "#/components/schemas/CollectionsTelemetry"
@@ -11061,6 +12155,26 @@
               }
             ]
           },
+          "runtime_features": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FeatureFlags"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "hnsw_global_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HnswGlobalConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
           "system": {
             "anyOf": [
               {
@@ -11091,14 +12205,12 @@
           "debug",
           "gpu",
           "recovery_mode",
+          "rocksdb",
           "service_debug_feature",
-          "web_feature"
+          "staging"
         ],
         "properties": {
           "debug": {
-            "type": "boolean"
-          },
-          "web_feature": {
             "type": "boolean"
           },
           "service_debug_feature": {
@@ -11109,6 +12221,85 @@
           },
           "gpu": {
             "type": "boolean"
+          },
+          "rocksdb": {
+            "type": "boolean"
+          },
+          "staging": {
+            "type": "boolean"
+          }
+        }
+      },
+      "FeatureFlags": {
+        "type": "object",
+        "properties": {
+          "all": {
+            "description": "Magic feature flag that enables all features.\n\nNote that this will only be applied to all flags when passed into [`init_feature_flags`].",
+            "default": false,
+            "type": "boolean"
+          },
+          "payload_index_skip_rocksdb": {
+            "description": "Skip usage of RocksDB in new immutable payload indices.\n\nFirst implemented in Qdrant 1.13.5. Enabled by default in Qdrant 1.14.1.",
+            "default": true,
+            "type": "boolean"
+          },
+          "payload_index_skip_mutable_rocksdb": {
+            "description": "Skip usage of RocksDB in new mutable payload indices.\n\nFirst implemented in Qdrant 1.15.0. Enabled by default in Qdrant 1.16.0.",
+            "default": true,
+            "type": "boolean"
+          },
+          "payload_storage_skip_rocksdb": {
+            "description": "Skip usage of RocksDB in new payload storages.\n\nOn-disk payload storages never use Gridstore.\n\nFirst implemented in Qdrant 1.15.0. Enabled by default in Qdrant 1.16.0.",
+            "default": true,
+            "type": "boolean"
+          },
+          "incremental_hnsw_building": {
+            "description": "Use incremental HNSW building.\n\nEnabled by default in Qdrant 1.14.1.",
+            "default": true,
+            "type": "boolean"
+          },
+          "migrate_rocksdb_id_tracker": {
+            "description": "Migrate RocksDB based ID trackers into file based ID tracker on start.\n\nEnabled by default in Qdrant 1.15.0.",
+            "default": true,
+            "type": "boolean"
+          },
+          "migrate_rocksdb_vector_storage": {
+            "description": "Migrate RocksDB based vector storages into new format on start.\n\nEnabled by default in Qdrant 1.16.1.",
+            "default": true,
+            "type": "boolean"
+          },
+          "migrate_rocksdb_payload_storage": {
+            "description": "Migrate RocksDB based payload storages into new format on start.\n\nEnabled by default in Qdrant 1.16.1.",
+            "default": true,
+            "type": "boolean"
+          },
+          "migrate_rocksdb_payload_indices": {
+            "description": "Migrate RocksDB based payload indices into new format on start.\n\nRebuilds a new payload index from scratch.\n\nEnabled by default in Qdrant 1.16.1.",
+            "default": true,
+            "type": "boolean"
+          },
+          "appendable_quantization": {
+            "description": "Use appendable quantization in appendable plain segments.\n\nEnabled by default in Qdrant 1.16.0.",
+            "default": true,
+            "type": "boolean"
+          },
+          "single_file_mmap_vector_storage": {
+            "description": "Use single-file mmap in-ram vector storage (InRamMmap)\n\nEnabled by default in Qdrant 1.17.1+",
+            "default": false,
+            "type": "boolean"
+          }
+        }
+      },
+      "HnswGlobalConfig": {
+        "type": "object",
+        "properties": {
+          "healing_threshold": {
+            "description": "Enable HNSW healing if the ratio of missing points is no more than this value. To disable healing completely, set this value to `0.0`.",
+            "default": 0.3,
+            "type": "number",
+            "format": "double",
+            "maximum": 1,
+            "minimum": 0
           }
         }
       },
@@ -11200,10 +12391,23 @@
             "format": "uint",
             "minimum": 0
           },
+          "max_collections": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
           "collections": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CollectionTelemetryEnum"
+            },
+            "nullable": true
+          },
+          "snapshots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CollectionSnapshotTelemetry"
             },
             "nullable": true
           }
@@ -11222,13 +12426,7 @@
       "CollectionTelemetry": {
         "type": "object",
         "required": [
-          "config",
-          "id",
-          "init_time_ms",
-          "resharding",
-          "shard_clean_tasks",
-          "shards",
-          "transfers"
+          "id"
         ],
         "properties": {
           "id": {
@@ -11237,38 +12435,50 @@
           "init_time_ms": {
             "type": "integer",
             "format": "uint64",
-            "minimum": 0
+            "minimum": 0,
+            "nullable": true
           },
           "config": {
-            "$ref": "#/components/schemas/CollectionConfigInternal"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CollectionConfigTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "shards": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReplicaSetTelemetry"
-            }
+            },
+            "nullable": true
           },
           "transfers": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ShardTransferInfo"
-            }
+            },
+            "nullable": true
           },
           "resharding": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReshardingInfo"
-            }
+            },
+            "nullable": true
           },
           "shard_clean_tasks": {
             "type": "object",
             "additionalProperties": {
               "$ref": "#/components/schemas/ShardCleanStatusTelemetry"
-            }
+            },
+            "nullable": true
           }
         }
       },
-      "CollectionConfigInternal": {
+      "CollectionConfigTelemetry": {
         "type": "object",
         "required": [
           "hnsw_config",
@@ -11303,7 +12513,7 @@
           "strict_mode_config": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/StrictModeConfig"
+                "$ref": "#/components/schemas/StrictModeConfigOutput"
               },
               {
                 "nullable": true
@@ -11315,6 +12525,17 @@
             "type": "string",
             "format": "uuid",
             "nullable": true
+          },
+          "metadata": {
+            "description": "Arbitrary JSON metadata for the collection",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Payload"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -11362,14 +12583,22 @@
             "additionalProperties": {
               "$ref": "#/components/schemas/ReplicaState"
             }
+          },
+          "partial_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PartialSnapshotTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
       "LocalShardTelemetry": {
         "type": "object",
         "required": [
-          "optimizations",
-          "segments",
           "total_optimized_points"
         ],
         "properties": {
@@ -11393,18 +12622,84 @@
             "format": "uint",
             "minimum": 0
           },
+          "vectors_size_bytes": {
+            "description": "An ESTIMATION of effective amount of bytes used for vectors Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "payloads_size_bytes": {
+            "description": "An estimation of the effective amount of bytes used for payloads Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_points": {
+            "description": "Sum of segment points This is an approximate number Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_vectors": {
+            "description": "Sum of number of vectors in all segments This is an approximate number Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_vectors_by_name": {
+            "description": "Sum of number of vectors across all segments, grouped by their name. This is an approximate number. Do NOT rely on this number unless you know what you are doing",
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "nullable": true
+          },
           "segments": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SegmentTelemetry"
-            }
+            },
+            "nullable": true
           },
           "optimizations": {
-            "$ref": "#/components/schemas/OptimizerTelemetry"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptimizerTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "async_scorer": {
             "type": "boolean",
             "nullable": true
+          },
+          "indexed_only_excluded_vectors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "nullable": true
+          },
+          "update_queue": {
+            "description": "Update queue status",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardUpdateQueueInfo"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -11461,10 +12756,15 @@
           "payloads_size_bytes",
           "ram_usage_bytes",
           "segment_type",
+          "uuid",
           "vector_data",
           "vectors_size_bytes"
         ],
         "properties": {
+          "uuid": {
+            "type": "string",
+            "format": "uuid"
+          },
           "segment_type": {
             "$ref": "#/components/schemas/SegmentType"
           },
@@ -11675,6 +12975,13 @@
             "enum": [
               "InRamChunkedMmap"
             ]
+          },
+          {
+            "description": "Storage in a single mmap file, not appendable Pre-fetched into RAM on load",
+            "type": "string",
+            "enum": [
+              "InRamMmap"
+            ]
           }
         ]
       },
@@ -11742,6 +13049,17 @@
           },
           "storage_type": {
             "$ref": "#/components/schemas/SparseVectorStorageType"
+          },
+          "modifier": {
+            "description": "Configures addition value modifications for sparse vectors. Default: none",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Modifier"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -11804,14 +13122,14 @@
       "SparseVectorStorageType": {
         "oneOf": [
           {
-            "description": "Storage on disk",
+            "description": "Storage on disk (rocksdb storage)",
             "type": "string",
             "enum": [
               "on_disk"
             ]
           },
           {
-            "description": "Storage in memory maps",
+            "description": "Storage in memory maps (gridstore storage)",
             "type": "string",
             "enum": [
               "mmap"
@@ -11860,6 +13178,20 @@
                 "type": "string",
                 "enum": [
                   "mmap"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "in_ram_mmap"
                 ]
               }
             }
@@ -11916,8 +13248,7 @@
       "OperationDurationStatistics": {
         "type": "object",
         "required": [
-          "count",
-          "total_duration_micros"
+          "count"
         ],
         "properties": {
           "count": {
@@ -11928,7 +13259,8 @@
           "fail_count": {
             "type": "integer",
             "format": "uint",
-            "minimum": 0
+            "minimum": 0,
+            "nullable": true
           },
           "avg_duration_micros": {
             "description": "The average time taken by 128 latest operations, calculated as a weighted mean.",
@@ -11952,7 +13284,8 @@
             "description": "The total duration of all operations in microseconds.",
             "type": "integer",
             "format": "uint64",
-            "minimum": 0
+            "minimum": 0,
+            "nullable": true
           },
           "last_responded": {
             "type": "string",
@@ -11964,6 +13297,7 @@
       "PayloadIndexTelemetry": {
         "type": "object",
         "required": [
+          "index_type",
           "points_count",
           "points_values_count"
         ],
@@ -11971,6 +13305,9 @@
           "field_name": {
             "type": "string",
             "nullable": true
+          },
+          "index_type": {
+            "type": "string"
           },
           "points_values_count": {
             "description": "The amount of values indexed for all points.",
@@ -11995,7 +13332,6 @@
       "OptimizerTelemetry": {
         "type": "object",
         "required": [
-          "log",
           "optimizations",
           "status"
         ],
@@ -12010,7 +13346,8 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/TrackerTelemetry"
-            }
+            },
+            "nullable": true
           }
         }
       },
@@ -12020,21 +13357,36 @@
         "required": [
           "name",
           "segment_ids",
+          "segment_uuids",
           "start_at",
-          "status"
+          "status",
+          "uuid"
         ],
         "properties": {
           "name": {
             "description": "Name of the optimizer",
             "type": "string"
           },
+          "uuid": {
+            "description": "UUID of the upcoming segment being created by the optimizer",
+            "type": "string",
+            "format": "uuid"
+          },
           "segment_ids": {
-            "description": "Segment IDs being optimized",
+            "description": "Internal segment IDs being optimized. These are local and in-memory, meaning that they can refer to different segments after a service restart.",
             "type": "array",
             "items": {
               "type": "integer",
               "format": "uint",
               "minimum": 0
+            }
+          },
+          "segment_uuids": {
+            "description": "Segment UUIDs being optimized. Refers to same segments as in `segment_ids`, but trackable across restarts, and reflect their directory name.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
             }
           },
           "status": {
@@ -12089,12 +13441,32 @@
           }
         ]
       },
+      "ShardUpdateQueueInfo": {
+        "type": "object",
+        "required": [
+          "length"
+        ],
+        "properties": {
+          "length": {
+            "description": "Number of elements in the queue",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "op_num": {
+            "description": "last operation number processed",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
       "RemoteShardTelemetry": {
         "type": "object",
         "required": [
-          "searches",
-          "shard_id",
-          "updates"
+          "peer_id",
+          "shard_id"
         ],
         "properties": {
           "shard_id": {
@@ -12105,14 +13477,50 @@
           "peer_id": {
             "type": "integer",
             "format": "uint64",
-            "minimum": 0,
-            "nullable": true
+            "minimum": 0
           },
           "searches": {
-            "$ref": "#/components/schemas/OperationDurationStatistics"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OperationDurationStatistics"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "updates": {
-            "$ref": "#/components/schemas/OperationDurationStatistics"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OperationDurationStatistics"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "PartialSnapshotTelemetry": {
+        "type": "object",
+        "required": [
+          "is_recovering",
+          "ongoing_create_snapshot_requests",
+          "recovery_timestamp"
+        ],
+        "properties": {
+          "ongoing_create_snapshot_requests": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "is_recovering": {
+            "type": "boolean"
+          },
+          "recovery_timestamp": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
           }
         }
       },
@@ -12197,6 +13605,35 @@
           }
         }
       },
+      "CollectionSnapshotTelemetry": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "running_snapshots": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "running_snapshot_recovery": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "total_snapshot_creations": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
       "ClusterTelemetry": {
         "type": "object",
         "required": [
@@ -12233,9 +13670,20 @@
             },
             "nullable": true
           },
+          "peer_metadata": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PeerMetadata"
+            },
+            "nullable": true
+          },
           "metadata": {
             "type": "object",
             "additionalProperties": true,
+            "nullable": true
+          },
+          "resharding_enabled": {
+            "type": "boolean",
             "nullable": true
           }
         }
@@ -12354,6 +13802,19 @@
           }
         }
       },
+      "PeerMetadata": {
+        "description": "Metadata describing extra properties for each peer",
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "description": "Peer Qdrant version",
+            "type": "string"
+          }
+        }
+      },
       "RequestsTelemetry": {
         "type": "object",
         "required": [
@@ -12395,7 +13856,10 @@
           "responses": {
             "type": "object",
             "additionalProperties": {
-              "$ref": "#/components/schemas/OperationDurationStatistics"
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/components/schemas/OperationDurationStatistics"
+              }
             }
           }
         }
@@ -12461,6 +13925,8 @@
         "type": "object",
         "required": [
           "cpu",
+          "payload_index_io_read",
+          "payload_index_io_write",
           "payload_io_read",
           "payload_io_write",
           "vector_io_read",
@@ -12478,6 +13944,16 @@
             "minimum": 0
           },
           "payload_io_write": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "payload_index_io_read": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "payload_index_io_write": {
             "type": "integer",
             "format": "uint",
             "minimum": 0
@@ -12522,6 +13998,9 @@
           },
           {
             "$ref": "#/components/schemas/AbortReshardingOperation"
+          },
+          {
+            "$ref": "#/components/schemas/ReplicatePointsOperation"
           }
         ]
       },
@@ -12728,6 +14207,17 @@
               "minimum": 0
             },
             "nullable": true
+          },
+          "initial_state": {
+            "description": "Initial state of the shards for this key If not specified, will be `Initializing` first and then `Active` Warning: do not change this unless you know what you are doing",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReplicaState"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -12845,6 +14335,42 @@
       "AbortResharding": {
         "type": "object"
       },
+      "ReplicatePointsOperation": {
+        "type": "object",
+        "required": [
+          "replicate_points"
+        ],
+        "properties": {
+          "replicate_points": {
+            "$ref": "#/components/schemas/ReplicatePoints"
+          }
+        }
+      },
+      "ReplicatePoints": {
+        "type": "object",
+        "required": [
+          "from_shard_key",
+          "to_shard_key"
+        ],
+        "properties": {
+          "filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "from_shard_key": {
+            "$ref": "#/components/schemas/ShardKey"
+          },
+          "to_shard_key": {
+            "$ref": "#/components/schemas/ShardKey"
+          }
+        }
+      },
       "SearchRequestBatch": {
         "type": "object",
         "required": [
@@ -12870,21 +14396,6 @@
             "items": {
               "$ref": "#/components/schemas/RecommendRequest"
             }
-          }
-        }
-      },
-      "LocksOption": {
-        "type": "object",
-        "required": [
-          "write"
-        ],
-        "properties": {
-          "error_message": {
-            "type": "string",
-            "nullable": true
-          },
-          "write": {
-            "type": "boolean"
           }
         }
       },
@@ -13016,6 +14527,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/ShardKeySelector"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "update_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
               },
               {
                 "nullable": true
@@ -14081,7 +15602,16 @@
             "$ref": "#/components/schemas/FusionQuery"
           },
           {
+            "$ref": "#/components/schemas/RrfQuery"
+          },
+          {
+            "$ref": "#/components/schemas/FormulaQuery"
+          },
+          {
             "$ref": "#/components/schemas/SampleQuery"
+          },
+          {
+            "$ref": "#/components/schemas/RelevanceFeedbackQuery"
           }
         ]
       },
@@ -14093,6 +15623,39 @@
         "properties": {
           "nearest": {
             "$ref": "#/components/schemas/VectorInput"
+          },
+          "mmr": {
+            "description": "Perform MMR (Maximal Marginal Relevance) reranking after search, using the same vector in this query to calculate relevance.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Mmr"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "Mmr": {
+        "description": "Maximal Marginal Relevance (MMR) algorithm for re-ranking the points.",
+        "type": "object",
+        "properties": {
+          "diversity": {
+            "description": "Tunable parameter for the MMR algorithm. Determines the balance between diversity and relevance.\n\nA higher value favors diversity (dissimilarity to selected results), while a lower value favors relevance (similarity to the query vector).\n\nMust be in the range [0, 1]. Default value is 0.5.",
+            "type": "number",
+            "format": "float",
+            "maximum": 1,
+            "minimum": 0,
+            "nullable": true
+          },
+          "candidates_limit": {
+            "description": "The maximum number of candidates to consider for re-ranking.\n\nIf not specified, the `limit` value is used.",
+            "type": "integer",
+            "format": "uint",
+            "maximum": 16384,
+            "minimum": 0,
+            "nullable": true
           }
         }
       },
@@ -14244,12 +15807,391 @@
         }
       },
       "Fusion": {
-        "description": "Fusion algorithm allows to combine results of multiple prefetches.\n\nAvailable fusion algorithms:\n\n* `rrf` - Reciprocal Rank Fusion * `dbsf` - Distribution-Based Score Fusion",
+        "description": "Fusion algorithm allows to combine results of multiple prefetches.\n\nAvailable fusion algorithms:\n\n* `rrf` - Reciprocal Rank Fusion (with default parameters) * `dbsf` - Distribution-Based Score Fusion",
         "type": "string",
         "enum": [
           "rrf",
           "dbsf"
         ]
+      },
+      "RrfQuery": {
+        "type": "object",
+        "required": [
+          "rrf"
+        ],
+        "properties": {
+          "rrf": {
+            "$ref": "#/components/schemas/Rrf"
+          }
+        }
+      },
+      "Rrf": {
+        "description": "Parameters for Reciprocal Rank Fusion",
+        "type": "object",
+        "properties": {
+          "k": {
+            "description": "K parameter for reciprocal rank fusion",
+            "default": null,
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "weights": {
+            "description": "Weights for each prefetch source. Higher weight gives more influence on the final ranking. If not specified, all prefetches are weighted equally. The number of weights should match the number of prefetches.",
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "FormulaQuery": {
+        "type": "object",
+        "required": [
+          "formula"
+        ],
+        "properties": {
+          "formula": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "defaults": {
+            "default": {},
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "Expression": {
+        "anyOf": [
+          {
+            "type": "number",
+            "format": "float"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/components/schemas/Condition"
+          },
+          {
+            "$ref": "#/components/schemas/GeoDistance"
+          },
+          {
+            "$ref": "#/components/schemas/DatetimeExpression"
+          },
+          {
+            "$ref": "#/components/schemas/DatetimeKeyExpression"
+          },
+          {
+            "$ref": "#/components/schemas/MultExpression"
+          },
+          {
+            "$ref": "#/components/schemas/SumExpression"
+          },
+          {
+            "$ref": "#/components/schemas/NegExpression"
+          },
+          {
+            "$ref": "#/components/schemas/AbsExpression"
+          },
+          {
+            "$ref": "#/components/schemas/DivExpression"
+          },
+          {
+            "$ref": "#/components/schemas/SqrtExpression"
+          },
+          {
+            "$ref": "#/components/schemas/PowExpression"
+          },
+          {
+            "$ref": "#/components/schemas/ExpExpression"
+          },
+          {
+            "$ref": "#/components/schemas/Log10Expression"
+          },
+          {
+            "$ref": "#/components/schemas/LnExpression"
+          },
+          {
+            "$ref": "#/components/schemas/LinDecayExpression"
+          },
+          {
+            "$ref": "#/components/schemas/ExpDecayExpression"
+          },
+          {
+            "$ref": "#/components/schemas/GaussDecayExpression"
+          }
+        ]
+      },
+      "GeoDistance": {
+        "type": "object",
+        "required": [
+          "geo_distance"
+        ],
+        "properties": {
+          "geo_distance": {
+            "$ref": "#/components/schemas/GeoDistanceParams"
+          }
+        }
+      },
+      "GeoDistanceParams": {
+        "type": "object",
+        "required": [
+          "origin",
+          "to"
+        ],
+        "properties": {
+          "origin": {
+            "$ref": "#/components/schemas/GeoPoint"
+          },
+          "to": {
+            "description": "Payload field with the destination geo point",
+            "type": "string"
+          }
+        }
+      },
+      "DatetimeExpression": {
+        "type": "object",
+        "required": [
+          "datetime"
+        ],
+        "properties": {
+          "datetime": {
+            "type": "string"
+          }
+        }
+      },
+      "DatetimeKeyExpression": {
+        "type": "object",
+        "required": [
+          "datetime_key"
+        ],
+        "properties": {
+          "datetime_key": {
+            "type": "string"
+          }
+        }
+      },
+      "MultExpression": {
+        "type": "object",
+        "required": [
+          "mult"
+        ],
+        "properties": {
+          "mult": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Expression"
+            }
+          }
+        }
+      },
+      "SumExpression": {
+        "type": "object",
+        "required": [
+          "sum"
+        ],
+        "properties": {
+          "sum": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Expression"
+            }
+          }
+        }
+      },
+      "NegExpression": {
+        "type": "object",
+        "required": [
+          "neg"
+        ],
+        "properties": {
+          "neg": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "AbsExpression": {
+        "type": "object",
+        "required": [
+          "abs"
+        ],
+        "properties": {
+          "abs": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "DivExpression": {
+        "type": "object",
+        "required": [
+          "div"
+        ],
+        "properties": {
+          "div": {
+            "$ref": "#/components/schemas/DivParams"
+          }
+        }
+      },
+      "DivParams": {
+        "type": "object",
+        "required": [
+          "left",
+          "right"
+        ],
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "right": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "by_zero_default": {
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          }
+        }
+      },
+      "SqrtExpression": {
+        "type": "object",
+        "required": [
+          "sqrt"
+        ],
+        "properties": {
+          "sqrt": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "PowExpression": {
+        "type": "object",
+        "required": [
+          "pow"
+        ],
+        "properties": {
+          "pow": {
+            "$ref": "#/components/schemas/PowParams"
+          }
+        }
+      },
+      "PowParams": {
+        "type": "object",
+        "required": [
+          "base",
+          "exponent"
+        ],
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "exponent": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "ExpExpression": {
+        "type": "object",
+        "required": [
+          "exp"
+        ],
+        "properties": {
+          "exp": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "Log10Expression": {
+        "type": "object",
+        "required": [
+          "log10"
+        ],
+        "properties": {
+          "log10": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "LnExpression": {
+        "type": "object",
+        "required": [
+          "ln"
+        ],
+        "properties": {
+          "ln": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "LinDecayExpression": {
+        "type": "object",
+        "required": [
+          "lin_decay"
+        ],
+        "properties": {
+          "lin_decay": {
+            "$ref": "#/components/schemas/DecayParamsExpression"
+          }
+        }
+      },
+      "DecayParamsExpression": {
+        "type": "object",
+        "required": [
+          "x"
+        ],
+        "properties": {
+          "x": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "target": {
+            "description": "The target value to start decaying from. Defaults to 0.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Expression"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "scale": {
+            "description": "The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          },
+          "midpoint": {
+            "description": "The midpoint of the decay. Should be between 0 and 1.Defaults to 0.5. Output will be this value when `|x - target| == scale`.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          }
+        }
+      },
+      "ExpDecayExpression": {
+        "type": "object",
+        "required": [
+          "exp_decay"
+        ],
+        "properties": {
+          "exp_decay": {
+            "$ref": "#/components/schemas/DecayParamsExpression"
+          }
+        }
+      },
+      "GaussDecayExpression": {
+        "type": "object",
+        "required": [
+          "gauss_decay"
+        ],
+        "properties": {
+          "gauss_decay": {
+            "$ref": "#/components/schemas/DecayParamsExpression"
+          }
+        }
       },
       "SampleQuery": {
         "type": "object",
@@ -14267,6 +16209,96 @@
         "enum": [
           "random"
         ]
+      },
+      "RelevanceFeedbackQuery": {
+        "type": "object",
+        "required": [
+          "relevance_feedback"
+        ],
+        "properties": {
+          "relevance_feedback": {
+            "$ref": "#/components/schemas/RelevanceFeedbackInput"
+          }
+        }
+      },
+      "RelevanceFeedbackInput": {
+        "type": "object",
+        "required": [
+          "feedback",
+          "strategy",
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          "feedback": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedbackItem"
+            }
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/FeedbackStrategy"
+          }
+        }
+      },
+      "FeedbackItem": {
+        "type": "object",
+        "required": [
+          "example",
+          "score"
+        ],
+        "properties": {
+          "example": {
+            "$ref": "#/components/schemas/VectorInput"
+          },
+          "score": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
+      "FeedbackStrategy": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/NaiveFeedbackStrategy"
+          }
+        ]
+      },
+      "NaiveFeedbackStrategy": {
+        "type": "object",
+        "required": [
+          "naive"
+        ],
+        "properties": {
+          "naive": {
+            "$ref": "#/components/schemas/NaiveFeedbackStrategyParams"
+          }
+        }
+      },
+      "NaiveFeedbackStrategyParams": {
+        "type": "object",
+        "required": [
+          "a",
+          "b",
+          "c"
+        ],
+        "properties": {
+          "a": {
+            "type": "number",
+            "format": "float"
+          },
+          "b": {
+            "type": "number",
+            "format": "float",
+            "minimum": 0
+          },
+          "c": {
+            "type": "number",
+            "format": "float"
+          }
+        }
       },
       "QueryRequestBatch": {
         "type": "object",
@@ -14655,6 +16687,581 @@
             "type": "boolean"
           }
         ]
+      },
+      "Usage": {
+        "description": "Usage of the hardware resources, spent to process the request",
+        "type": "object",
+        "properties": {
+          "hardware": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HardwareUsage"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "inference": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InferenceUsage"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "InferenceUsage": {
+        "type": "object",
+        "required": [
+          "models"
+        ],
+        "properties": {
+          "models": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelUsage"
+            }
+          }
+        }
+      },
+      "ModelUsage": {
+        "type": "object",
+        "required": [
+          "tokens"
+        ],
+        "properties": {
+          "tokens": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "ShardKeysResponse": {
+        "type": "object",
+        "properties": {
+          "shard_keys": {
+            "description": "The existing shard keys. Only available when sharding method is `custom`",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardKeyDescription"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "ShardKeyDescription": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "$ref": "#/components/schemas/ShardKey"
+          }
+        }
+      },
+      "OptimizationsResponse": {
+        "description": "Optimizations progress for the collection",
+        "type": "object",
+        "required": [
+          "running",
+          "summary"
+        ],
+        "properties": {
+          "summary": {
+            "$ref": "#/components/schemas/OptimizationsSummary"
+          },
+          "running": {
+            "description": "Currently running optimizations.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Optimization"
+            }
+          },
+          "queued": {
+            "description": "An estimated queue of pending optimizations. Requires `?with=queued`.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PendingOptimization"
+            },
+            "nullable": true
+          },
+          "completed": {
+            "description": "Completed optimizations. Requires `?with=completed`. Limited by `?completed_limit=N`.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Optimization"
+            },
+            "nullable": true
+          },
+          "idle_segments": {
+            "description": "Segments that don't require optimization. Requires `?with=idle_segments`.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptimizationSegmentInfo"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "OptimizationsSummary": {
+        "type": "object",
+        "required": [
+          "idle_segments",
+          "queued_optimizations",
+          "queued_points",
+          "queued_segments"
+        ],
+        "properties": {
+          "queued_optimizations": {
+            "description": "Number of pending optimizations in the queue. Each optimization will take one or more unoptimized segments and produce one optimized segment.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "queued_segments": {
+            "description": "Number of unoptimized segments in the queue.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "queued_points": {
+            "description": "Number of points in unoptimized segments in the queue.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "idle_segments": {
+            "description": "Number of segments that don't require optimization.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
+      "Optimization": {
+        "type": "object",
+        "required": [
+          "optimizer",
+          "progress",
+          "segments",
+          "status",
+          "uuid"
+        ],
+        "properties": {
+          "uuid": {
+            "description": "Unique identifier of the optimization process.\n\nAfter the optimization is complete, a new segment will be created with this UUID.",
+            "type": "string",
+            "format": "uuid"
+          },
+          "optimizer": {
+            "description": "Name of the optimizer that performed this optimization.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TrackerStatus"
+          },
+          "segments": {
+            "description": "Segments being optimized.\n\nAfter the optimization is complete, these segments will be replaced by the new optimized segment.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptimizationSegmentInfo"
+            }
+          },
+          "progress": {
+            "$ref": "#/components/schemas/ProgressTree"
+          }
+        }
+      },
+      "OptimizationSegmentInfo": {
+        "type": "object",
+        "required": [
+          "points_count",
+          "uuid"
+        ],
+        "properties": {
+          "uuid": {
+            "description": "Unique identifier of the segment.",
+            "type": "string",
+            "format": "uuid"
+          },
+          "points_count": {
+            "description": "Number of non-deleted points in the segment.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
+      "ProgressTree": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "description": "Name of the operation.",
+            "type": "string"
+          },
+          "started_at": {
+            "description": "When the operation started.",
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "finished_at": {
+            "description": "When the operation finished.",
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "duration_sec": {
+            "description": "For finished operations, how long they took, in seconds.",
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "done": {
+            "description": "Number of completed units of work, if applicable.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "total": {
+            "description": "Total number of units of work, if applicable and known.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "children": {
+            "description": "Child operations.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProgressTree"
+            }
+          }
+        }
+      },
+      "PendingOptimization": {
+        "type": "object",
+        "required": [
+          "optimizer",
+          "segments"
+        ],
+        "properties": {
+          "optimizer": {
+            "description": "Name of the optimizer that scheduled this optimization.",
+            "type": "string"
+          },
+          "segments": {
+            "description": "Segments that will be optimized.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OptimizationSegmentInfo"
+            }
+          }
+        }
+      },
+      "DistributedTelemetryData": {
+        "type": "object",
+        "required": [
+          "collections"
+        ],
+        "properties": {
+          "collections": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DistributedCollectionTelemetry"
+            }
+          },
+          "cluster": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DistributedClusterTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "DistributedCollectionTelemetry": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "description": "Collection name",
+            "type": "string"
+          },
+          "shards": {
+            "description": "Shards topology",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DistributedShardTelemetry"
+            },
+            "nullable": true
+          },
+          "reshardings": {
+            "description": "Ongoing resharding operations",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReshardingInfo"
+            },
+            "nullable": true
+          },
+          "shard_transfers": {
+            "description": "Ongoing shard transfers",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardTransferInfo"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "DistributedShardTelemetry": {
+        "type": "object",
+        "required": [
+          "id",
+          "replicas"
+        ],
+        "properties": {
+          "id": {
+            "description": "Shard ID",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "key": {
+            "description": "Optional shard key",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardKey"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "replicas": {
+            "description": "Replica information",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DistributedReplicaTelemetry"
+            }
+          }
+        }
+      },
+      "DistributedReplicaTelemetry": {
+        "type": "object",
+        "required": [
+          "peer_id",
+          "state"
+        ],
+        "properties": {
+          "peer_id": {
+            "description": "Peer ID hosting this replica",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/ReplicaState"
+          },
+          "status": {
+            "description": "Shard status",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardStatus"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "total_optimized_points": {
+            "description": "Total optimized points",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "vectors_size_bytes": {
+            "description": "Estimated vectors size in bytes",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "payloads_size_bytes": {
+            "description": "Estimated payloads size in bytes",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_points": {
+            "description": "Approximate number of points",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_vectors": {
+            "description": "Approximate number of vectors",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_vectors_by_name": {
+            "description": "Approximate number of vectors by name",
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "nullable": true
+          },
+          "shard_cleaning_status": {
+            "description": "Shard cleaning task status. After a resharding, a cleanup task is performed to remove outdated points from this shard.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardCleanStatusTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "partial_snapshot": {
+            "description": "Partial snapshot telemetry",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PartialSnapshotTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "DistributedClusterTelemetry": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "peers"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "number_of_peers": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "peers": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DistributedPeerInfo"
+            }
+          }
+        }
+      },
+      "DistributedPeerInfo": {
+        "type": "object",
+        "required": [
+          "responsive",
+          "uri"
+        ],
+        "properties": {
+          "uri": {
+            "description": "URI of the peer",
+            "type": "string"
+          },
+          "responsive": {
+            "description": "Whether this peer responded for this request",
+            "type": "boolean"
+          },
+          "details": {
+            "description": "If responsive, these details should be available",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DistributedPeerDetails"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "DistributedPeerDetails": {
+        "type": "object",
+        "required": [
+          "commit",
+          "consensus_thread_status",
+          "is_voter",
+          "num_pending_operations",
+          "term",
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "description": "Qdrant version",
+            "type": "string"
+          },
+          "role": {
+            "description": "Consensus role for the peer",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StateRole"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "is_voter": {
+            "description": "Whether it can participate in leader elections",
+            "type": "boolean"
+          },
+          "term": {
+            "description": "Election term",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "commit": {
+            "description": "Latest accepted commit",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "num_pending_operations": {
+            "description": "Number of operations pending for being applied",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "consensus_thread_status": {
+            "$ref": "#/components/schemas/ConsensusThreadStatus"
+          }
+        }
       }
     }
   }

@@ -1,45 +1,19 @@
 use std::cmp::max;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{fs, io};
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use fs_err as fs;
 use tokio::runtime;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
-use validator::Validate;
 
 use crate::settings::{Settings, TlsConfig};
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate)]
-pub struct LocksOption {
-    pub error_message: Option<String>,
-    pub write: bool,
-}
-
 pub fn create_search_runtime(max_search_threads: usize) -> io::Result<Runtime> {
-    let mut search_threads = max_search_threads;
-
-    if search_threads == 0 {
-        let num_cpu = common::cpu::get_num_cpus();
-        // At least one thread, but not more than number of CPUs - 1 if there are more than 2 CPU
-        // Example:
-        // Num CPU = 1 -> 1 thread
-        // Num CPU = 2 -> 2 thread - if we use one thread with 2 cpus, its too much un-utilized resources
-        // Num CPU = 3 -> 2 thread
-        // Num CPU = 4 -> 3 thread
-        // Num CPU = 5 -> 4 thread
-        search_threads = match num_cpu {
-            0 => 1,
-            1 => 1,
-            2 => 2,
-            _ => num_cpu - 1,
-        };
-    }
-
+    let num_threads = common::defaults::search_thread_count(max_search_threads);
     runtime::Builder::new_multi_thread()
-        .worker_threads(search_threads)
-        .max_blocking_threads(search_threads)
+        .worker_threads(num_threads)
+        .max_blocking_threads(num_threads)
         .enable_all()
         .thread_name_fn(|| {
             static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
@@ -52,8 +26,12 @@ pub fn create_search_runtime(max_search_threads: usize) -> io::Result<Runtime> {
 pub fn create_update_runtime(max_optimization_threads: usize) -> io::Result<Runtime> {
     let mut update_runtime_builder = runtime::Builder::new_multi_thread();
 
+    let num_cpus = common::cpu::get_num_cpus();
+
     update_runtime_builder
         .enable_time()
+        .enable_io()
+        .worker_threads(num_cpus)
         .thread_name_fn(move || {
             static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
             let update_id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
@@ -113,12 +91,18 @@ fn load_identity(tls_config: &TlsConfig) -> io::Result<Identity> {
 }
 
 fn load_ca_certificate(tls_config: &TlsConfig) -> io::Result<Certificate> {
-    let pem = fs::read_to_string(&tls_config.ca_cert)?;
+    let Some(ca_cert_path) = &tls_config.ca_cert else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CA certificate is required for TLS configuration",
+        ));
+    };
+    let pem = fs::read_to_string(ca_cert_path)?;
     Ok(Certificate::from_pem(pem))
 }
 
 pub fn tonic_error_to_io_error(err: tonic::transport::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err)
+    io::Error::other(err)
 }
 
 #[cfg(test)]

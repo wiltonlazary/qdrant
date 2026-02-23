@@ -1,7 +1,7 @@
 use common::counter::hardware_counter::HardwareCounterCell;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use segment::data_types::vectors::only_default_vector;
-use segment::entry::entry_point::SegmentEntry;
+use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
 use segment::json_path::JsonPath;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{Distance, Payload, PayloadFieldSchema, PayloadSchemaType};
@@ -26,6 +26,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 100,
                 &JsonPath::new(&key),
                 Some(&PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword)),
+                &HardwareCounterCell::new(),
             )
             .unwrap();
     }

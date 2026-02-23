@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use half::f16;
 use sparse::common::types::{DimId, QuantizedU8};
+use sparse::index::inverted_index::InvertedIndex;
 use sparse::index::inverted_index::inverted_index_compressed_immutable_ram::InvertedIndexCompressedImmutableRam;
 use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
 use sparse::index::inverted_index::inverted_index_immutable_ram::InvertedIndexImmutableRam;
@@ -35,6 +37,10 @@ pub trait VectorIndex {
 
     fn files(&self) -> Vec<PathBuf>;
 
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// The number of indexed vectors, currently accessible
     fn indexed_vector_count(&self) -> usize;
 
@@ -46,14 +52,15 @@ pub trait VectorIndex {
     /// # Arguments
     /// - `id` - sequential vector id, offset in the vector storage
     /// - `vector` - new vector value,
-    ///        if None - vector will be removed from the index marked as deleted in storage.
-    ///        Note: inserting None vector is not equal to removing vector from the storage.
-    ///              Unlike removing, it will always result in storage growth.
-    ///              Proper removing should be performed by the optimizer.
+    ///   if None - vector will be removed from the index marked as deleted in storage.
+    ///   Note: inserting None vector is not equal to removing vector from the storage.
+    ///   Unlike removing, it will always result in storage growth.
+    ///   Proper removing should be performed by the optimizer.
     fn update_vector(
         &mut self,
         id: PointOffsetType,
         vector: Option<VectorRef>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()>;
 }
 
@@ -91,18 +98,96 @@ impl VectorIndexEnum {
         }
     }
 
-    pub fn fill_idf_statistics(&self, idf: &mut HashMap<DimId, usize>) {
+    /// Returns true if underlying storage is configured to be stored on disk without
+    /// actively holding data in RAM
+    pub fn is_on_disk(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            Self::Hnsw(index) => index.is_on_disk(),
+            Self::SparseRam(index) => index.inverted_index().is_on_disk(),
+            Self::SparseImmutableRam(index) => index.inverted_index().is_on_disk(),
+            Self::SparseMmap(index) => index.inverted_index().is_on_disk(),
+            Self::SparseCompressedImmutableRamF32(index) => index.inverted_index().is_on_disk(),
+            Self::SparseCompressedImmutableRamF16(index) => index.inverted_index().is_on_disk(),
+            Self::SparseCompressedImmutableRamU8(index) => index.inverted_index().is_on_disk(),
+            Self::SparseCompressedMmapF32(index) => index.inverted_index().is_on_disk(),
+            Self::SparseCompressedMmapF16(index) => index.inverted_index().is_on_disk(),
+            Self::SparseCompressedMmapU8(index) => index.inverted_index().is_on_disk(),
+        }
+    }
+
+    pub fn populate(&self) -> OperationResult<()> {
+        match self {
+            Self::Plain(_) => {}
+            Self::Hnsw(index) => index.populate()?,
+            Self::SparseRam(_) => {}
+            Self::SparseImmutableRam(_) => {}
+            Self::SparseMmap(index) => index.inverted_index().populate()?,
+            Self::SparseCompressedImmutableRamF32(_) => {}
+            Self::SparseCompressedImmutableRamF16(_) => {}
+            Self::SparseCompressedImmutableRamU8(_) => {}
+            Self::SparseCompressedMmapF32(index) => index.inverted_index().populate()?,
+            Self::SparseCompressedMmapF16(index) => index.inverted_index().populate()?,
+            Self::SparseCompressedMmapU8(index) => index.inverted_index().populate()?,
+        };
+        Ok(())
+    }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        match self {
+            Self::Plain(_) => {}
+            Self::Hnsw(index) => index.clear_cache()?,
+            Self::SparseRam(_) => {}
+            Self::SparseImmutableRam(_) => {}
+            Self::SparseMmap(index) => index.inverted_index().clear_cache()?,
+            Self::SparseCompressedImmutableRamF32(_) => {}
+            Self::SparseCompressedImmutableRamF16(_) => {}
+            Self::SparseCompressedImmutableRamU8(_) => {}
+            Self::SparseCompressedMmapF32(index) => index.inverted_index().clear_cache()?,
+            Self::SparseCompressedMmapF16(index) => index.inverted_index().clear_cache()?,
+            Self::SparseCompressedMmapU8(index) => index.inverted_index().clear_cache()?,
+        };
+        Ok(())
+    }
+
+    pub fn fill_idf_statistics(
+        &self,
+        idf: &mut HashMap<DimId, usize>,
+        hw_counter: &HardwareCounterCell,
+    ) {
         match self {
             Self::Plain(_) | Self::Hnsw(_) => (),
-            Self::SparseRam(index) => index.fill_idf_statistics(idf),
-            Self::SparseImmutableRam(index) => index.fill_idf_statistics(idf),
-            Self::SparseMmap(index) => index.fill_idf_statistics(idf),
-            Self::SparseCompressedImmutableRamF32(index) => index.fill_idf_statistics(idf),
-            Self::SparseCompressedImmutableRamF16(index) => index.fill_idf_statistics(idf),
-            Self::SparseCompressedImmutableRamU8(index) => index.fill_idf_statistics(idf),
-            Self::SparseCompressedMmapF32(index) => index.fill_idf_statistics(idf),
-            Self::SparseCompressedMmapF16(index) => index.fill_idf_statistics(idf),
-            Self::SparseCompressedMmapU8(index) => index.fill_idf_statistics(idf),
+            Self::SparseRam(index) => index.fill_idf_statistics(idf, hw_counter),
+            Self::SparseImmutableRam(index) => index.fill_idf_statistics(idf, hw_counter),
+            Self::SparseMmap(index) => index.fill_idf_statistics(idf, hw_counter),
+            Self::SparseCompressedImmutableRamF32(index) => {
+                index.fill_idf_statistics(idf, hw_counter)
+            }
+            Self::SparseCompressedImmutableRamF16(index) => {
+                index.fill_idf_statistics(idf, hw_counter)
+            }
+            Self::SparseCompressedImmutableRamU8(index) => {
+                index.fill_idf_statistics(idf, hw_counter)
+            }
+            Self::SparseCompressedMmapF32(index) => index.fill_idf_statistics(idf, hw_counter),
+            Self::SparseCompressedMmapF16(index) => index.fill_idf_statistics(idf, hw_counter),
+            Self::SparseCompressedMmapU8(index) => index.fill_idf_statistics(idf, hw_counter),
+        }
+    }
+
+    pub fn indexed_vectors(&self) -> usize {
+        match self {
+            Self::Plain(index) => index.indexed_vector_count(),
+            Self::Hnsw(index) => index.indexed_vector_count(),
+            Self::SparseRam(index) => index.inverted_index().vector_count(),
+            Self::SparseImmutableRam(index) => index.inverted_index().vector_count(),
+            Self::SparseMmap(index) => index.inverted_index().vector_count(),
+            Self::SparseCompressedImmutableRamF32(index) => index.inverted_index().vector_count(),
+            Self::SparseCompressedImmutableRamF16(index) => index.inverted_index().vector_count(),
+            Self::SparseCompressedImmutableRamU8(index) => index.inverted_index().vector_count(),
+            Self::SparseCompressedMmapF32(index) => index.inverted_index().vector_count(),
+            Self::SparseCompressedMmapF16(index) => index.inverted_index().vector_count(),
+            Self::SparseCompressedMmapU8(index) => index.inverted_index().vector_count(),
         }
     }
 }
@@ -191,6 +276,22 @@ impl VectorIndex for VectorIndexEnum {
         }
     }
 
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        match self {
+            VectorIndexEnum::Plain(index) => index.immutable_files(),
+            VectorIndexEnum::Hnsw(index) => index.immutable_files(),
+            VectorIndexEnum::SparseRam(index) => index.immutable_files(),
+            VectorIndexEnum::SparseImmutableRam(index) => index.immutable_files(),
+            VectorIndexEnum::SparseMmap(index) => index.immutable_files(),
+            VectorIndexEnum::SparseCompressedImmutableRamF32(index) => index.immutable_files(),
+            VectorIndexEnum::SparseCompressedImmutableRamF16(index) => index.immutable_files(),
+            VectorIndexEnum::SparseCompressedImmutableRamU8(index) => index.immutable_files(),
+            VectorIndexEnum::SparseCompressedMmapF32(index) => index.immutable_files(),
+            VectorIndexEnum::SparseCompressedMmapF16(index) => index.immutable_files(),
+            VectorIndexEnum::SparseCompressedMmapU8(index) => index.immutable_files(),
+        }
+    }
+
     fn indexed_vector_count(&self) -> usize {
         match self {
             Self::Plain(index) => index.indexed_vector_count(),
@@ -233,19 +334,26 @@ impl VectorIndex for VectorIndexEnum {
         &mut self,
         id: PointOffsetType,
         vector: Option<VectorRef>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match self {
-            Self::Plain(index) => index.update_vector(id, vector),
-            Self::Hnsw(index) => index.update_vector(id, vector),
-            Self::SparseRam(index) => index.update_vector(id, vector),
-            Self::SparseImmutableRam(index) => index.update_vector(id, vector),
-            Self::SparseMmap(index) => index.update_vector(id, vector),
-            Self::SparseCompressedImmutableRamF32(index) => index.update_vector(id, vector),
-            Self::SparseCompressedImmutableRamF16(index) => index.update_vector(id, vector),
-            Self::SparseCompressedImmutableRamU8(index) => index.update_vector(id, vector),
-            Self::SparseCompressedMmapF32(index) => index.update_vector(id, vector),
-            Self::SparseCompressedMmapF16(index) => index.update_vector(id, vector),
-            Self::SparseCompressedMmapU8(index) => index.update_vector(id, vector),
+            Self::Plain(index) => index.update_vector(id, vector, hw_counter),
+            Self::Hnsw(index) => index.update_vector(id, vector, hw_counter),
+            Self::SparseRam(index) => index.update_vector(id, vector, hw_counter),
+            Self::SparseImmutableRam(index) => index.update_vector(id, vector, hw_counter),
+            Self::SparseMmap(index) => index.update_vector(id, vector, hw_counter),
+            Self::SparseCompressedImmutableRamF32(index) => {
+                index.update_vector(id, vector, hw_counter)
+            }
+            Self::SparseCompressedImmutableRamF16(index) => {
+                index.update_vector(id, vector, hw_counter)
+            }
+            Self::SparseCompressedImmutableRamU8(index) => {
+                index.update_vector(id, vector, hw_counter)
+            }
+            Self::SparseCompressedMmapF32(index) => index.update_vector(id, vector, hw_counter),
+            Self::SparseCompressedMmapF16(index) => index.update_vector(id, vector, hw_counter),
+            Self::SparseCompressedMmapU8(index) => index.update_vector(id, vector, hw_counter),
         }
     }
 }

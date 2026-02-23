@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use collection::collection::Collection;
 use collection::collection_state;
-use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::ReplicaState;
-use collection::shards::shard::PeerId;
 use collection::shards::CollectionId;
+use collection::shards::collection_shard_distribution::CollectionShardDistribution;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
+use collection::shards::shard::PeerId;
 
 use super::TableOfContent;
 use crate::content_manager::collection_meta_ops::*;
@@ -14,7 +14,7 @@ use crate::content_manager::collections_ops::Checker as _;
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus_ops::ConsensusOperations;
 use crate::content_manager::errors::StorageError;
-use crate::content_manager::{consensus_manager, CollectionContainer};
+use crate::content_manager::{CollectionContainer, consensus_manager};
 
 impl CollectionContainer for TableOfContent {
     fn perform_collection_meta_op(
@@ -77,19 +77,19 @@ impl CollectionContainer for TableOfContent {
             for collection in collections.values() {
                 let finish_shard_initialize = Self::change_peer_state_callback(
                     self.consensus_proposal_sender.clone(),
-                    collection.name(),
+                    collection.name().to_string(),
                     ReplicaState::Active,
                     Some(ReplicaState::Initializing),
                 );
                 let convert_to_listener_callback = Self::change_peer_state_callback(
                     self.consensus_proposal_sender.clone(),
-                    collection.name(),
+                    collection.name().to_string(),
                     ReplicaState::Listener,
                     Some(ReplicaState::Active),
                 );
                 let convert_from_listener_to_active_callback = Self::change_peer_state_callback(
                     self.consensus_proposal_sender.clone(),
-                    collection.name(),
+                    collection.name().to_string(),
                     ReplicaState::Active,
                     Some(ReplicaState::Listener),
                 );
@@ -177,7 +177,7 @@ impl TableOfContent {
                     let shard_distribution =
                         CollectionShardDistribution::from_shards_info(state.shards.clone());
                     let collection = Collection::new(
-                        id.to_string(),
+                        id.clone(),
                         self.this_peer_id,
                         &collection_path,
                         &snapshots_path,
@@ -186,28 +186,29 @@ impl TableOfContent {
                             .to_shared_storage_config(self.is_distributed())
                             .into(),
                         shard_distribution,
+                        Some(state.shards_key_mapping.clone()),
                         self.channel_service.clone(),
                         Self::change_peer_from_state_callback(
                             self.consensus_proposal_sender.clone(),
-                            id.to_string(),
+                            id.clone(),
                             ReplicaState::Dead,
                         ),
                         Self::request_shard_transfer_callback(
                             self.consensus_proposal_sender.clone(),
-                            id.to_string(),
+                            id.clone(),
                         ),
                         Self::abort_shard_transfer_callback(
                             self.consensus_proposal_sender.clone(),
-                            id.to_string(),
+                            id.clone(),
                         ),
                         Some(self.search_runtime.handle().clone()),
                         Some(self.update_runtime.handle().clone()),
-                        self.optimizer_cpu_budget.clone(),
+                        self.optimizer_resource_budget.clone(),
                         self.storage_config.optimizers_overwrite.clone(),
                     )
                     .await?;
                     collections.validate_collection_not_exists(id)?;
-                    collections.insert(id.to_string(), collection);
+                    collections.insert(id.clone(), Arc::new(collection));
                 }
 
                 let Some(collection) = collections.get(id) else {
@@ -227,8 +228,7 @@ impl TableOfContent {
                                 ))
                             {
                                 log::error!(
-                                    "Can't report transfer progress to consensus: {}",
-                                    error
+                                    "Can't report transfer progress to consensus: {error}"
                                 )
                             };
                         };
@@ -244,14 +244,15 @@ impl TableOfContent {
                 // if collection has been created during snapshot application
                 if !collection_exists {
                     for shard_id in collection.get_local_shards().await {
-                        collection
-                            .set_shard_replica_state(
-                                shard_id,
-                                self.this_peer_id,
-                                ReplicaState::Dead,
-                                None,
-                            )
-                            .await?;
+                        let shard_holder = collection.shards_holder().read_owned().await;
+
+                        let Some(replica_set) = shard_holder.get_shard(shard_id) else {
+                            continue;
+                        };
+
+                        if replica_set.is_local().await {
+                            replica_set.add_locally_disabled(None, self.this_peer_id, None);
+                        }
                     }
                 }
             }
@@ -310,10 +311,8 @@ impl TableOfContent {
                 );
                 if let Err(send_error) = proposal_sender.send(operation) {
                     log::error!(
-                        "Can't send proposal to abort transfer of shard {} of collection {}. Error: {}",
+                        "Can't send proposal to abort transfer of shard {} of collection {collection_name}. Error: {send_error}",
                         transfer.shard_id,
-                        collection_name,
-                        send_error
                     );
                 }
             }
@@ -329,10 +328,8 @@ impl TableOfContent {
                     ConsensusOperations::finish_transfer(collection_name.clone(), transfer.clone());
                 if let Err(send_error) = proposal_sender.send(operation) {
                     log::error!(
-                        "Can't send proposal to complete transfer of shard {} of collection {}. Error: {}",
+                        "Can't send proposal to complete transfer of shard {} of collection {collection_name}. Error: {send_error}",
                         transfer.shard_id,
-                        collection_name,
-                        send_error
                     );
                 }
             }

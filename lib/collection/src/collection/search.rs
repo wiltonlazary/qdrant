@@ -1,16 +1,16 @@
-use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use futures::{future, TryFutureExt};
+use futures::{TryFutureExt, future};
 use itertools::{Either, Itertools};
-use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     ExtendedPointId, Filter, Order, ScoredPoint, WithPayloadInterface, WithVector,
 };
+use shard::retrieve::record_internal::RecordInternal;
+use shard::search::CoreSearchRequestBatch;
 use tokio::time::Instant;
 
 use super::Collection;
@@ -20,6 +20,7 @@ use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 
 impl Collection {
+    #[cfg(feature = "testing")]
     pub async fn search(
         &self,
         request: CoreSearchRequest,
@@ -60,20 +61,15 @@ impl Collection {
         if request.searches.iter().all(|s| s.limit == 0) {
             return Ok(vec![]);
         }
-        // A factor which determines if we need to use the 2-step search or not
-        // Should be adjusted based on usage statistics.
-        const PAYLOAD_TRANSFERS_FACTOR_THRESHOLD: usize = 10;
 
         let is_payload_required = request
             .searches
             .iter()
-            .all(|s| s.with_payload.clone().is_some_and(|p| p.is_required()));
-        let with_vectors = request.searches.iter().all(|s| {
-            s.with_vector
-                .as_ref()
-                .map(|wv| wv.is_enabled())
-                .unwrap_or(false)
-        });
+            .all(|s| s.with_payload.as_ref().is_some_and(|p| p.is_required()));
+        let with_vectors = request
+            .searches
+            .iter()
+            .all(|s| s.with_vector.as_ref().is_some_and(|wv| wv.is_enabled()));
 
         let metadata_required = is_payload_required || with_vectors;
 
@@ -85,8 +81,8 @@ impl Collection {
         // Actually used number of records.
         let used_transfers = sum_limits;
 
-        let is_required_transfer_large_enough =
-            require_transfers > used_transfers.saturating_mul(PAYLOAD_TRANSFERS_FACTOR_THRESHOLD);
+        let is_required_transfer_large_enough = require_transfers
+            > used_transfers.saturating_mul(super::query::PAYLOAD_TRANSFERS_FACTOR_THRESHOLD);
 
         if metadata_required && is_required_transfer_large_enough {
             // If there is a significant offset, we need to retrieve the whole result
@@ -96,8 +92,12 @@ impl Collection {
             let mut without_payload_requests = Vec::with_capacity(request.searches.len());
             for search in &request.searches {
                 let mut without_payload_request = search.clone();
-                without_payload_request.with_payload = None;
-                without_payload_request.with_vector = None;
+                without_payload_request
+                    .with_payload
+                    .replace(WithPayloadInterface::Bool(false));
+                without_payload_request
+                    .with_vector
+                    .replace(WithVector::Bool(false));
                 without_payload_requests.push(without_payload_request);
             }
             let without_payload_batch = CoreSearchRequestBatch {
@@ -116,7 +116,7 @@ impl Collection {
             let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
             let filled_results = without_payload_results
                 .into_iter()
-                .zip(request.clone().searches.into_iter())
+                .zip(request.searches.into_iter())
                 .map(|(without_payload_result, req)| {
                     self.fill_search_result_with_payload(
                         without_payload_result,
@@ -239,7 +239,7 @@ impl Collection {
             )
             .await?;
 
-        let mut records_map: HashMap<ExtendedPointId, RecordInternal> = retrieved_records
+        let mut records_map: AHashMap<ExtendedPointId, RecordInternal> = retrieved_records
             .into_iter()
             .map(|rec| (rec.id, rec))
             .collect();
@@ -251,7 +251,7 @@ impl Collection {
                 // So we just filter out them.
                 records_map.remove(&scored_point.id).map(|record| {
                     scored_point.payload = record.payload;
-                    scored_point.vector = record.vector.map(VectorStructInternal::from);
+                    scored_point.vector = record.vector;
                     scored_point
                 })
             })
@@ -286,7 +286,7 @@ impl Collection {
 
             let results_from_shards = all_searches_res
                 .iter_mut()
-                .map(|res| mem::take(&mut res[batch_index]));
+                .map(|res| res.get_mut(batch_index).map_or(Vec::new(), mem::take));
 
             let merged_iter = match order {
                 Order::LargeBetter => Either::Left(results_from_shards.kmerge_by(|a, b| a > b)),
@@ -318,7 +318,7 @@ impl Collection {
         duration: Duration,
         filters: impl IntoIterator<Item = Option<&'a Filter>>,
     ) {
-        if duration > segment::problems::UnindexedField::slow_query_threshold() {
+        if duration > crate::problems::UnindexedField::slow_query_threshold() {
             let filters = filters.into_iter().flatten().cloned().collect_vec();
 
             let schema = self.payload_index_schema.read().schema.clone();

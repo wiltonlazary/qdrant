@@ -5,8 +5,8 @@ use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 
-use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
 use crate::payload_storage::PayloadStorage;
+use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
 use crate::types::{OwnedPayloadRef, Payload};
 
 #[derive(Clone)]
@@ -38,6 +38,7 @@ impl PayloadProvider {
             PayloadStorageEnum::InMemoryPayloadStorage(s) => {
                 s.payload_ptr(point_id).map(OwnedPayloadRef::from)
             }
+            #[cfg(feature = "rocksdb")]
             PayloadStorageEnum::SimplePayloadStorage(s) => {
                 s.payload_ptr(point_id).map(OwnedPayloadRef::from)
             }
@@ -54,6 +55,7 @@ impl PayloadProvider {
             // The alternative:
             // Rewrite condition checking code to support error reporting.
             // Which may lead to slowdown and assumes a lot of changes.
+            #[cfg(feature = "rocksdb")]
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s
                 .read_payload(point_id, hw_counter)
                 .unwrap_or_else(|err| panic!("Payload storage is corrupted: {err}"))

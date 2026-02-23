@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 //use atomic_refcell::{AtomicRef, AtomicRefCell};
-use rocksdb::{ColumnFamily, DBRecoveryMode, LogLevel, Options, WriteOptions, DB};
+use rocksdb::{ColumnFamily, DB, DBRecoveryMode, LogLevel, Options, WriteOptions};
 
+use crate::common::Flusher;
 //use crate::common::arc_rwlock_iterator::ArcRwLockIterator;
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::common::Flusher;
 
 const DB_CACHE_SIZE: usize = 10 * 1024 * 1024; // 10 mb
 const DB_MAX_LOG_SIZE: usize = 1024 * 1024; // 1 mb
@@ -75,11 +75,32 @@ pub fn open_db<T: AsRef<str>>(
     path: &Path,
     vector_paths: &[T],
 ) -> Result<Arc<RwLock<DB>>, rocksdb::Error> {
-    let mut column_families = vec![DB_PAYLOAD_CF, DB_MAPPING_CF, DB_VERSIONS_CF, DB_DEFAULT_CF];
+    let options = make_db_options();
+    let mut column_families = vec![DB_PAYLOAD_CF, DB_DEFAULT_CF];
+
+    // We're using new ID tracker, only add RocksDB ID tracker column families if they already exist
+    // Not adding them prevents older Qdrant versions from trying to load the unused RocksDB ID tracker
+    {
+        let exists = check_db_exists(path);
+        let existing_column_families = if exists {
+            DB::list_cf(&options, path)?
+        } else {
+            vec![]
+        };
+
+        // Add column families to create or open
+        // - on database creation: always add CFs
+        // - on database open: only add CFs if they already exist
+        column_families.extend(
+            [DB_MAPPING_CF, DB_VERSIONS_CF]
+                .into_iter()
+                .filter(|cf| !exists || existing_column_families.iter().any(|other| other == cf)),
+        );
+    }
+
     for vector_path in vector_paths {
         column_families.push(vector_path.as_ref());
     }
-    let options = make_db_options();
     // Make sure that all column families have the same options
     let column_with_options = column_families
         .into_iter()
@@ -183,7 +204,7 @@ impl DatabaseColumnWrapper {
         Ok(())
     }
 
-    pub fn lock_db(&self) -> LockedDatabaseColumnWrapper {
+    pub fn lock_db(&self) -> LockedDatabaseColumnWrapper<'_> {
         LockedDatabaseColumnWrapper {
             guard: self.database.read(),
             column_name: &self.column_name,
@@ -196,15 +217,9 @@ impl DatabaseColumnWrapper {
         Box::new(move || {
             let db = database.read();
             let Some(column_family) = db.cf_handle(&column_name) else {
-                // It is possible, that the index was removed during the flush by user or another thread.
-                // In this case, non-existing column family is not an error, but an expected behavior.
-
-                // Still we want to log this event, for potential debugging.
-                log::warn!(
-                    "Flush: RocksDB cf_handle error: Cannot find column family {}. Ignoring",
-                    &column_name
-                );
-                return Ok(()); // ignore error
+                return Err(OperationError::RocksDbColumnFamilyNotFound {
+                    name: column_name.clone(),
+                });
             };
 
             db.flush_cf(column_family).map_err(|err| {
@@ -257,12 +272,10 @@ impl DatabaseColumnWrapper {
         &self,
         db: &'a parking_lot::RwLockReadGuard<'_, DB>,
     ) -> OperationResult<&'a ColumnFamily> {
-        db.cf_handle(&self.column_name).ok_or_else(|| {
-            OperationError::service_error(format!(
-                "RocksDB cf_handle error: Cannot find column family {}",
-                &self.column_name
-            ))
-        })
+        db.cf_handle(&self.column_name)
+            .ok_or_else(|| OperationError::RocksDbColumnFamilyNotFound {
+                name: self.column_name.clone(),
+            })
     }
 
     pub fn get_database(&self) -> Arc<RwLock<DB>> {
@@ -285,7 +298,7 @@ impl DatabaseColumnWrapper {
 }
 
 impl LockedDatabaseColumnWrapper<'_> {
-    pub fn iter(&self) -> OperationResult<DatabaseColumnIterator> {
+    pub fn iter(&self) -> OperationResult<DatabaseColumnIterator<'_>> {
         DatabaseColumnIterator::new(&self.guard, self.column_name)
     }
 }

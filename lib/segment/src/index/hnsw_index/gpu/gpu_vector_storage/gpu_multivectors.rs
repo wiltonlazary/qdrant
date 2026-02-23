@@ -3,22 +3,24 @@ use std::sync::Arc;
 
 use common::types::PointOffsetType;
 use quantization::EncodedVectors;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::gpu_quantization::MAX_QUANTIZATION_BINDINGS;
 use super::STORAGES_COUNT;
+use super::gpu_quantization::MAX_QUANTIZATION_BINDINGS;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::primitive::PrimitiveVectorElement;
-use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
 use crate::index::hnsw_index::gpu::GPU_TIMEOUT;
+use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
 use crate::vector_storage::quantized::quantized_multivector_storage::{
     MultivectorOffsetsStorage, QuantizedMultivectorStorage,
 };
-use crate::vector_storage::MultiVectorStorage;
+use crate::vector_storage::{MultiVectorStorage, Random};
 
 // Multivector shader binding is after vectot data and quantization data bindings.
 const START_MULTIVECTORS_BINDING: usize = STORAGES_COUNT + MAX_QUANTIZATION_BINDINGS;
 
 /// Shader struct for multivector offsets with start id and count of vectors in multivector.
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 struct GpuMultivectorOffset {
     start: u32,
@@ -56,13 +58,11 @@ impl ShaderBuilderParameters for GpuMultivectors {
 impl GpuMultivectors {
     /// Construct multivectors data from quantized storage.
     pub fn new_quantized<
-        TEncodedQuery: Sized,
-        QuantizedStorage: EncodedVectors<TEncodedQuery>,
+        QuantizedStorage: EncodedVectors,
         TMultivectorOffsetsStorage: MultivectorOffsetsStorage,
     >(
         device: Arc<gpu::Device>,
         quantized_storage: &QuantizedMultivectorStorage<
-            TEncodedQuery,
             QuantizedStorage,
             TMultivectorOffsetsStorage,
         >,
@@ -89,7 +89,7 @@ impl GpuMultivectors {
                 // map ID to count of vectors in multivector
                 .map(|id| {
                     vector_storage
-                        .get_multi(id as PointOffsetType)
+                        .get_multi::<Random>(id as PointOffsetType)
                         .vectors_count()
                 })
                 // Map count of vectors to start and count of vectors in multivector.

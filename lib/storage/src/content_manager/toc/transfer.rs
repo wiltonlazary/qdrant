@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use collection::operations::types::{CollectionError, CollectionResult};
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::CollectionId;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId};
 use collection::shards::transfer::{ShardTransfer, ShardTransferConsensus, ShardTransferKey};
-use collection::shards::CollectionId;
 
 use super::dispatcher::TocDispatcher;
 use crate::content_manager::collection_meta_ops::{
@@ -125,6 +125,7 @@ impl ShardTransferConsensus for TocDispatcher {
 
     async fn set_shard_replica_set_state(
         &self,
+        peer_id: Option<PeerId>,
         collection_id: CollectionId,
         shard_id: ShardId,
         state: ReplicaState,
@@ -133,7 +134,7 @@ impl ShardTransferConsensus for TocDispatcher {
         let operation = ConsensusOperations::set_replica_state(
             collection_id,
             shard_id,
-            self.this_peer_id(),
+            peer_id.unwrap_or_else(|| self.this_peer_id()),
             state,
             from_state,
         );

@@ -1,12 +1,12 @@
 [package]
 name = "api"
-version = "1.13.4"
+version = "1.17.0"
 authors = [
     "Andrey Vasnetsov <andrey@vasnetsov.com>",
     "Qdrant Team <info@qdrant.tech>",
 ]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 
 [lints]
 workspace = true
@@ -15,6 +15,7 @@ workspace = true
 tracing = ["dep:tracing", "segment/tracing"]
 
 [dependencies]
+ahash = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 prost-wkt-types = { workspace = true }
@@ -29,9 +30,10 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 validator = { workspace = true }
 itertools = { workspace = true }
+ordered-float = { workspace = true }
 
 common = { path = "../common/common" }
-segment = { path = "../segment" }
+segment = { path = "../segment", default-features = false }
 sparse = { path = "../sparse" }
 
 tracing = { workspace = true, optional = true }

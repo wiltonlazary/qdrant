@@ -4,14 +4,16 @@ use std::sync::Arc;
 use common::types::TelemetryDetail;
 use parking_lot::Mutex;
 use schemars::JsonSchema;
-use segment::common::anonymize::Anonymize;
+use segment::common::anonymize::{Anonymize, anonymize_collection_values};
 use segment::common::operation_time_statistics::{
     OperationDurationStatistics, OperationDurationsAggregator, ScopeDurationMeasurer,
 };
 use serde::Serialize;
-use storage::rbac::{Access, AccessRequirements};
+use storage::rbac::{AccessRequirements, Auth};
 
 pub type HttpStatusCode = u16;
+
+pub type GrpcStatusCode = i32;
 
 #[derive(Serialize, Clone, Default, Debug, JsonSchema)]
 pub struct WebApiTelemetry {
@@ -20,7 +22,7 @@ pub struct WebApiTelemetry {
 
 #[derive(Serialize, Clone, Default, Debug, JsonSchema)]
 pub struct GrpcTelemetry {
-    pub responses: HashMap<String, OperationDurationStatistics>,
+    pub responses: HashMap<String, HashMap<GrpcStatusCode, OperationDurationStatistics>>,
 }
 
 pub struct ActixTelemetryCollector {
@@ -38,7 +40,7 @@ pub struct TonicTelemetryCollector {
 
 #[derive(Default)]
 pub struct TonicWorkerTelemetryCollector {
-    methods: HashMap<String, Arc<Mutex<OperationDurationsAggregator>>>,
+    methods: HashMap<String, HashMap<GrpcStatusCode, Arc<Mutex<OperationDurationsAggregator>>>>,
 }
 
 impl ActixTelemetryCollector {
@@ -76,18 +78,29 @@ impl TonicTelemetryCollector {
 }
 
 impl TonicWorkerTelemetryCollector {
-    pub fn add_response(&mut self, method: String, instant: std::time::Instant) {
+    pub fn add_response(
+        &mut self,
+        method: String,
+        instant: std::time::Instant,
+        status_code: GrpcStatusCode,
+    ) {
         let aggregator = self
             .methods
             .entry(method)
+            .or_default()
+            .entry(status_code)
             .or_insert_with(OperationDurationsAggregator::new);
         ScopeDurationMeasurer::new_with_instant(aggregator, instant);
     }
 
     pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> GrpcTelemetry {
         let mut responses = HashMap::new();
-        for (method, aggregator) in self.methods.iter() {
-            responses.insert(method.clone(), aggregator.lock().get_statistics(detail));
+        for (method, status_codes) in &self.methods {
+            let mut status_codes_map = HashMap::new();
+            for (status_code, aggregator) in status_codes {
+                status_codes_map.insert(*status_code, aggregator.lock().get_statistics(detail));
+            }
+            responses.insert(method.clone(), status_codes_map);
         }
         GrpcTelemetry { responses }
     }
@@ -124,9 +137,12 @@ impl ActixWorkerTelemetryCollector {
 
 impl GrpcTelemetry {
     pub fn merge(&mut self, other: &GrpcTelemetry) {
-        for (method, other_statistics) in &other.responses {
+        for (method, success_map) in &other.responses {
             let entry = self.responses.entry(method.clone()).or_default();
-            *entry = entry.clone() + other_statistics.clone();
+            for (is_success, statistics) in success_map {
+                let status_entry = entry.entry(*is_success).or_default();
+                *status_entry = status_entry.clone() + statistics.clone();
+            }
         }
     }
 }
@@ -143,7 +159,7 @@ impl WebApiTelemetry {
     }
 }
 
-#[derive(Serialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
 pub struct RequestsTelemetry {
     pub rest: WebApiTelemetry,
     pub grpc: GrpcTelemetry,
@@ -151,13 +167,16 @@ pub struct RequestsTelemetry {
 
 impl RequestsTelemetry {
     pub fn collect(
-        access: &Access,
+        auth: &Auth,
         actix_collector: &ActixTelemetryCollector,
         tonic_collector: &TonicTelemetryCollector,
         detail: TelemetryDetail,
     ) -> Option<Self> {
-        let global_access = AccessRequirements::new().whole();
-        if access.check_global_access(global_access).is_ok() {
+        let global_access = AccessRequirements::new();
+        if auth
+            .check_global_access(global_access, "telemetry_requests")
+            .is_ok()
+        {
             let rest = actix_collector.get_telemetry_data(detail);
             let grpc = tonic_collector.get_telemetry_data(detail);
             Some(Self { rest, grpc })
@@ -167,26 +186,12 @@ impl RequestsTelemetry {
     }
 }
 
-impl Anonymize for RequestsTelemetry {
-    fn anonymize(&self) -> Self {
-        let rest = self.rest.anonymize();
-        let grpc = self.grpc.anonymize();
-        Self { rest, grpc }
-    }
-}
-
 impl Anonymize for WebApiTelemetry {
     fn anonymize(&self) -> Self {
         let responses = self
             .responses
             .iter()
-            .map(|(key, value)| {
-                let value: HashMap<_, _> = value
-                    .iter()
-                    .map(|(key, value)| (*key, value.anonymize()))
-                    .collect();
-                (key.clone(), value)
-            })
+            .map(|(key, value)| (key.clone(), anonymize_collection_values(value)))
             .collect();
 
         WebApiTelemetry { responses }
@@ -198,7 +203,7 @@ impl Anonymize for GrpcTelemetry {
         let responses = self
             .responses
             .iter()
-            .map(|(key, value)| (key.clone(), value.anonymize()))
+            .map(|(key, value)| (key.clone(), anonymize_collection_values(value)))
             .collect();
 
         GrpcTelemetry { responses }

@@ -1,5 +1,9 @@
 <p align="center">
-  <img height="100" src="https://github.com/qdrant/qdrant/raw/master/docs/logo.svg" alt="Qdrant">
+  <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://github.com/qdrant/qdrant/raw/master/docs/logo-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="https://github.com/qdrant/qdrant/raw/master/docs/logo-light.svg">
+      <img height="100" alt="Qdrant" src="https://github.com/qdrant/qdrant/raw/master/docs/logo.svg">
+  </picture>
 </p>
 
 <p align="center">
@@ -11,7 +15,7 @@
     <a href="https://api.qdrant.tech/"><img src="https://img.shields.io/badge/Docs-OpenAPI%203.0-success?style=flat-square" alt="OpenAPI Docs"></a>
     <a href="https://github.com/qdrant/qdrant/blob/master/LICENSE"><img src="https://img.shields.io/github/license/qdrant/qdrant?style=flat-square" alt="Apache 2.0 License"></a>
     <a href="https://qdrant.to/discord"><img src="https://img.shields.io/discord/907569970500743200?logo=Discord&style=flat-square&color=7289da" alt="Discord"></a>
-    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2024-bc1439.svg?style=flat-square" alt="Roadmap 2024"></a>
+    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2025-bc1439.svg?style=flat-square" alt="Roadmap 2025"></a>
     <a href="https://cloud.qdrant.io/"><img src="https://img.shields.io/badge/Qdrant-Cloud-24386C.svg?logo=cloud&style=flat-square" alt="Qdrant Cloud"></a>
 </p>
 
@@ -56,6 +60,9 @@ To experience the full power of Qdrant locally, run the container with this comm
 docker run -p 6333:6333 qdrant/qdrant
 ```
 
+> [!CAUTION]
+> Starts an insecure deployment without authentication open to all network interfaces. Please refer to [secure your instance](https://qdrant.tech/documentation/guides/security/#secure-your-instance).
+
 Now you can connect to this with any client, including Python:
 
 ```python
@@ -88,7 +95,7 @@ Qdrant offers the following client libraries to help you integrate it into your 
 - Detailed [Documentation](https://qdrant.tech/documentation/) are great starting points
 - [Step-by-Step Tutorial](https://qdrant.to/qdrant-tutorial) to create your first neural network project with Qdrant
 
-## Demo Projects  <a href="https://replit.com/@qdrant"><img align="right" src="https://replit.com/badge/github/qdrant/qdrant" alt="Run on Repl.it"></a>
+## Demo Projects<a href="https://replit.com/@qdrant"><img align="right" src="https://replit.com/badge/github/qdrant/qdrant" alt="Run on Repl.it"></a>
 
 ### Discover Semantic Text Search 🔍
 

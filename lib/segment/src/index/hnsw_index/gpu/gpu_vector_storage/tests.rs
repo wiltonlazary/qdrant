@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use bitvec::vec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
 use parking_lot::RwLock;
 use rand::rngs::StdRng;
@@ -11,26 +10,26 @@ use rocksdb::DB;
 use rstest::rstest;
 
 use super::*;
-use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use crate::data_types::vectors::{MultiDenseVectorInternal, QueryVector, VectorRef};
 use crate::fixtures::index_fixtures::random_vector;
 use crate::fixtures::payload_fixtures::random_dense_byte_vector;
 use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilder;
-use crate::spaces::metric::Metric;
-use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
 use crate::types::{
-    BinaryQuantization, BinaryQuantizationConfig, Distance, ProductQuantization,
-    ProductQuantizationConfig, QuantizationConfig, ScalarQuantization, ScalarQuantizationConfig,
+    BinaryQuantization, BinaryQuantizationConfig, BinaryQuantizationEncoding, Distance,
+    ProductQuantization, ProductQuantizationConfig, QuantizationConfig, ScalarQuantization,
+    ScalarQuantizationConfig,
 };
 use crate::vector_storage::dense::simple_dense_vector_storage::{
-    open_simple_dense_byte_vector_storage, open_simple_dense_half_vector_storage,
-    open_simple_dense_vector_storage,
+    open_simple_dense_byte_vector_storage, open_simple_dense_full_vector_storage,
+    open_simple_dense_half_vector_storage,
 };
 use crate::vector_storage::multi_dense::simple_multi_dense_vector_storage::{
-    open_simple_multi_dense_vector_storage, open_simple_multi_dense_vector_storage_byte,
+    open_simple_multi_dense_vector_storage_byte, open_simple_multi_dense_vector_storage_full,
     open_simple_multi_dense_vector_storage_half,
 };
-use crate::vector_storage::{new_raw_scorer_for_test, RawScorer};
+use crate::vector_storage::quantized::quantized_vectors::QuantizedVectorsStorageType;
+use crate::vector_storage::{DEFAULT_STOPPED, RawScorer, new_raw_scorer_for_test};
 
 #[derive(Debug, Clone, Copy)]
 enum TestElementType {
@@ -55,25 +54,65 @@ impl TestStorageType {
 }
 
 #[rstest]
+#[case::cosine_f32(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::dot_f32(
+    Distance::Dot,
+    TestStorageType::Dense(TestElementType::Float32),
+    256,
+    512
+)]
+#[case::euclid_f32(
+    Distance::Euclid,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::manhattan_f32(
+    Distance::Manhattan,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::small_dimension(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    2057
+)]
+#[case::cosine_f16(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float16),
+    273,
+    2057
+)]
+#[case::cosine_u8(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Uint8),
+    273,
+    2057
+)]
+#[case::cosine_multi_f32(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float32),
+    67,
+    2057
+)]
+#[case::cosine_multi_u8(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Uint8),
+    273,
+    2057
+)]
 fn test_gpu_vector_storage_sq(
-    #[values(Distance::Cosine, Distance::Dot, Distance::Euclid, Distance::Manhattan)]
-    distance: Distance,
-    #[values(
-        TestStorageType::Dense(TestElementType::Float32),
-        TestStorageType::Dense(TestElementType::Float16),
-        TestStorageType::Dense(TestElementType::Uint8),
-        TestStorageType::Multi(TestElementType::Float32),
-        TestStorageType::Multi(TestElementType::Float16),
-        TestStorageType::Multi(TestElementType::Uint8)
-    )]
-    storage_type: TestStorageType,
-    #[values(
-        15,
-        512,
-        256 + 17,
-    )]
-    dim: usize,
-    #[values(2048 + 17)] num_vectors: usize,
+    #[case] distance: Distance,
+    #[case] storage_type: TestStorageType,
+    #[case] dim: usize,
+    #[case] num_vectors: usize,
 ) {
     let _ = env_logger::builder()
         .is_test(true)
@@ -90,11 +129,7 @@ fn test_gpu_vector_storage_sq(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing SQ distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing SQ distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -109,20 +144,75 @@ fn test_gpu_vector_storage_sq(
 }
 
 #[rstest]
+#[case::cosine_f32_one_bit(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
+#[case::dot_f32_one_and_half_bits(
+    Distance::Dot,
+    TestStorageType::Dense(TestElementType::Float32),
+    256,
+    512,
+    BinaryQuantizationEncoding::OneAndHalfBits
+)]
+#[case::euclid_f32(
+    Distance::Euclid,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
+#[case::manhattan_f32_two_bits(
+    Distance::Manhattan,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057,
+    BinaryQuantizationEncoding::TwoBits
+)]
+#[case::small_dimension(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
+#[case::cosine_f16(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float16),
+    273,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
+#[case::cosine_u8(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Uint8),
+    273,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
+#[case::cosine_multi_f32(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float32),
+    67,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
+#[case::cosine_multi_u8(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Uint8),
+    273,
+    2057,
+    BinaryQuantizationEncoding::OneBit
+)]
 fn test_gpu_vector_storage_bq(
-    #[values(Distance::Cosine, Distance::Dot, Distance::Euclid, Distance::Manhattan)]
-    distance: Distance,
-    #[values(
-        TestStorageType::Dense(TestElementType::Float32),
-        TestStorageType::Dense(TestElementType::Float16),
-        TestStorageType::Dense(TestElementType::Uint8),
-        TestStorageType::Multi(TestElementType::Float32),
-        TestStorageType::Multi(TestElementType::Float16),
-        TestStorageType::Multi(TestElementType::Uint8)
-    )]
-    storage_type: TestStorageType,
-    #[values(15, 1536, 256 + 17)] dim: usize,
-    #[values(2048 + 17)] num_vectors: usize,
+    #[case] distance: Distance,
+    #[case] storage_type: TestStorageType,
+    #[case] dim: usize,
+    #[case] num_vectors: usize,
+    #[case] encoding: BinaryQuantizationEncoding,
 ) {
     let _ = env_logger::builder()
         .is_test(true)
@@ -132,16 +222,14 @@ fn test_gpu_vector_storage_bq(
     let quantization_config = QuantizationConfig::Binary(BinaryQuantization {
         binary: BinaryQuantizationConfig {
             always_ram: Some(true),
+            encoding: Some(encoding),
+            query_encoding: None,
         },
     });
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing BQ distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing BQ distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -156,18 +244,65 @@ fn test_gpu_vector_storage_bq(
 }
 
 #[rstest]
+#[case::cosine_f32(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    2057
+)]
+#[case::dot_f32(
+    Distance::Dot,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    512
+)]
+#[case::euclid_f32(
+    Distance::Euclid,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    2057
+)]
+#[case::manhattan_f32(
+    Distance::Manhattan,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    2057
+)]
+#[case::large_dimension(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    129,
+    1095
+)]
+#[case::cosine_f16(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float16),
+    17,
+    2057
+)]
+#[case::cosine_u8(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Uint8),
+    17,
+    2057
+)]
+#[case::cosine_multi_f32(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float32),
+    17,
+    2057
+)]
+#[case::cosine_multi_u8(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Uint8),
+    17,
+    2057
+)]
 fn test_gpu_vector_storage_pq(
-    #[values(Distance::Cosine, Distance::Dot, Distance::Euclid, Distance::Manhattan)]
-    distance: Distance,
-    #[values(
-        TestStorageType::Dense(TestElementType::Float32),
-        TestStorageType::Dense(TestElementType::Float16),
-        TestStorageType::Multi(TestElementType::Float32),
-        TestStorageType::Multi(TestElementType::Float16)
-    )]
-    storage_type: TestStorageType,
-    #[values(15, 256 + 17)] dim: usize,
-    #[values(512 + 17)] num_vectors: usize,
+    #[case] distance: Distance,
+    #[case] storage_type: TestStorageType,
+    #[case] dim: usize,
+    #[case] num_vectors: usize,
 ) {
     let _ = env_logger::builder()
         .is_test(true)
@@ -183,11 +318,7 @@ fn test_gpu_vector_storage_pq(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing PQ distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing PQ distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -202,25 +333,65 @@ fn test_gpu_vector_storage_pq(
 }
 
 #[rstest]
+#[case::cosine_f32(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::dot_f32(
+    Distance::Dot,
+    TestStorageType::Dense(TestElementType::Float32),
+    256,
+    512
+)]
+#[case::euclid_f32(
+    Distance::Euclid,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::manhattan_f32(
+    Distance::Manhattan,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::small_dimension(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    17,
+    2057
+)]
+#[case::cosine_f16(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float16),
+    273,
+    2057
+)]
+#[case::cosine_u8(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Uint8),
+    273,
+    2057
+)]
+#[case::cosine_multi_f32(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float32),
+    67,
+    2057
+)]
+#[case::cosine_multi_u8(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Uint8),
+    273,
+    2057
+)]
 fn test_gpu_vector_storage(
-    #[values(Distance::Cosine, Distance::Dot, Distance::Euclid, Distance::Manhattan)]
-    distance: Distance,
-    #[values(
-        TestStorageType::Dense(TestElementType::Float32),
-        TestStorageType::Dense(TestElementType::Float16),
-        TestStorageType::Dense(TestElementType::Uint8),
-        TestStorageType::Multi(TestElementType::Float32),
-        TestStorageType::Multi(TestElementType::Float16),
-        TestStorageType::Multi(TestElementType::Uint8)
-    )]
-    storage_type: TestStorageType,
-    #[values(
-        15,
-        512,
-        256 + 17,
-    )]
-    dim: usize,
-    #[values(2048 + 17)] num_vectors: usize,
+    #[case] distance: Distance,
+    #[case] storage_type: TestStorageType,
+    #[case] dim: usize,
+    #[case] num_vectors: usize,
 ) {
     let _ = env_logger::builder()
         .is_test(true)
@@ -229,11 +400,7 @@ fn test_gpu_vector_storage(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -248,16 +415,23 @@ fn test_gpu_vector_storage(
 }
 
 #[rstest]
+#[case::cosine_dense(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::cosine_multi(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float32),
+    67,
+    2057
+)]
 fn test_gpu_vector_storage_force_half(
-    #[values(Distance::Cosine, Distance::Dot, Distance::Euclid, Distance::Manhattan)]
-    distance: Distance,
-    #[values(
-        TestStorageType::Dense(TestElementType::Float32),
-        TestStorageType::Multi(TestElementType::Float32)
-    )]
-    storage_type: TestStorageType,
-    #[values(15, 256 + 17)] dim: usize,
-    #[values(2048 + 17)] num_vectors: usize,
+    #[case] distance: Distance,
+    #[case] storage_type: TestStorageType,
+    #[case] dim: usize,
+    #[case] num_vectors: usize,
 ) {
     let _ = env_logger::builder()
         .is_test(true)
@@ -266,11 +440,7 @@ fn test_gpu_vector_storage_force_half(
 
     let precision = 5.0 * get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -285,17 +455,35 @@ fn test_gpu_vector_storage_force_half(
 }
 
 #[rstest]
+#[case::dense_f32(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float32),
+    273,
+    2057
+)]
+#[case::dense_f16(
+    Distance::Cosine,
+    TestStorageType::Dense(TestElementType::Float16),
+    273,
+    2057
+)]
+#[case::multi_f32(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float32),
+    67,
+    2057
+)]
+#[case::multi_f16(
+    Distance::Cosine,
+    TestStorageType::Multi(TestElementType::Float16),
+    67,
+    2057
+)]
 fn test_gpu_vector_storage_without_half(
-    #[values(Distance::Cosine)] distance: Distance,
-    #[values(
-        TestStorageType::Dense(TestElementType::Float32),
-        TestStorageType::Multi(TestElementType::Float32),
-        TestStorageType::Dense(TestElementType::Float16),
-        TestStorageType::Multi(TestElementType::Float16)
-    )]
-    storage_type: TestStorageType,
-    #[values(15)] dim: usize,
-    #[values(2048 + 17)] num_vectors: usize,
+    #[case] distance: Distance,
+    #[case] storage_type: TestStorageType,
+    #[case] dim: usize,
+    #[case] num_vectors: usize,
 ) {
     let _ = env_logger::builder()
         .is_test(true)
@@ -304,11 +492,7 @@ fn test_gpu_vector_storage_without_half(
 
     let precision = 5.0 * get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -374,18 +558,14 @@ fn create_vector_storage_f32(
 ) -> VectorStorageEnum {
     let mut rnd = StdRng::seed_from_u64(42);
     let mut vector_storage =
-        open_simple_dense_vector_storage(db, DB_VECTOR_CF, dim, distance, &false.into()).unwrap();
+        open_simple_dense_full_vector_storage(db, DB_VECTOR_CF, dim, distance, &false.into())
+            .unwrap();
     for i in 0..num_vectors {
         let vec = random_vector(&mut rnd, dim);
-        let vec = match distance {
-            Distance::Cosine => <CosineMetric as Metric<VectorElementType>>::preprocess(vec),
-            Distance::Euclid => <EuclidMetric as Metric<VectorElementType>>::preprocess(vec),
-            Distance::Dot => <DotProductMetric as Metric<VectorElementType>>::preprocess(vec),
-            Distance::Manhattan => <ManhattanMetric as Metric<VectorElementType>>::preprocess(vec),
-        };
+        let vec = distance.preprocess_vector::<VectorElementType>(vec);
         let vec_ref = VectorRef::from(&vec);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -403,17 +583,10 @@ fn create_vector_storage_f16(
             .unwrap();
     for i in 0..num_vectors {
         let vec = random_vector(&mut rnd, dim);
-        let vec = match distance {
-            Distance::Cosine => <CosineMetric as Metric<VectorElementTypeHalf>>::preprocess(vec),
-            Distance::Euclid => <EuclidMetric as Metric<VectorElementTypeHalf>>::preprocess(vec),
-            Distance::Dot => <DotProductMetric as Metric<VectorElementTypeHalf>>::preprocess(vec),
-            Distance::Manhattan => {
-                <ManhattanMetric as Metric<VectorElementTypeHalf>>::preprocess(vec)
-            }
-        };
+        let vec = distance.preprocess_vector::<VectorElementTypeHalf>(vec);
         let vec_ref = VectorRef::from(&vec);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -431,17 +604,10 @@ fn create_vector_storage_u8(
             .unwrap();
     for i in 0..num_vectors {
         let vec = random_dense_byte_vector(&mut rnd, dim);
-        let vec = match distance {
-            Distance::Cosine => <CosineMetric as Metric<VectorElementTypeByte>>::preprocess(vec),
-            Distance::Euclid => <EuclidMetric as Metric<VectorElementTypeByte>>::preprocess(vec),
-            Distance::Dot => <DotProductMetric as Metric<VectorElementTypeByte>>::preprocess(vec),
-            Distance::Manhattan => {
-                <ManhattanMetric as Metric<VectorElementTypeByte>>::preprocess(vec)
-            }
-        };
+        let vec = distance.preprocess_vector::<VectorElementTypeByte>(vec);
         let vec_ref = VectorRef::from(&vec);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -455,7 +621,7 @@ fn create_vector_storage_f32_multi(
 ) -> VectorStorageEnum {
     let mut rnd = StdRng::seed_from_u64(42);
     let multivector_config = Default::default();
-    let mut vector_storage = open_simple_multi_dense_vector_storage(
+    let mut vector_storage = open_simple_multi_dense_vector_storage_full(
         db,
         DB_VECTOR_CF,
         dim,
@@ -469,20 +635,13 @@ fn create_vector_storage_f32_multi(
         let num_vectors_per_points = 1 + rnd.random::<u8>() % 3;
         for _ in 0..num_vectors_per_points {
             let vec = random_vector(&mut rnd, dim);
-            let vec = match distance {
-                Distance::Cosine => <CosineMetric as Metric<VectorElementType>>::preprocess(vec),
-                Distance::Euclid => <EuclidMetric as Metric<VectorElementType>>::preprocess(vec),
-                Distance::Dot => <DotProductMetric as Metric<VectorElementType>>::preprocess(vec),
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementType>>::preprocess(vec)
-                }
-            };
+            let vec = distance.preprocess_vector::<VectorElementType>(vec);
             vectors.extend(vec);
         }
         let multivector = MultiDenseVectorInternal::new(vectors, dim);
         let vec_ref = VectorRef::from(&multivector);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -510,26 +669,13 @@ fn create_vector_storage_f16_multi(
         let num_vectors_per_points = 1 + rnd.random::<u8>() % 3;
         for _ in 0..num_vectors_per_points {
             let vec = random_vector(&mut rnd, dim);
-            let vec = match distance {
-                Distance::Cosine => {
-                    <CosineMetric as Metric<VectorElementTypeHalf>>::preprocess(vec)
-                }
-                Distance::Euclid => {
-                    <EuclidMetric as Metric<VectorElementTypeHalf>>::preprocess(vec)
-                }
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementTypeHalf>>::preprocess(vec)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementTypeHalf>>::preprocess(vec)
-                }
-            };
+            let vec = distance.preprocess_vector::<VectorElementTypeHalf>(vec);
             vectors.extend(vec);
         }
         let multivector = MultiDenseVectorInternal::new(vectors, dim);
         let vec_ref = VectorRef::from(&multivector);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -557,26 +703,13 @@ fn create_vector_storage_u8_multi(
         let num_vectors_per_points = 1 + rnd.random::<u8>() % 3;
         for _ in 0..num_vectors_per_points {
             let vec = random_dense_byte_vector(&mut rnd, dim);
-            let vec = match distance {
-                Distance::Cosine => {
-                    <CosineMetric as Metric<VectorElementTypeByte>>::preprocess(vec)
-                }
-                Distance::Euclid => {
-                    <EuclidMetric as Metric<VectorElementTypeByte>>::preprocess(vec)
-                }
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementTypeByte>>::preprocess(vec)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementTypeByte>>::preprocess(vec)
-                }
-            };
+            let vec = distance.preprocess_vector::<VectorElementTypeByte>(vec);
             vectors.extend(vec);
         }
         let multivector = MultiDenseVectorInternal::new(vectors, dim);
         let vec_ref = VectorRef::from(&multivector);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -600,24 +733,32 @@ fn test_gpu_vector_storage_impl(
     let storage = create_vector_storage(dir.path(), storage_type, num_vectors, dim, distance);
 
     let quantized_vectors = quantization_config.as_ref().map(|quantization_config| {
-        QuantizedVectors::create(&storage, quantization_config, dir.path(), 1, &false.into())
-            .unwrap()
+        QuantizedVectors::create(
+            &storage,
+            quantization_config,
+            QuantizedVectorsStorageType::Immutable,
+            dir.path(),
+            1,
+            &DEFAULT_STOPPED,
+        )
+        .unwrap()
     });
 
-    let debug_messenger = gpu::PanicIfErrorMessenger {};
-    let instance = gpu::Instance::builder()
-        .with_debug_messenger(&debug_messenger)
-        .with_skip_half_precision(skip_half_support)
-        .build()
-        .unwrap();
-    let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
+    let instance = gpu::GPU_TEST_INSTANCE.clone();
+    let device = gpu::Device::new_with_params(
+        instance.clone(),
+        &instance.physical_devices()[0],
+        0,
+        skip_half_support,
+    )
+    .unwrap();
 
     let gpu_vector_storage = GpuVectorStorage::new(
         device.clone(),
         &storage,
         quantized_vectors.as_ref(),
         force_half_precision,
-        &false.into(),
+        &DEFAULT_STOPPED,
     )
     .unwrap();
 
@@ -711,26 +852,17 @@ fn test_gpu_vector_storage_impl(
     context.run().unwrap();
     context.wait_finish(GPU_TIMEOUT).unwrap();
 
-    let mut gpu_scores = vec![0.0f32; num_vectors];
-    staging_buffer.download_slice(&mut gpu_scores, 0).unwrap();
+    let gpu_scores = staging_buffer.download_vec(0, num_vectors).unwrap();
 
-    let stopped = false.into();
-    let point_deleted = BitVec::repeat(false, num_vectors);
-    let query = QueryVector::Nearest(storage.get_vector(test_point_id).to_owned());
+    let query = QueryVector::Nearest(storage.get_vector::<Random>(test_point_id).to_owned());
 
     let hardware_counter = HardwareCounterCell::new();
     let scorer: Box<dyn RawScorer> = if let Some(quantized_vectors) = quantized_vectors.as_ref() {
         quantized_vectors
-            .raw_scorer(
-                query,
-                &point_deleted,
-                &point_deleted,
-                &stopped,
-                hardware_counter,
-            )
+            .raw_scorer(query, hardware_counter)
             .unwrap()
     } else {
-        new_raw_scorer_for_test(query, &storage, &point_deleted).unwrap()
+        new_raw_scorer_for_test(query, &storage).unwrap()
     };
 
     for (point_id, gpu_score) in gpu_scores.iter().enumerate() {

@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use collection::collection::{Collection, RequestShardTransfer};
 use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
-use collection::operations::types::CollectionError;
+use collection::operations::types::CollectionResult;
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::optimizers_builder::OptimizersConfig;
+use collection::shards::CollectionId;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
-use collection::shards::CollectionId;
-use common::cpu::CpuBudget;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
+use collection::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
+use common::budget::ResourceBudget;
 use segment::types::Distance;
 
 /// Test collections for this upper bound of shards.
@@ -26,10 +27,12 @@ pub const TEST_OPTIMIZERS_CONFIG: OptimizersConfig = OptimizersConfig {
     vacuum_min_vector_number: 1000,
     default_segment_number: 2,
     max_segment_size: None,
+    #[expect(deprecated)]
     memmap_threshold: None,
     indexing_threshold: Some(50_000),
     flush_interval_sec: 30,
     max_optimization_threads: Some(2),
+    prevent_unoptimized: None,
 };
 
 #[cfg(test)]
@@ -37,6 +40,7 @@ pub async fn simple_collection_fixture(collection_path: &Path, shard_number: u32
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let collection_params = CollectionParams {
@@ -53,6 +57,7 @@ pub async fn simple_collection_fixture(collection_path: &Path, shard_number: u32
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let snapshot_path = collection_path.join("snapshots");
@@ -87,7 +92,7 @@ pub async fn new_local_collection(
     path: &Path,
     snapshots_path: &Path,
     config: &CollectionConfigInternal,
-) -> Result<Collection, CollectionError> {
+) -> CollectionResult<Collection> {
     let collection = Collection::new(
         id,
         0,
@@ -96,13 +101,14 @@ pub async fn new_local_collection(
         config,
         Default::default(),
         CollectionShardDistribution::all_local(Some(config.params.shard_number.into()), 0),
-        ChannelService::new(REST_PORT, None),
+        None,
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await;
@@ -131,13 +137,13 @@ pub async fn load_local_collection(
         path,
         snapshots_path,
         Default::default(),
-        ChannelService::new(REST_PORT, None),
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await

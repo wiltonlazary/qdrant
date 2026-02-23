@@ -2,24 +2,25 @@ use std::sync::Arc;
 
 use api::rest::SearchRequestInternal;
 use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted,
 };
-use collection::operations::types::CoreSearchRequestBatch;
 use collection::operations::vector_params_builder::VectorParamsBuilder;
-use collection::operations::CollectionUpdateOperations;
 use collection::optimizers_builder::OptimizersConfig;
-use collection::save_on_disk::SaveOnDisk;
 use collection::shards::local_shard::LocalShard;
 use collection::shards::shard_trait::ShardOperation;
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
-use criterion::{criterion_group, criterion_main, Criterion};
+use common::save_on_disk::SaveOnDisk;
+use criterion::{Criterion, criterion_group, criterion_main};
+use ordered_float::OrderedFloat;
 use rand::rng;
-use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
+use segment::data_types::vectors::{VectorStructInternal, only_default_vector};
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
 use serde_json::Map;
+use shard::search::CoreSearchRequestBatch;
 use tempfile::Builder;
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
@@ -60,6 +61,7 @@ fn batch_search_bench(c: &mut Criterion) {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let collection_params = CollectionParams {
@@ -74,16 +76,19 @@ fn batch_search_bench(c: &mut Criterion) {
             vacuum_min_vector_number: 1000,
             default_segment_number: 2,
             max_segment_size: Some(100_000),
+            #[expect(deprecated)]
             memmap_threshold: Some(100_000),
             indexing_threshold: Some(50_000),
             flush_interval_sec: 30,
             max_optimization_threads: Some(2),
+            prevent_unoptimized: None,
         },
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let optimizers_config = collection_config.optimizer_config.clone();
@@ -105,7 +110,7 @@ fn batch_search_bench(c: &mut Criterion) {
             payload_index_schema,
             handle.clone(),
             handle.clone(),
-            CpuBudget::default(),
+            ResourceBudget::default(),
             optimizers_config,
         ))
         .unwrap();
@@ -113,7 +118,7 @@ fn batch_search_bench(c: &mut Criterion) {
     let rnd_batch = create_rnd_batch();
 
     handle
-        .block_on(shard.update(rnd_batch.into(), true, HwMeasurementAcc::new()))
+        .block_on(shard.update(rnd_batch.into(), true, None, HwMeasurementAcc::new()))
         .unwrap();
 
     let mut group = c.benchmark_group("batch-search-bench");
@@ -128,9 +133,9 @@ fn batch_search_bench(c: &mut Criterion) {
                 "a".parse().unwrap(),
                 Range {
                     lt: None,
-                    gt: Some(-1.),
+                    gt: Some(OrderedFloat(-1.)),
                     gte: None,
-                    lte: Some(100.0),
+                    lte: Some(OrderedFloat(100.0)),
                 },
             ),
         ))),
@@ -206,6 +211,10 @@ fn batch_search_bench(c: &mut Criterion) {
     }
 
     group.finish();
+
+    search_runtime.block_on(async {
+        shard.stop_gracefully().await;
+    });
 }
 
 criterion_group! {

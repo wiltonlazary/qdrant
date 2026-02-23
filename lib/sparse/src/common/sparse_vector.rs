@@ -4,6 +4,7 @@ use std::hash::Hash;
 use common::types::ScoreType;
 use gridstore::Blob;
 use itertools::Itertools;
+use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -18,6 +19,16 @@ pub struct SparseVector {
     pub indices: Vec<DimId>,
     /// Values and indices must be the same length
     pub values: Vec<DimWeight>,
+}
+
+impl Hash for SparseVector {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self { indices, values } = self;
+        indices.hash(state);
+        for &value in values {
+            OrderedFloat(value).hash(state);
+        }
+    }
 }
 
 /// Same as `SparseVector` but with `DimOffset` indices.
@@ -52,7 +63,7 @@ pub fn double_sort<T: Ord + Copy, V: Copy>(indices: &mut [T], values: &mut [V]) 
     }
 }
 
-fn score_vectors<T: Ord + Eq>(
+pub fn score_vectors<T: Ord + Eq>(
     self_indices: &[T],
     self_values: &[DimWeight],
     other_indices: &[T],
@@ -75,11 +86,7 @@ fn score_vectors<T: Ord + Eq>(
             }
         }
     }
-    if overlap {
-        Some(score)
-    } else {
-        None
-    }
+    if overlap { Some(score) } else { None }
 }
 
 impl RemappedSparseVector {
@@ -140,6 +147,11 @@ impl SparseVector {
     /// Check if this vector is empty.
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty() && self.values.is_empty()
+    }
+
+    /// Returns the number of elements in the vector.
+    pub fn len(&self) -> usize {
+        self.indices.len()
     }
 
     /// Score this vector against another vector using dot product.

@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{cmp, fmt, thread};
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use api::grpc::dynamic_channel_pool::make_grpc_channel;
 use api::grpc::qdrant::raft_client::RaftClient;
 use api::grpc::qdrant::{AllPeers, PeerId as GrpcPeerId, RaftMessage as GrpcRaftMessage};
@@ -16,7 +16,7 @@ use collection::shards::shard::PeerId;
 use common::cpu::linux_high_thread_priority;
 use raft::eraftpb::Message as RaftMessage;
 use raft::prelude::*;
-use raft::{SoftState, StateRole, INVALID_ID};
+use raft::{INVALID_ID, SoftState, StateRole};
 use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::consensus_ops::{ConsensusOperations, SnapshotStatus};
 use storage::content_manager::toc::TableOfContent;
@@ -27,6 +27,7 @@ use tokio::time::sleep;
 use tonic::transport::{ClientTlsConfig, Uri};
 
 use crate::common::helpers;
+use crate::common::telemetry::TelemetryCollector;
 use crate::common::telemetry_ops::requests_telemetry::TonicTelemetryCollector;
 use crate::settings::{ConsensusConfig, Settings};
 use crate::tonic::init_internal;
@@ -68,7 +69,8 @@ impl Consensus {
         settings: Settings,
         channel_service: ChannelService,
         propose_receiver: mpsc::Receiver<ConsensusOperations>,
-        telemetry_collector: Arc<parking_lot::Mutex<TonicTelemetryCollector>>,
+        telemetry_collector: Arc<tokio::sync::Mutex<TelemetryCollector>>,
+        tonic_telemetry_collector: Arc<parking_lot::Mutex<TonicTelemetryCollector>>,
         toc: Arc<TableOfContent>,
         runtime: Handle,
         reinit: bool,
@@ -156,6 +158,7 @@ impl Consensus {
                     toc,
                     state_ref,
                     telemetry_collector,
+                    tonic_telemetry_collector,
                     settings,
                     p2p_host,
                     p2p_port,
@@ -223,7 +226,7 @@ impl Consensus {
                 &runtime,
                 leader_established_in_ms,
             )
-            .map_err(|err| anyhow!("Failed to initialize Consensus for new Raft state: {}", err))?;
+            .context("Failed to initialize Consensus for new Raft state")?;
         } else {
             runtime
                 .block_on(Self::recover(
@@ -233,12 +236,7 @@ impl Consensus {
                     &config,
                     tls_config.clone(),
                 ))
-                .map_err(|err| {
-                    anyhow!(
-                        "Failed to recover Consensus from existing Raft state: {}",
-                        err
-                    )
-                })?;
+                .context("Failed to recover Consensus from existing Raft state")?;
 
             if bootstrap_peer.is_some() || uri.is_some() {
                 log::debug!("Local raft state found - bootstrap and uri cli arguments were ignored")
@@ -312,7 +310,9 @@ impl Consensus {
                 "Bootstrapping is disabled. Assuming this peer is the first in the network"
             );
             let tick_period = config.tick_period_ms;
-            log::info!("With current tick period of {tick_period}ms, leader will be established in approximately {leader_established_in_ms}ms. To avoid rejected operations - add peers and submit operations only after this period.");
+            log::info!(
+                "With current tick period of {tick_period}ms, leader will be established in approximately {leader_established_in_ms}ms. To avoid rejected operations - add peers and submit operations only after this period.",
+            );
             // First peer needs to add its own address
             state_ref.add_peer(
                 state_ref.this_peer_id(),
@@ -339,7 +339,7 @@ impl Consensus {
             tls_config,
         )
         .await
-        .map_err(|err| anyhow!("Failed to create timeout channel: {err}"))?;
+        .context("Failed to create timeout channel")?;
         let mut client = RaftClient::new(channel);
         let all_peers = client
             .add_peer_to_known(tonic::Request::new(
@@ -350,7 +350,7 @@ impl Consensus {
                 },
             ))
             .await
-            .map_err(|err| anyhow!("Failed to add peer to known: {err}"))?
+            .context("Failed to add peer to known")?
             .into_inner();
         Ok(all_peers)
     }
@@ -394,16 +394,11 @@ impl Consensus {
                     .await;
                     if res.is_err() {
                         log::warn!(
-                            "Failed to recover from peer with id {} at {} with error {:?}, trying others",
-                            peer_id,
-                            peer_uri,
-                            res
+                            "Failed to recover from peer with id {peer_id} at {peer_uri} with error {res:?}, trying others"
                         );
                     } else {
                         log::debug!(
-                            "Successfully recovered from peer with id {} at {}",
-                            peer_id,
-                            peer_uri
+                            "Successfully recovered from peer with id {peer_id} at {peer_uri}"
                         );
                         return Ok(());
                     }
@@ -458,7 +453,7 @@ impl Consensus {
                         .parse()
                         .context(format!("Failed to parse peer URI: {}", peer.uri))?,
                 )
-                .map_err(|err| anyhow!("Failed to add peer: {}", err))?
+                .context("Failed to add peer")?
         }
         // Only first peer has itself as a voter in the initial conf state.
         // This needs to be propagated manually to other peers as it is not contained in any log entry.
@@ -533,9 +528,10 @@ impl Consensus {
             // If we only sent outgoing Raft messages, but did not change any state during `on_ready`,
             // we consider Raft node to be "idle"
             if is_idle {
-                // If we received new Raft messages (i.e., we are still connected to Raft leader)
-                // and Raft node is idle, count "idle cycle"
-                if raft_messages > 0 {
+                // If current node is the only peer in the cluster, or if we received new Raft messages
+                // (i.e., we are still connected to Raft leader/peers), and Raft node is idle,
+                // count "idle cycle"
+                if raft_messages > 0 || (self.is_single_peer() && self.is_leader()) {
                     idle_cycles += 1;
                 }
             } else {
@@ -632,6 +628,30 @@ impl Consensus {
     fn advance_node_impl(&mut self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::FromClient(ConsensusOperations::AddPeer { peer_id, uri }) => {
+                let existing_uris = self
+                    .broker
+                    .consensus_state
+                    .peer_address_by_id()
+                    .into_iter()
+                    .map(|(peer_id, url)| (url, peer_id))
+                    .collect::<HashMap<_, _>>();
+
+                // Don't allow a peer URI to join if already in consensus
+                // - new URIs can always join
+                // - existing URIs can re-join with the same peer ID
+                // See: <https://github.com/qdrant/qdrant/pull/7375>
+                if let Some(registered_peer_id) =
+                    existing_uris.get(&uri.parse::<Uri>().context("peer URI is not a valid URI")?)
+                    && registered_peer_id != &peer_id
+                {
+                    log::warn!(
+                        "Rejected peer {peer_id} to join consensus, URI is already registered by peer {registered_peer_id} ({uri})",
+                    );
+                    return Err(anyhow!(
+                        "peer URI {uri} already used by peer {registered_peer_id}, remove it first or use a different URI",
+                    ));
+                }
+
                 let mut change = ConfChangeV2::default();
 
                 change.set_changes(vec![raft_proto::new_conf_change_single(
@@ -639,7 +659,7 @@ impl Consensus {
                     ConfChangeType::AddLearnerNode,
                 )]);
 
-                log::debug!("Proposing network configuration change: {:?}", change);
+                log::debug!("Proposing network configuration change: {change:?}");
                 self.node
                     .propose_conf_change(uri.into_bytes(), change)
                     .context("failed to propose conf change")?;
@@ -653,7 +673,7 @@ impl Consensus {
                     ConfChangeType::RemoveNode,
                 )]);
 
-                log::debug!("Proposing network configuration change: {:?}", change);
+                log::debug!("Proposing network configuration change: {change:?}");
                 self.node
                     .propose_conf_change(vec![], change)
                     .context("failed to propose conf change")?;
@@ -698,6 +718,14 @@ impl Consensus {
         }
 
         Ok(())
+    }
+
+    fn is_single_peer(&self) -> bool {
+        self.node.store().peer_count() == 1
+    }
+
+    fn is_leader(&self) -> bool {
+        self.node.status().ss.raft_state == raft::StateRole::Leader
     }
 
     fn try_sync_local_state(&self) -> anyhow::Result<()> {
@@ -900,10 +928,11 @@ impl Consensus {
 
         if !ready.snapshot().is_empty() {
             // This is a snapshot, we need to apply the snapshot at first.
-            log::debug!("Applying snapshot");
+            let snapshot = ready.snapshot().clone();
+            log::debug!("Applying snapshot {:?}", snapshot.get_metadata());
             is_idle = false;
 
-            if let Err(err) = store.apply_snapshot(&ready.snapshot().clone())? {
+            if let Err(err) = store.apply_snapshot(&snapshot)? {
                 log::error!("Failed to apply snapshot: {err}");
             }
         }
@@ -915,7 +944,7 @@ impl Consensus {
 
             store
                 .append_entries(ready.take_entries())
-                .map_err(|err| anyhow!("Failed to append entries: {}", err))?
+                .context("Failed to append entries")?
         }
 
         if let Some(hs) = ready.hs() {
@@ -925,7 +954,7 @@ impl Consensus {
 
             store
                 .set_hard_state(hs.clone())
-                .map_err(|err| anyhow!("Failed to set hard state: {}", err))?
+                .context("Failed to set hard state")?
         }
 
         let role_change = ready.ss().map(|ss| ss.raft_state);
@@ -988,7 +1017,7 @@ impl Consensus {
 
             store
                 .set_commit_index(commit)
-                .map_err(|err| anyhow!("Failed to set commit index: {}", err))?;
+                .context("Failed to set commit index")?;
         }
 
         self.send_messages(light_rd.take_messages());
@@ -1344,7 +1373,7 @@ impl RaftMessageSender {
             //   and it will only produce more noise.
 
             if let Err(err) = res {
-                log::error!("{}", err);
+                log::error!("{err}");
             }
         }
 
@@ -1385,7 +1414,7 @@ impl RaftMessageSender {
             self.tls_config.clone(),
         )
         .await
-        .map_err(|err| anyhow::format_err!("Failed to create who-is channel: {}", err))?;
+        .context("Failed to create who-is channel")?;
 
         let uri = RaftClient::new(channel)
             .who_is(tonic::Request::new(GrpcPeerId { id: peer_id }))
@@ -1410,7 +1439,7 @@ mod tests {
 
     use collection::operations::vector_params_builder::VectorParamsBuilder;
     use collection::shards::channel_service::ChannelService;
-    use common::cpu::CpuBudget;
+    use common::budget::ResourceBudget;
     use segment::types::Distance;
     use slog::Drain;
     use storage::content_manager::collection_meta_ops::{
@@ -1421,7 +1450,7 @@ mod tests {
     use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
     use storage::content_manager::toc::TableOfContent;
     use storage::dispatcher::Dispatcher;
-    use storage::rbac::Access;
+    use storage::rbac::{Access, Auth, AuthType};
     use tempfile::Builder;
 
     use super::Consensus;
@@ -1433,7 +1462,7 @@ mod tests {
         // Given
         let storage_dir = Builder::new().prefix("storage").tempdir().unwrap();
         let mut settings = crate::Settings::new(None).expect("Can't read config.");
-        settings.storage.storage_path = storage_dir.path().to_str().unwrap().to_string();
+        settings.storage.storage_path = storage_dir.path().to_path_buf();
         tracing_subscriber::fmt::init();
         let search_runtime =
             crate::create_search_runtime(settings.storage.performance.max_search_threads)
@@ -1446,15 +1475,20 @@ mod tests {
         let handle = general_runtime.handle().clone();
         let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
         let persistent_state =
-            Persistent::load_or_init(&settings.storage.storage_path, true, false).unwrap();
+            Persistent::load_or_init(&settings.storage.storage_path, true, false, None).unwrap();
         let operation_sender = OperationSender::new(propose_sender);
         let toc = TableOfContent::new(
             &settings.storage,
             search_runtime,
             update_runtime,
             general_runtime,
-            CpuBudget::default(),
-            ChannelService::new(settings.service.http_port, None),
+            ResourceBudget::default(),
+            ChannelService::new(
+                settings.service.http_port,
+                settings.service.enable_tls,
+                None,
+                None,
+            ),
             persistent_state.this_peer_id(),
             Some(operation_sender.clone()),
         );
@@ -1466,6 +1500,7 @@ mod tests {
             operation_sender,
             storage_path,
         )
+        .expect("initialize consensus manager")
         .into();
         let dispatcher =
             Dispatcher::new(toc_arc.clone()).with_consensus(consensus_state.clone(), true);
@@ -1478,7 +1513,12 @@ mod tests {
             6335,
             ConsensusConfig::default(),
             None,
-            ChannelService::new(settings.service.http_port, None),
+            ChannelService::new(
+                settings.service.http_port,
+                settings.service.enable_tls,
+                None,
+                None,
+            ),
             handle.clone(),
             false,
         )
@@ -1525,16 +1565,16 @@ mod tests {
                                 on_disk_payload: None,
                                 replication_factor: None,
                                 write_consistency_factor: None,
-                                init_from: None,
                                 quantization_config: None,
                                 sharding_method: None,
                                 strict_mode_config: None,
                                 uuid: None,
+                                metadata: None,
                             },
                         )
                         .unwrap(),
                     ),
-                    Access::full("For test"),
+                    Auth::new(Access::full("For test"), None, None, AuthType::Internal),
                     None,
                 ),
             )

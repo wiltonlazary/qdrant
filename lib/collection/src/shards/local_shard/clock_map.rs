@@ -1,9 +1,8 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::fmt;
 use std::path::Path;
 
 use api::grpc::qdrant::RecoveryPointClockTag;
-use io::file_operations;
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
@@ -15,7 +14,9 @@ use crate::shards::shard::PeerId;
 #[serde(from = "ClockMapHelper", into = "ClockMapHelper")]
 pub struct ClockMap {
     clocks: HashMap<Key, Clock>,
-    /// Whether this clock map has changed since the last time it was persisted.
+    /// Optional snapshot with earlier version of clocks
+    snapshot: Option<HashMap<Key, Clock>>,
+    /// Whether this clock map has changed since the last time it was persisted
     changed: bool,
 }
 
@@ -23,22 +24,22 @@ impl ClockMap {
     pub fn load_or_default(path: &Path) -> Result<Self> {
         let result = Self::load(path);
 
-        if let Err(Error::Io(err)) = &result {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Ok(Self::default());
-            }
+        if let Err(Error::Io(err)) = &result
+            && err.kind() == std::io::ErrorKind::NotFound
+        {
+            return Ok(Self::default());
         }
 
         result
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let clock_map = file_operations::read_json(path)?;
+        let clock_map = common::fs::read_json(path)?;
         Ok(clock_map)
     }
 
     pub fn store(&mut self, path: &Path) -> Result<()> {
-        file_operations::atomic_save_json(path, self)?;
+        common::fs::atomic_save_json(path, self)?;
         self.changed = false;
         Ok(())
     }
@@ -126,15 +127,45 @@ impl ClockMap {
         (is_accepted, new_tick)
     }
 
+    /// Take a snapshot of clocks
+    ///
+    /// Does nothing if a snapshot already exists. Returns `true` if a snapshot was taken.
+    pub fn take_snapshot(&mut self) -> bool {
+        if self.snapshot.is_some() {
+            return false;
+        }
+
+        self.snapshot.replace(self.clocks.clone());
+        self.changed = true;
+        true
+    }
+
+    /// Clear any snapshot of clocks
+    ///
+    /// Returns `true` if a snapshot was cleared.
+    pub fn clear_snapshot(&mut self) -> bool {
+        if self.snapshot.is_none() {
+            return false;
+        }
+
+        self.snapshot.take();
+        self.changed = true;
+        true
+    }
+
     /// Create a recovery point based on the current clock map state, so that we can recover any
     /// new operations with new clock values
+    ///
+    /// The recovery point will be derived from a clocks snapshot if it exists. Otherwise the
+    /// current clocks are used.
     ///
     /// The recovery point contains every clock that is in this clock map. So, it represents all
     /// the clock ticks we have.
     pub fn to_recovery_point(&self) -> RecoveryPoint {
+        let clocks = self.snapshot.as_ref().unwrap_or(&self.clocks);
+
         RecoveryPoint {
-            clocks: self
-                .clocks
+            clocks: clocks
                 .iter()
                 .map(|(&key, clock)| (key, (clock.current_tick, clock.token)))
                 .collect(),
@@ -249,7 +280,7 @@ impl RecoveryPoint {
             other
                 .clocks
                 .get(key)
-                .map_or(true, |&(other_tick, _token)| tick > other_tick)
+                .is_none_or(|&(other_tick, _token)| tick > other_tick)
         })
     }
 
@@ -284,10 +315,10 @@ impl RecoveryPoint {
     /// Remove clocks from this recovery point, that are equal to the clocks in the `other`.
     pub fn remove_clocks_equal_to(&mut self, other: &Self) {
         for (key, (other_tick, _)) in &other.clocks {
-            if let Some((tick, _)) = self.clocks.get(key) {
-                if tick == other_tick {
-                    self.clocks.remove(key);
-                }
+            if let Some((tick, _)) = self.clocks.get(key)
+                && tick == other_tick
+            {
+                self.clocks.remove(key);
             }
         }
     }
@@ -301,11 +332,11 @@ impl RecoveryPoint {
 
         let mut is_equal = false;
 
-        if let Some(&(tick, _)) = self.clocks.get(&key) {
-            if tick >= tag.clock_tick {
-                self.clocks.remove(&key);
-                is_equal = tick == tag.clock_tick;
-            }
+        if let Some(&(tick, _)) = self.clocks.get(&key)
+            && tick >= tag.clock_tick
+        {
+            self.clocks.remove(&key);
+            is_equal = tick == tag.clock_tick;
         }
 
         is_equal
@@ -368,8 +399,8 @@ impl TryFrom<api::grpc::qdrant::RecoveryPoint> for RecoveryPoint {
     type Error = Status;
 
     fn try_from(rp: api::grpc::qdrant::RecoveryPoint) -> Result<Self, Self::Error> {
-        let clocks = rp
-            .clocks
+        let api::grpc::qdrant::RecoveryPoint { clocks } = rp;
+        let clocks = clocks
             .into_iter()
             .map(|tag| {
                 (
@@ -386,12 +417,17 @@ impl TryFrom<api::grpc::qdrant::RecoveryPoint> for RecoveryPoint {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ClockMapHelper {
     clocks: Vec<KeyClockHelper>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot: Option<Vec<KeyClockHelper>>,
 }
 
 impl From<ClockMap> for ClockMapHelper {
     fn from(clock_map: ClockMap) -> Self {
         Self {
             clocks: clock_map.clocks.into_iter().map(Into::into).collect(),
+            snapshot: clock_map
+                .snapshot
+                .map(|clocks| clocks.into_iter().map(Into::into).collect()),
         }
     }
 }
@@ -400,6 +436,9 @@ impl From<ClockMapHelper> for ClockMap {
     fn from(helper: ClockMapHelper) -> Self {
         Self {
             clocks: helper.clocks.into_iter().map(Into::into).collect(),
+            snapshot: helper
+                .snapshot
+                .map(|clocks| clocks.into_iter().map(Into::into).collect()),
             changed: false,
         }
     }
@@ -434,11 +473,11 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
 }
 
-impl From<file_operations::Error> for Error {
-    fn from(err: file_operations::Error) -> Self {
+impl From<common::fs::FileOperationError> for Error {
+    fn from(err: common::fs::FileOperationError) -> Self {
         match err {
-            file_operations::Error::Io(err) => err.into(),
-            file_operations::Error::SerdeJson(err) => err.into(),
+            common::fs::FileOperationError::Io(err) => err.into(),
+            common::fs::FileOperationError::SerdeJson(err) => err.into(),
             _ => unreachable!(),
         }
     }

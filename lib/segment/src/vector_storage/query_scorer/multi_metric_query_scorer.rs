@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::typelevel::False;
 use common::types::{PointOffsetType, ScoreType};
 
 use super::score_multi;
@@ -12,7 +14,7 @@ use crate::data_types::vectors::{
 use crate::spaces::metric::Metric;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::QueryScorer;
-use crate::vector_storage::MultiVectorStorage;
+use crate::vector_storage::{MultiVectorStorage, Random};
 
 pub struct MultiMetricQueryScorer<
     'a,
@@ -27,11 +29,11 @@ pub struct MultiMetricQueryScorer<
 }
 
 impl<
-        'a,
-        TElement: PrimitiveVectorElement,
-        TMetric: Metric<TElement>,
-        TVectorStorage: MultiVectorStorage<TElement>,
-    > MultiMetricQueryScorer<'a, TElement, TMetric, TVectorStorage>
+    'a,
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
+    TVectorStorage: MultiVectorStorage<TElement>,
+> MultiMetricQueryScorer<'a, TElement, TMetric, TVectorStorage>
 {
     pub fn new(
         query: &MultiDenseVectorInternal,
@@ -45,6 +47,12 @@ impl<
         let preprocessed = MultiDenseVectorInternal::new(preprocessed, query.dim);
 
         hardware_counter.set_cpu_multiplier(query.dim * size_of::<TElement>());
+
+        if vector_storage.is_on_disk() {
+            hardware_counter.set_vector_io_read_multiplier(query.dim * size_of::<TElement>());
+        } else {
+            hardware_counter.set_vector_io_read_multiplier(0);
+        }
 
         Self {
             query: TElement::from_float_multivector(CowMultiVector::Owned(preprocessed)).to_owned(),
@@ -77,18 +85,21 @@ impl<
 }
 
 impl<
-        TElement: PrimitiveVectorElement,
-        TMetric: Metric<TElement>,
-        TVectorStorage: MultiVectorStorage<TElement>,
-    > QueryScorer<TypedMultiDenseVector<TElement>>
-    for MultiMetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
+    TVectorStorage: MultiVectorStorage<TElement>,
+> QueryScorer for MultiMetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
 {
+    type TVector = TypedMultiDenseVector<TElement>;
+
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        self.score_multi(
-            TypedMultiDenseVectorRef::from(&self.query),
-            self.vector_storage.get_multi(idx),
-        )
+        let stored = self.vector_storage.get_multi::<Random>(idx);
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(stored.vectors_count());
+
+        self.score_multi(TypedMultiDenseVectorRef::from(&self.query), stored)
     }
 
     #[inline]
@@ -103,20 +114,34 @@ impl<
         debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
         debug_assert_eq!(ids.len(), scores.len());
 
-        let mut vectors = [TypedMultiDenseVectorRef {
-            flattened_vectors: &[],
-            dim: 0,
-        }; VECTOR_READ_BATCH_SIZE];
-        self.vector_storage
+        let mut vectors = [MaybeUninit::uninit(); VECTOR_READ_BATCH_SIZE];
+        let vectors = self
+            .vector_storage
             .get_batch_multi(ids, &mut vectors[..ids.len()]);
+
+        let total_read = vectors.iter().map(|v| v.vectors_count()).sum();
+
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(total_read);
+
         for idx in 0..ids.len() {
             scores[idx] = self.score_ref(vectors[idx]);
         }
     }
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
-        let v1 = self.vector_storage.get_multi(point_a);
-        let v2 = self.vector_storage.get_multi(point_b);
+        let v1 = self.vector_storage.get_multi::<Random>(point_a);
+        let v2 = self.vector_storage.get_multi::<Random>(point_b);
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(v1.vectors_count() + v2.vectors_count());
+
         self.score_multi(v1, v2)
+    }
+
+    type SupportsBytes = False;
+    fn score_bytes(&self, enabled: Self::SupportsBytes, _: &[u8]) -> ScoreType {
+        match enabled {}
     }
 }

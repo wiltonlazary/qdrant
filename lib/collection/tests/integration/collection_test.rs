@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::io::{BufReader, BufWriter};
 
+use ahash::AHashSet;
 use api::rest::{OrderByInterface, SearchRequestInternal};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::payload_ops::{PayloadOps, SetPayloadOp};
 use collection::operations::point_ops::{
     BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
@@ -12,10 +14,10 @@ use collection::operations::types::{
     CountRequestInternal, PointRequestInternal, RecommendRequestInternal, ScrollRequestInternal,
     UpdateStatus,
 };
-use collection::operations::CollectionUpdateOperations;
 use collection::recommendations::recommend_by;
-use collection::shards::replica_set::{ReplicaSetState, ReplicaState};
+use collection::shards::replica_set::replica_set_state::{ReplicaSetState, ReplicaState};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use fs_err::File;
 use itertools::Itertools;
 use segment::data_types::order_by::{Direction, OrderBy};
 use segment::data_types::vectors::VectorStructInternal;
@@ -26,7 +28,7 @@ use segment::types::{
 use serde_json::Map;
 use tempfile::Builder;
 
-use crate::common::{load_local_collection, simple_collection_fixture, N_SHARDS};
+use crate::common::{N_SHARDS, load_local_collection, simple_collection_fixture};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collection_updater() {
@@ -58,8 +60,15 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
         PointInsertOperationsInternal::from(batch),
     ));
 
+    let hw_counter = HwMeasurementAcc::new();
     let insert_result = collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await;
 
     match insert_result {
@@ -128,8 +137,15 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         PointInsertOperationsInternal::from(batch),
     ));
 
+    let hw_counter = HwMeasurementAcc::new();
     let insert_result = collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await;
 
     match insert_result {
@@ -231,8 +247,15 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
             PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
         );
 
+        let hw_counter = HwMeasurementAcc::new();
         collection
-            .update_from_client_simple(insert_points, true, WriteOrdering::default())
+            .update_from_client_simple(
+                insert_points,
+                true,
+                None,
+                WriteOrdering::default(),
+                hw_counter,
+            )
             .await
             .unwrap();
 
@@ -246,10 +269,19 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
                 key: None,
             }));
 
+        let hw_counter = HwMeasurementAcc::new();
         collection
-            .update_from_client_simple(assign_payload, true, WriteOrdering::default())
+            .update_from_client_simple(
+                assign_payload,
+                true,
+                None,
+                WriteOrdering::default(),
+                hw_counter,
+            )
             .await
             .unwrap();
+
+        collection.stop_gracefully().await;
     }
 
     let collection_path = collection_dir.path();
@@ -284,6 +316,8 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
             assert_eq!(non_empty_payload.len(), 1)
         }
     }
+
+    loaded_collection.stop_gracefully().await;
     println!("Function end");
 }
 
@@ -374,7 +408,13 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
 
     let hw_acc = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_acc.clone(),
+        )
         .await
         .unwrap();
     let result = recommend_by(
@@ -432,8 +472,15 @@ async fn test_read_api_with_shards(shard_number: u32) {
         PointInsertOperationsInternal::from(batch),
     ));
 
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await
         .unwrap();
 
@@ -475,7 +522,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
 
     let get_payload = |value: f64| -> Option<Payload> {
         let mut payload_map = Map::new();
-        payload_map.insert(PRICE_FLOAT_KEY.to_string(), (value).into());
+        payload_map.insert(PRICE_FLOAT_KEY.to_string(), value.into());
         payload_map.insert(PRICE_INT_KEY.to_string(), (value as i64).into());
         payload_map.insert(
             MULTI_VALUE_KEY.to_string(),
@@ -529,8 +576,15 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
         PointInsertOperationsInternal::from(batch),
     ));
 
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter.clone(),
+        )
         .await
         .unwrap();
 
@@ -539,6 +593,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
             PRICE_FLOAT_KEY.parse().unwrap(),
             PayloadFieldSchema::FieldType(PayloadSchemaType::Float),
             true,
+            hw_counter.clone(),
         )
         .await
         .unwrap();
@@ -548,6 +603,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
             PRICE_INT_KEY.parse().unwrap(),
             PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
             true,
+            hw_counter.clone(),
         )
         .await
         .unwrap();
@@ -557,6 +613,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
             MULTI_VALUE_KEY.parse().unwrap(),
             PayloadFieldSchema::FieldType(PayloadSchemaType::Float),
             true,
+            hw_counter.clone(),
         )
         .await
         .unwrap();
@@ -627,11 +684,11 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
                 let b = b.0.get(key).unwrap().as_f64();
                 a >= b
             }),
-            "got: {:#?}",
+            "Expected descending order when using {key} key, got: {:#?}",
             result_desc.points
         );
 
-        let asc_already_seen: HashSet<_> = result_asc.points.iter().map(|x| x.id).collect();
+        let asc_already_seen: AHashSet<_> = result_asc.points.iter().map(|x| x.id).collect();
 
         dbg!(&asc_already_seen);
         let asc_second_page = collection
@@ -670,7 +727,7 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
         assert_eq!(asc_second_page.points.len(), 5);
         assert!(asc_second_page_points.is_subset(&valid_asc_second_page_points));
 
-        let desc_already_seen: HashSet<_> = result_desc.points.iter().map(|x| x.id).collect();
+        let desc_already_seen: AHashSet<_> = result_desc.points.iter().map(|x| x.id).collect();
 
         dbg!(&desc_already_seen);
 
@@ -735,19 +792,21 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
         .await
         .unwrap();
 
-    assert!(result_multi
-        .points
-        .iter()
-        .fold(HashMap::<PointIdType, usize, _>::new(), |mut acc, point| {
-            acc.entry(point.id)
-                .and_modify(|x| {
-                    *x += 1;
-                })
-                .or_insert(1);
-            acc
-        })
-        .values()
-        .all(|&x| x == 2));
+    assert!(
+        result_multi
+            .points
+            .iter()
+            .fold(HashMap::<PointIdType, usize, _>::new(), |mut acc, point| {
+                acc.entry(point.id)
+                    .and_modify(|x| {
+                        *x += 1;
+                    })
+                    .or_insert(1);
+                acc
+            })
+            .values()
+            .all(|&x| x == 2),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -780,8 +839,15 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
         PointInsertOperationsInternal::from(batch),
     ));
 
+    let hw_counter = HwMeasurementAcc::new();
     let insert_result = collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter.clone(),
+        )
         .await;
 
     match insert_result {
@@ -792,7 +858,7 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
     }
 
     // delete points with id (0, 3)
-    let to_be_deleted: HashSet<PointIdType> = vec![0.into(), 3.into()].into_iter().collect();
+    let to_be_deleted: AHashSet<PointIdType> = vec![0.into(), 3.into()].into_iter().collect();
     let delete_filter =
         segment::types::Filter::new_must(Condition::HasId(HasIdCondition::from(to_be_deleted)));
 
@@ -801,7 +867,13 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
     );
 
     let delete_result = collection
-        .update_from_client_simple(delete_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            delete_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await;
 
     match delete_result {
@@ -841,22 +913,25 @@ async fn test_collection_local_load_initializing_not_stuck() {
     let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
 
     // Create and unload collection
-    simple_collection_fixture(collection_dir.path(), 1).await;
+    simple_collection_fixture(collection_dir.path(), 1)
+        .await
+        .stop_gracefully()
+        .await;
 
     // Modify replica state file on disk, set state to Initializing
     // This is to simulate a situation where a collection was not fully created, we cannot create
     // this situation through our collection interface
     {
         let replica_state_path = collection_dir.path().join("0/replica_state.json");
-        let replica_state_file = File::open(&replica_state_path).unwrap();
+        let replica_state_file = BufReader::new(File::open(&replica_state_path).unwrap());
         let mut replica_set_state: ReplicaSetState =
             serde_json::from_reader(replica_state_file).unwrap();
 
-        for peer_id in replica_set_state.peers().into_keys() {
+        for peer_id in replica_set_state.peers().clone().into_keys() {
             replica_set_state.set_peer_state(peer_id, ReplicaState::Initializing);
         }
 
-        let replica_state_file = File::create(&replica_state_path).unwrap();
+        let replica_state_file = BufWriter::new(File::create(&replica_state_path).unwrap());
         serde_json::to_writer(replica_state_file, &replica_set_state).unwrap();
     }
 

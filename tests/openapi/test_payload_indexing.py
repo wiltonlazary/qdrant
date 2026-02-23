@@ -10,6 +10,23 @@ def setup(collection_name):
     yield
     drop_collection(collection_name=collection_name)
 
+def test_payload_indexing_validation(collection_name):
+    response = request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "test_payload",
+            "field_schema": {
+              "type": "integer",
+              "lookup": False,
+              "range": False,
+            }
+        }
+    )
+    assert response.status_code == 422
+    assert "Validation error: the 'lookup' and 'range' capabilities can't be both disabled" in response.json()["status"]["error"]
 
 def test_payload_indexing_operations(collection_name):
     # create payload
@@ -305,6 +322,7 @@ def test_payload_schemas(collection_name):
             "type": "keyword",
             "is_tenant": True,
             "on_disk": True,
+            "enable_hnsw": True,
         },
         {
             "type": "integer",
@@ -312,14 +330,17 @@ def test_payload_schemas(collection_name):
             "range": True,
             "is_principal": True,
             "on_disk": True,
+            "enable_hnsw": True,
         },
         {
             "type": "float",
             "on_disk": True,
             "is_principal": True,
+            "enable_hnsw": True,
         },
         {
             "type": "geo",
+            "enable_hnsw": True,
         },
         {
             "type": "text",
@@ -327,19 +348,23 @@ def test_payload_schemas(collection_name):
             "lowercase": True,
             "min_token_len": 2,
             "max_token_len": 10,
+            "enable_hnsw": True,
         },
         {
             "type": "bool",
+            "enable_hnsw": True,
         },
         {
             "type": "datetime",
             "on_disk": True,
             "is_principal": True,
+            "enable_hnsw": True,
         },
         {
             "type": "uuid",
             "is_tenant": True,
             "on_disk": True,
+            "enable_hnsw": True,
         },
     ]
 

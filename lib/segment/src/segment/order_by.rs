@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cmp::Reverse;
+use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::iterator_ext::IteratorExt;
@@ -7,8 +8,8 @@ use itertools::Either;
 use super::Segment;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::order_by::{Direction, OrderBy, OrderValue};
-use crate::index::field_index::numeric_index::StreamRange;
 use crate::index::PayloadIndex;
+use crate::index::field_index::numeric_index::StreamRange;
 use crate::spaces::tools::{peek_top_largest_iterable, peek_top_smallest_iterable};
 use crate::types::{Filter, PointIdType};
 
@@ -32,13 +33,18 @@ impl Segment {
                 key: order_by.key.to_string(),
             })?;
 
-        let cardinality_estimation = payload_index.estimate_cardinality(condition);
+        let cardinality_estimation = payload_index.estimate_cardinality(condition, hw_counter);
 
         let start_from = order_by.start_from();
 
         let values_ids_iterator = payload_index
-            .iter_filtered_points(condition, &*id_tracker, &cardinality_estimation, hw_counter)
-            .check_stop(|| is_stopped.load(Ordering::Relaxed))
+            .iter_filtered_points(
+                condition,
+                &*id_tracker,
+                &cardinality_estimation,
+                hw_counter,
+                is_stopped,
+            )
             .flat_map(|internal_id| {
                 // Repeat a point for as many values as it has
                 numeric_index
@@ -62,7 +68,7 @@ impl Segment {
                     Some(limit) => peek_top_smallest_iterable(values_ids_iterator, limit),
                     None => values_ids_iterator.collect(),
                 };
-                page.sort_unstable_by(|(value_a, _), (value_b, _)| value_a.cmp(value_b));
+                page.sort_unstable_by_key(|(value, _)| *value);
                 page
             }
             Direction::Desc => {
@@ -70,7 +76,7 @@ impl Segment {
                     Some(limit) => peek_top_largest_iterable(values_ids_iterator, limit),
                     None => values_ids_iterator.collect(),
                 };
-                page.sort_unstable_by(|(value_a, _), (value_b, _)| value_b.cmp(value_a));
+                page.sort_unstable_by_key(|(value, _)| Reverse(*value));
                 page
             }
         };
@@ -118,7 +124,7 @@ impl Segment {
         };
 
         let reads = filtered_iter
-            .check_stop(|| is_stopped.load(Ordering::Relaxed))
+            .stop_if(is_stopped)
             .filter_map(|(value, internal_id)| {
                 id_tracker
                     .external_id(internal_id)

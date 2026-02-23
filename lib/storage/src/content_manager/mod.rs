@@ -11,20 +11,21 @@ mod collections_ops;
 pub mod consensus;
 pub mod consensus_manager;
 pub mod conversions;
-mod data_transfer;
 pub mod errors;
 pub mod shard_distribution;
 pub mod snapshots;
+#[cfg(feature = "staging")]
+pub mod staging;
 pub mod toc;
 
 pub mod consensus_ops {
     use collection::operations::types::PeerMetadata;
-    use collection::shards::replica_set::ReplicaState;
-    use collection::shards::replica_set::ReplicaState::Initializing;
+    use collection::shards::replica_set::replica_set_state::ReplicaState;
+    use collection::shards::replica_set::replica_set_state::ReplicaState::Initializing;
     use collection::shards::resharding::ReshardKey;
     use collection::shards::shard::PeerId;
     use collection::shards::transfer::ShardTransfer;
-    use collection::shards::{replica_set, CollectionId};
+    use collection::shards::{CollectionId, replica_set};
     use raft::eraftpb::Entry as RaftEntry;
     use serde::{Deserialize, Serialize};
 
@@ -136,6 +137,7 @@ pub mod consensus_ops {
                     quantization_config: None,
                     sparse_vectors: None,
                     strict_mode_config: None,
+                    metadata: None,
                 },
             );
             operation

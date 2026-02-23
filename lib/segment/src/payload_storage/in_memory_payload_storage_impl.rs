@@ -1,15 +1,14 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::json_path::JsonPath;
-use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use crate::payload_storage::PayloadStorage;
+use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use crate::types::Payload;
 
 impl PayloadStorage for InMemoryPayloadStorage {
@@ -67,6 +66,15 @@ impl PayloadStorage for InMemoryPayloadStorage {
         }
     }
 
+    fn get_sequential(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        // In memory => No optimizations available.
+        self.get(point_id, hw_counter)
+    }
+
     fn delete(
         &mut self,
         point_id: PointOffsetType,
@@ -91,8 +99,9 @@ impl PayloadStorage for InMemoryPayloadStorage {
         Ok(res)
     }
 
-    fn wipe(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
-        self.payload = HashMap::new();
+    #[cfg(test)]
+    fn clear_all(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
+        self.payload = ahash::AHashMap::new();
         Ok(())
     }
 
@@ -100,7 +109,7 @@ impl PayloadStorage for InMemoryPayloadStorage {
         Box::new(|| Ok(()))
     }
 
-    fn iter<F>(&self, mut callback: F) -> OperationResult<()>
+    fn iter<F>(&self, mut callback: F, _hw_counter: &HardwareCounterCell) -> OperationResult<()>
     where
         F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
     {
@@ -128,6 +137,10 @@ impl PayloadStorage for InMemoryPayloadStorage {
             }
         }
         Ok(estimated_size)
+    }
+
+    fn is_on_disk(&self) -> bool {
+        false
     }
 }
 
@@ -188,10 +201,11 @@ mod tests {
                 payload.borrow().as_ref().cloned().unwrap()
             }),
             Some(&id_tracker),
-            &HashMap::new(),
+            &std::collections::HashMap::new(),
             &query,
             0,
             &IndexesMap::new(),
+            &HardwareCounterCell::new(),
         );
     }
 
@@ -203,12 +217,12 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         storage.set(100, &payload, &hw_counter).unwrap();
-        storage.wipe(&hw_counter).unwrap();
+        storage.clear_all(&hw_counter).unwrap();
         storage.set(100, &payload, &hw_counter).unwrap();
-        storage.wipe(&hw_counter).unwrap();
+        storage.clear_all(&hw_counter).unwrap();
         storage.set(100, &payload, &hw_counter).unwrap();
         assert!(!storage.get(100, &hw_counter).unwrap().is_empty());
-        storage.wipe(&hw_counter).unwrap();
+        storage.clear_all(&hw_counter).unwrap();
     }
 
     #[test]

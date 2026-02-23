@@ -8,35 +8,39 @@ use std::time::{Duration, SystemTimeError};
 
 use api::grpc::transport_channel_pool::RequestError;
 use api::rest::{
-    BaseGroupRequest, LookupLocation, OrderByInterface, RecommendStrategy, Record,
-    SearchGroupsRequestInternal, SearchRequestInternal, ShardKeySelector, VectorStructOutput,
+    BaseGroupRequest, LookupLocation, RecommendStrategy, SearchGroupsRequestInternal,
+    SearchRequestInternal, ShardKeySelector, VectorStructOutput,
 };
-use common::defaults;
 use common::ext::OptionExt;
+use common::fs::FileStorageError;
+use common::progress_tracker::ProgressTree;
 use common::rate_limiting::{RateLimitError, RetryError};
 use common::types::ScoreType;
 use common::validation::validate_range_generic;
-use io::file_operations::FileStorageError;
+use common::{defaults, save_on_disk};
 use issues::IssueRecord;
-use merge::Merge;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use segment::common::operation_error::OperationError;
+use segment::common::operation_error::{CancelledError, OperationError};
 use segment::data_types::groups::GroupId;
-use segment::data_types::order_by::{OrderBy, OrderValue};
-use segment::data_types::vectors::{
-    DenseVector, QueryVector, VectorRef, VectorStructInternal, DEFAULT_VECTOR_NAME,
-};
+use segment::data_types::modifier::Modifier;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, DenseVector};
 use segment::types::{
     Distance, Filter, HnswConfig, MultiVectorConfig, Payload, PayloadIndexInfo, PayloadKeyType,
     PointIdType, QuantizationConfig, SearchParams, SeqNumberType, ShardKey,
-    SparseVectorStorageType, StrictModeConfig, VectorName, VectorNameBuf, VectorStorageDatatype,
-    WithPayloadInterface, WithVector,
+    SparseVectorStorageType, StrictModeConfigOutput, VectorName, VectorNameBuf,
+    VectorStorageDatatype, WithPayloadInterface, WithVector,
 };
 use semver::Version;
 use serde;
 use serde::{Deserialize, Serialize};
 use serde_json::{Error as JsonError, Map, Value};
+pub use shard::count::CountRequestInternal;
+use shard::payload_index_schema::PayloadIndexSchema;
+pub use shard::query::scroll::{QueryScrollRequestInternal, ScrollOrder};
+pub use shard::scroll::ScrollRequestInternal;
+pub use shard::search::CoreSearchRequest;
+use shard::wal::WalError;
 use sparse::common::sparse_vector::SparseVector;
 use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
@@ -46,20 +50,16 @@ use tonic::codegen::http::uri::InvalidUri;
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use super::config_diff::{self};
 use super::ClockTag;
+use crate::collection_manager::optimizers::TrackerStatus;
 use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::config_diff::{HnswConfigDiff, QuantizationConfigDiff};
-use crate::operations::point_ops::{PointStructPersisted, VectorStructPersisted};
-use crate::operations::query_enum::QueryEnum;
-use crate::operations::universal_query::shard_query::{ScoringQuery, ShardQueryRequest};
 use crate::optimizers_builder::OptimizersConfig;
-use crate::save_on_disk;
-use crate::shards::replica_set::ReplicaState;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::resharding::ReshardingStage;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::transfer::ShardTransferMethod;
-use crate::wal::WalError;
 
 /// Current state of the collection.
 /// `Green` - all good. `Yellow` - optimization is running, 'Grey' - optimizations are possible but not triggered, `Red` - some operations failed and was not recovered
@@ -80,7 +80,7 @@ pub enum CollectionStatus {
 /// Current state of the shard (supports same states as the collection)
 ///
 /// `Green` - all good. `Yellow` - optimization is running, 'Grey' - optimizations are possible but not triggered, `Red` - some operations failed and was not recovered
-#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+#[derive(Debug, Serialize, JsonSchema, Anonymize, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum ShardStatus {
     // Shard is completely ready for requests
@@ -113,96 +113,63 @@ pub struct CollectionExistence {
 }
 
 /// Current state of the collection
-#[derive(Debug, Default, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(
+    Debug, Default, Serialize, JsonSchema, Anonymize, PartialEq, Eq, PartialOrd, Ord, Clone,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OptimizersStatus {
     /// Optimizers are reporting as expected
     #[default]
     Ok,
     /// Something wrong happened with optimizers
+    #[anonymize(false)]
     Error(String),
 }
 
-/// Point data
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecordInternal {
-    /// Id of the point
-    pub id: PointIdType,
-    /// Payload - values assigned to the point
-    pub payload: Option<Payload>,
-    /// Vector of the point
-    pub vector: Option<VectorStructInternal>,
-    /// Shard Key
-    pub shard_key: Option<ShardKey>,
-    /// Order value, if used for order_by
-    pub order_value: Option<OrderValue>,
+#[derive(
+    Debug, Default, Serialize, JsonSchema, Anonymize, PartialEq, Eq, PartialOrd, Ord, Clone,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct CollectionWarning {
+    /// Warning message
+    #[anonymize(true)] // Might contain vector names
+    pub message: String,
 }
 
-/// Warn: panics if the vector is empty
-impl TryFrom<RecordInternal> for PointStructPersisted {
-    type Error = String;
-
-    fn try_from(record: RecordInternal) -> Result<Self, Self::Error> {
-        let RecordInternal {
-            id,
-            payload,
-            vector,
-            shard_key: _,
-            order_value: _,
-        } = record;
-
-        if vector.is_none() {
-            return Err("Vector is empty".to_string());
-        }
-
-        Ok(Self {
-            id,
-            payload,
-            vector: VectorStructPersisted::from(vector.unwrap()),
-        })
-    }
+#[derive(Debug, Clone, Serialize, JsonSchema, Default, Anonymize)]
+pub struct ShardUpdateQueueInfo {
+    /// Number of elements in the queue
+    #[anonymize(false)]
+    pub length: usize,
+    /// last operation number processed
+    #[anonymize(false)]
+    pub op_num: Option<usize>,
 }
 
-impl TryFrom<Record> for PointStructPersisted {
-    type Error = String;
-
-    fn try_from(record: Record) -> Result<Self, Self::Error> {
-        let Record {
-            id,
-            payload,
-            vector,
-            shard_key: _,
-            order_value: _,
-        } = record;
-
-        if vector.is_none() {
-            return Err("Vector is empty".to_string());
-        }
-
-        Ok(Self {
-            id,
-            payload,
-            vector: VectorStructPersisted::from(vector.unwrap()),
-        })
-    }
+#[derive(Debug, Clone, Serialize, JsonSchema, Default, Anonymize)]
+pub struct UpdateQueueInfo {
+    /// Number of elements in the queue
+    #[anonymize(false)]
+    pub length: usize,
 }
 
 // Version of the collection config we can present to the user
 /// Information about the collection configuration
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CollectionConfig {
-    #[validate(nested)]
     pub params: CollectionParams,
-    #[validate(nested)]
     pub hnsw_config: HnswConfig,
-    #[validate(nested)]
     pub optimizer_config: OptimizersConfig,
-    #[validate(nested)]
     pub wal_config: Option<WalConfig>,
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strict_mode_config: Option<StrictModeConfig>,
+    pub strict_mode_config: Option<StrictModeConfigOutput>,
+    /// Arbitrary JSON metadata for the collection
+    /// This can be used to store application-specific information
+    /// such as creation time, migration data, inference model info, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Payload>,
 }
 
 impl From<CollectionConfigInternal> for CollectionConfig {
@@ -216,6 +183,7 @@ impl From<CollectionConfigInternal> for CollectionConfig {
             strict_mode_config,
             // Internal UUID to identify unique collections in consensus snapshots
             uuid: _,
+            metadata,
         } = config;
 
         CollectionConfig {
@@ -224,7 +192,8 @@ impl From<CollectionConfigInternal> for CollectionConfig {
             optimizer_config,
             wal_config: Some(wal_config),
             quantization_config,
-            strict_mode_config,
+            strict_mode_config: strict_mode_config.map(StrictModeConfigOutput::from),
+            metadata,
         }
     }
 }
@@ -236,13 +205,9 @@ pub struct CollectionInfo {
     pub status: CollectionStatus,
     /// Status of optimizers
     pub optimizer_status: OptimizersStatus,
-    /// DEPRECATED:
-    /// Approximate number of vectors in collection.
-    /// All vectors in collection are available for querying.
-    /// Calculated as `points_count x vectors_per_point`.
-    /// Where `vectors_per_point` is a number of named vectors in schema.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vectors_count: Option<usize>,
+    /// Warnings related to the collection
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<CollectionWarning>,
     /// Approximate number of indexed vectors in the collection.
     /// Indexed vectors in large segments are faster to query,
     /// as it is stored in a specialized vector index.
@@ -257,35 +222,65 @@ pub struct CollectionInfo {
     pub config: CollectionConfig,
     /// Types of stored payload
     pub payload_schema: HashMap<PayloadKeyType, PayloadIndexInfo>,
+    /// Update queue info
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_queue: Option<UpdateQueueInfo>,
 }
 
 impl CollectionInfo {
-    pub fn empty(collection_config: CollectionConfigInternal) -> Self {
+    pub fn empty(
+        collection_config: CollectionConfigInternal,
+        payload_schema: PayloadIndexSchema,
+    ) -> Self {
         Self {
             status: CollectionStatus::Green,
             optimizer_status: OptimizersStatus::Ok,
-            vectors_count: Some(0),
+            warnings: collection_config.get_warnings(),
             indexed_vectors_count: Some(0),
             points_count: Some(0),
             segments_count: 0,
             config: CollectionConfig::from(collection_config),
-            payload_schema: HashMap::new(),
+            payload_schema: payload_schema
+                .schema
+                .into_iter()
+                .map(|(k, v)| (k, PayloadIndexInfo::new(v, 0)))
+                .collect(),
+            update_queue: Some(UpdateQueueInfo::default()),
         }
     }
 }
 
 impl From<ShardInfoInternal> for CollectionInfo {
     fn from(info: ShardInfoInternal) -> Self {
+        let ShardInfoInternal {
+            status,
+            optimizer_status,
+            indexed_vectors_count,
+            points_count,
+            segments_count,
+            config,
+            payload_schema,
+            update_queue,
+        } = info;
         Self {
-            status: info.status.into(),
-            optimizer_status: info.optimizer_status,
-            vectors_count: Some(info.vectors_count),
-            indexed_vectors_count: Some(info.indexed_vectors_count),
-            points_count: Some(info.points_count),
-            segments_count: info.segments_count,
-            config: CollectionConfig::from(info.config),
-            payload_schema: info.payload_schema,
+            status: status.into(),
+            optimizer_status,
+            warnings: config.get_warnings(),
+            indexed_vectors_count: Some(indexed_vectors_count),
+            points_count: Some(points_count),
+            segments_count,
+            config: CollectionConfig::from(config),
+            payload_schema,
+            update_queue: Some(UpdateQueueInfo::from(update_queue)),
         }
+    }
+}
+
+impl From<ShardUpdateQueueInfo> for UpdateQueueInfo {
+    fn from(value: ShardUpdateQueueInfo) -> Self {
+        // ignore field `op_num`, no sane way to aggregate across shards
+        let ShardUpdateQueueInfo { length, op_num: _ } = value;
+        UpdateQueueInfo { length }
     }
 }
 
@@ -296,11 +291,6 @@ pub struct ShardInfoInternal {
     pub status: ShardStatus,
     /// Status of optimizers
     pub optimizer_status: OptimizersStatus,
-    /// Approximate number of vectors in shard.
-    /// All vectors in shard are available for querying.
-    /// Calculated as `points_count x vectors_per_point`.
-    /// Where `vectors_per_point` is a number of named vectors in schema.
-    pub vectors_count: usize,
     /// Approximate number of indexed vectors in the shard.
     /// Indexed vectors in large segments are faster to query,
     /// as it is stored in vector index (HNSW).
@@ -315,6 +305,8 @@ pub struct ShardInfoInternal {
     pub config: CollectionConfigInternal,
     /// Types of stored payload
     pub payload_schema: HashMap<PayloadKeyType, PayloadIndexInfo>,
+    /// Update queue state
+    pub update_queue: ShardUpdateQueueInfo,
 }
 
 /// Current clustering distribution for the collection
@@ -336,46 +328,177 @@ pub struct CollectionClusterInfo {
     pub resharding_operations: Option<Vec<ReshardingInfo>>,
 }
 
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Copy, Clone)]
+pub struct OptimizationsRequestOptions {
+    /// `?with=queued`
+    pub queued: bool,
+    /// `?with=completed` and `?completed_limit=N`
+    pub completed_limit: Option<usize>,
+    /// `?with=idle_segments`
+    pub idle_segments: bool,
+}
+
+/// Optimizations progress for the collection
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub struct OptimizationsResponse {
+    pub summary: OptimizationsSummary,
+    /// Currently running optimizations.
+    pub running: Vec<Optimization>,
+    /// An estimated queue of pending optimizations.
+    /// Requires `?with=queued`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<Vec<PendingOptimization>>,
+    /// Completed optimizations.
+    /// Requires `?with=completed`. Limited by `?completed_limit=N`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<Vec<Optimization>>,
+    /// Segments that don't require optimization.
+    /// Requires `?with=idle_segments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_segments: Option<Vec<OptimizationSegmentInfo>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub struct OptimizationsSummary {
+    /// Number of pending optimizations in the queue.
+    /// Each optimization will take one or more unoptimized segments and produce
+    /// one optimized segment.
+    pub queued_optimizations: usize,
+    /// Number of unoptimized segments in the queue.
+    pub queued_segments: usize,
+    /// Number of points in unoptimized segments in the queue.
+    pub queued_points: usize,
+    /// Number of segments that don't require optimization.
+    pub idle_segments: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Optimization {
+    /// Unique identifier of the optimization process.
+    ///
+    /// After the optimization is complete, a new segment will be created with
+    /// this UUID.
+    pub uuid: Uuid,
+    /// Name of the optimizer that performed this optimization.
+    pub optimizer: String,
+    pub status: TrackerStatus,
+    /// Segments being optimized.
+    ///
+    /// After the optimization is complete, these segments will be replaced
+    /// by the new optimized segment.
+    pub segments: Vec<OptimizationSegmentInfo>,
+    pub progress: ProgressTree,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PendingOptimization {
+    /// Name of the optimizer that scheduled this optimization.
+    pub optimizer: String,
+    /// Segments that will be optimized.
+    pub segments: Vec<OptimizationSegmentInfo>,
+}
+
+impl OptimizationsResponse {
+    /// Merge another `OptimizationsResponse` into this one.
+    pub fn merge(&mut self, other: OptimizationsResponse) {
+        let OptimizationsResponse {
+            summary:
+                OptimizationsSummary {
+                    queued_optimizations,
+                    queued_segments,
+                    queued_points,
+                    idle_segments: idle_segments_count,
+                },
+            running,
+            queued,
+            completed,
+            idle_segments,
+        } = other;
+
+        self.running.extend(running);
+        self.summary.queued_optimizations += queued_optimizations;
+        self.summary.queued_segments += queued_segments;
+        self.summary.queued_points += queued_points;
+        self.summary.idle_segments += idle_segments_count;
+        merge_optional_vec(&mut self.completed, completed);
+        merge_optional_vec(&mut self.queued, queued);
+        merge_optional_vec(&mut self.idle_segments, idle_segments);
+    }
+}
+
+/// Merge two `Option<Vec<T>>` values: if either side has data, the result has data.
+fn merge_optional_vec<T>(target: &mut Option<Vec<T>>, source: Option<Vec<T>>) {
+    match (target.as_mut(), source) {
+        (Some(target), Some(source)) => target.extend(source),
+        (None, source @ Some(_)) => *target = source,
+        (Some(_) | None, None) => {}
+    }
+}
+
+// See also [`segment::types::SegmentInfo`] which is used in telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OptimizationSegmentInfo {
+    /// Unique identifier of the segment.
+    pub uuid: Uuid,
+    /// Number of non-deleted points in the segment.
+    pub points_count: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema, Clone, Anonymize)]
 pub struct ShardTransferInfo {
+    #[anonymize(false)]
     pub shard_id: ShardId,
 
     /// Target shard ID if different than source shard ID
     ///
-    /// Used exclusively with `ReshardStreamRecords` transfer method.
+    /// Used exclusively with `ReshardingStreamRecords` transfer method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub to_shard_id: Option<ShardId>,
 
     /// Source peer id
+    #[anonymize(false)]
     pub from: PeerId,
 
     /// Destination peer id
+    #[anonymize(false)]
     pub to: PeerId,
 
     /// If `true` transfer is a synchronization of a replicas
     /// If `false` transfer is a moving of a shard from one peer to another
+    #[anonymize(false)]
     pub sync: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub method: Option<ShardTransferMethod>,
 
     /// A human-readable report of the transfer progress. Available only on the source peer.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Serialize, JsonSchema, Clone, Anonymize)]
 pub struct ReshardingInfo {
     #[schemars(skip)]
     pub uuid: Uuid,
 
+    #[anonymize(false)]
     pub direction: ReshardingDirection,
 
+    #[anonymize(false)]
     pub shard_id: ShardId,
 
+    #[anonymize(false)]
     pub peer_id: PeerId,
 
     pub shard_key: Option<ShardKey>,
+
+    /// Only included in peer telemetry
+    #[serde(skip)]
+    #[anonymize(false)]
+    pub stage: ReshardingStage,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -408,14 +531,39 @@ pub struct RemoteShardInfo {
 
 /// `Acknowledged` - Request is saved to WAL and will be process in a queue.
 /// `Completed` - Request is completed, changes are actual.
+/// `WaitTimeout` - Request is waiting for timeout.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateStatus {
     Acknowledged,
     Completed,
+    WaitTimeout,
     /// Internal: update is rejected due to an outdated clock
     #[schemars(skip)]
     ClockRejected,
+}
+
+impl UpdateStatus {
+    /// Returns priority of the update status
+    ///
+    /// A higher value means the status is more significant
+    pub fn priority(&self) -> i32 {
+        match self {
+            UpdateStatus::Acknowledged => 0,
+            UpdateStatus::Completed => 1,
+            UpdateStatus::WaitTimeout => 2,
+            UpdateStatus::ClockRejected => 3,
+        }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            UpdateStatus::WaitTimeout => true,
+            UpdateStatus::Acknowledged => false,
+            UpdateStatus::Completed => false,
+            UpdateStatus::ClockRejected => false,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Serialize, JsonSchema)]
@@ -443,86 +591,6 @@ pub struct ScrollRequest {
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
-}
-
-/// Scroll request - paginate over all points which matches given condition
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub struct ScrollRequestInternal {
-    /// Start ID to read points from.
-    pub offset: Option<PointIdType>,
-
-    /// Page size. Default: 10
-    #[validate(range(min = 1))]
-    pub limit: Option<usize>,
-
-    /// Look only for points which satisfies this conditions. If not provided - all points.
-    #[validate(nested)]
-    pub filter: Option<Filter>,
-
-    /// Select which payload to return with the response. Default is true.
-    pub with_payload: Option<WithPayloadInterface>,
-
-    /// Options for specifying which vectors to include into response. Default is false.
-    #[serde(default, alias = "with_vectors")]
-    pub with_vector: WithVector,
-
-    /// Order the records by a payload field.
-    pub order_by: Option<OrderByInterface>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum ScrollOrder {
-    #[default]
-    ById,
-    ByField(OrderBy),
-    Random,
-}
-
-/// Scroll request, used as a part of query request
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryScrollRequestInternal {
-    /// Page size. Default: 10
-    pub limit: usize,
-
-    /// Look only for points which satisfies this conditions. If not provided - all points.
-    pub filter: Option<Filter>,
-
-    /// Select which payload to return with the response. Default is true.
-    pub with_payload: WithPayloadInterface,
-
-    /// Options for specifying which vectors to include into response. Default is false.
-    pub with_vector: WithVector,
-
-    /// Order the records by a payload field.
-    pub scroll_order: ScrollOrder,
-}
-
-impl ScrollRequestInternal {
-    pub(crate) fn default_limit() -> usize {
-        10
-    }
-
-    pub(crate) fn default_with_payload() -> WithPayloadInterface {
-        WithPayloadInterface::Bool(true)
-    }
-
-    pub(crate) fn default_with_vector() -> WithVector {
-        WithVector::Bool(false)
-    }
-}
-
-impl Default for ScrollRequestInternal {
-    fn default() -> Self {
-        ScrollRequestInternal {
-            offset: None,
-            limit: Some(Self::default_limit()),
-            filter: None,
-            with_payload: Some(Self::default_with_payload()),
-            with_vector: Self::default_with_vector(),
-            order_by: None,
-        }
-    }
 }
 
 fn points_example() -> Vec<api::rest::Record> {
@@ -581,32 +649,6 @@ pub struct SearchRequestBatch {
     pub searches: Vec<SearchRequest>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoreSearchRequest {
-    /// Every kind of query that can be performed on segment level
-    pub query: QueryEnum,
-    /// Look only for points which satisfies this conditions
-    pub filter: Option<Filter>,
-    /// Additional search params
-    pub params: Option<SearchParams>,
-    /// Max number of result to return
-    pub limit: usize,
-    /// Offset of the first result to return.
-    /// May be used to paginate results.
-    /// Note: large offset values may cause performance issues.
-    pub offset: usize,
-    /// Select which payload to return with the response. Default is false.
-    pub with_payload: Option<WithPayloadInterface>,
-    /// Options for specifying which vectors to include into response. Default is false.
-    pub with_vector: Option<WithVector>,
-    pub score_threshold: Option<ScoreType>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CoreSearchRequestBatch {
-    pub searches: Vec<CoreSearchRequest>,
-}
-
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 pub struct SearchGroupsRequest {
     #[serde(flatten)]
@@ -627,7 +669,7 @@ pub struct PointRequest {
     pub shard_key: Option<ShardKeySelector>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct PointRequestInternal {
     /// Look for points with ids
@@ -951,26 +993,7 @@ pub struct CountRequest {
     pub shard_key: Option<ShardKeySelector>,
 }
 
-/// Count Request
-/// Counts the number of points which satisfy the given filter.
-/// If filter is not provided, the count of all points in the collection will be returned.
-#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub struct CountRequestInternal {
-    /// Look only for points which satisfies this conditions
-    #[validate(nested)]
-    pub filter: Option<Filter>,
-    /// If true, count exact number of points. If false, count approximate number of points faster.
-    /// Approximate count might be unreliable during the indexing process. Default: true
-    #[serde(default = "default_exact_count")]
-    pub exact: bool,
-}
-
-pub const fn default_exact_count() -> bool {
-    true
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CountResult {
     /// Number of points which satisfy the conditions
@@ -998,7 +1021,7 @@ pub enum CollectionError {
     #[error("Bad shard selection: {description}")]
     BadShardSelection { description: String },
     #[error(
-    "{shards_failed} out of {shards_total} shards failed to apply operation. First error captured: {first_err}"
+        "{shards_failed} out of {shards_total} shards failed to apply operation. First error captured: {first_err}"
     )]
     InconsistentShardFailure {
         shards_total: u32,
@@ -1024,14 +1047,16 @@ pub enum CollectionError {
         description: String,
         retry_after: Option<Duration>,
     },
+    #[error("Shard temporarily unavailable: {description}")]
+    ShardUnavailable { description: String },
 }
 
 impl CollectionError {
-    pub fn timeout(timeout_sec: usize, operation: impl Into<String>) -> Self {
+    pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
         Self::Timeout {
             description: format!(
-                "Operation '{}' timed out after {timeout_sec} seconds",
-                operation.into()
+                "Operation '{}' timed out after {timeout:?}",
+                operation.into(),
             ),
         }
     }
@@ -1051,6 +1076,12 @@ impl CollectionError {
 
     pub fn not_found(what: impl Into<String>) -> Self {
         Self::NotFound { what: what.into() }
+    }
+
+    pub fn cancelled(description: impl Into<String>) -> Self {
+        Self::Cancelled {
+            description: description.into(),
+        }
     }
 
     pub fn bad_request(description: impl Into<String>) -> Self {
@@ -1121,7 +1152,7 @@ impl CollectionError {
                     retry_after,
                 } = retry_error;
                 let description = format!(
-                    "{rate_limiter_type} rate limit exceeded: Operation requires {cost} tokens but only {tokens_available} were available. Retry after {}s",
+                    "{rate_limiter_type} rate limit exceeded: Operation requires {cost} tokens but only {tokens_available:.1} were available. Retry after {}s",
                     retry_after.as_secs_f32().ceil() as u32,
                 );
                 (description, Some(retry_after))
@@ -1130,6 +1161,12 @@ impl CollectionError {
         Self::RateLimitExceeded {
             description,
             retry_after,
+        }
+    }
+
+    pub fn shard_unavailable(description: impl Into<String>) -> Self {
+        Self::ShardUnavailable {
+            description: description.into(),
         }
     }
 
@@ -1143,6 +1180,7 @@ impl CollectionError {
             Self::Cancelled { .. } => true,
             Self::OutOfMemory { .. } => true,
             Self::PreConditionFailed { .. } => true,
+            Self::ShardUnavailable { .. } => true,
             // Not transient
             Self::BadInput { .. } => false,
             Self::NotFound { .. } => false,
@@ -1218,6 +1256,7 @@ impl From<OperationError> for CollectionError {
             OperationError::OutOfMemory { description, free } => {
                 Self::OutOfMemory { description, free }
             }
+            OperationError::Timeout { description } => Self::Timeout { description },
             OperationError::InconsistentStorage { .. } => Self::ServiceError {
                 error: format!("{err}"),
                 backtrace: None,
@@ -1233,7 +1272,19 @@ impl From<OperationError> for CollectionError {
             },
             OperationError::MissingRangeIndexForOrderBy { .. } => Self::bad_input(format!("{err}")),
             OperationError::MissingMapIndexForFacet { .. } => Self::bad_input(format!("{err}")),
+            OperationError::VariableTypeError { .. } => Self::bad_input(format!("{err}")),
+            OperationError::NonFiniteNumber { .. } => Self::bad_input(format!("{err}")),
+            OperationError::RocksDbColumnFamilyNotFound { .. } => Self::ServiceError {
+                error: format!("{err}"),
+                backtrace: None,
+            },
         }
+    }
+}
+
+impl From<CancelledError> for CollectionError {
+    fn from(error: CancelledError) -> Self {
+        OperationError::from(error).into()
     }
 }
 
@@ -1334,10 +1385,27 @@ impl From<tonic::Status> for CollectionError {
             tonic::Code::FailedPrecondition => CollectionError::PreConditionFailed {
                 description: format!("{err}"),
             },
-            tonic::Code::ResourceExhausted => CollectionError::RateLimitExceeded {
-                description: format!("{err}"),
-                retry_after: None,
-            },
+            tonic::Code::ResourceExhausted => {
+                // extract retry-after from metadata
+                // the value is passed as a String containing an integer number of seconds
+                let retry_after = err.metadata().get("retry-after").and_then(|v| {
+                    v.to_str()
+                        .inspect_err(|e| log::info!("Failed to parse retry-after header: {e}"))
+                        .ok()
+                        .and_then(|v| {
+                            v.parse::<u64>()
+                                .inspect_err(|e| {
+                                    log::info!("Failed to parse retry-after value in gRPC metadata (value: {v}): {e}")
+                                })
+                                .ok()
+                        })
+                        .map(Duration::from_secs)
+                });
+                CollectionError::RateLimitExceeded {
+                    description: format!("{err}"),
+                    retry_after,
+                }
+            }
             tonic::Code::Ok
             | tonic::Code::Unknown
             | tonic::Code::PermissionDenied
@@ -1424,22 +1492,9 @@ impl From<tempfile::PathPersistError> for CollectionError {
 
 pub type CollectionResult<T> = Result<T, CollectionError>;
 
-impl RecordInternal {
-    pub fn get_vector_by_name(&self, name: &VectorName) -> Option<VectorRef> {
-        match &self.vector {
-            Some(VectorStructInternal::Single(vector)) => {
-                (name == DEFAULT_VECTOR_NAME).then_some(VectorRef::from(vector))
-            }
-            Some(VectorStructInternal::MultiDense(vectors)) => {
-                (name == DEFAULT_VECTOR_NAME).then_some(VectorRef::from(vectors))
-            }
-            Some(VectorStructInternal::Named(vectors)) => vectors.get(name).map(VectorRef::from),
-            None => None,
-        }
-    }
-}
-
-#[derive(Default, Debug, Deserialize, Serialize, JsonSchema, Eq, PartialEq, Copy, Clone, Hash)]
+#[derive(
+    Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Datatype {
     #[default]
@@ -1459,8 +1514,11 @@ impl From<Datatype> for VectorStorageDatatype {
 }
 
 /// Params of single vector data storage
-#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq)]
+#[derive(
+    Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
+#[anonymize(false)]
 pub struct VectorParams {
     /// Size of a vectors used
     #[validate(custom(function = "validate_nonzerou64_range_min_1_max_65536"))]
@@ -1509,31 +1567,13 @@ pub fn validate_nonzerou64_range_min_1_max_65536(
 
 /// Is considered empty if `None` or if diff has no field specified
 fn is_hnsw_diff_empty(hnsw_config: &Option<HnswConfigDiff>) -> bool {
-    hnsw_config
-        .as_ref()
-        .and_then(|config| config_diff::is_empty(config).ok())
-        .unwrap_or(true)
-}
-
-impl Anonymize for VectorParams {
-    fn anonymize(&self) -> Self {
-        self.clone()
-    }
-}
-
-/// If used, include weight modification, which will be applied to sparse vectors at query time:
-/// None - no modification (default)
-/// Idf - inverse document frequency, based on statistics of the collection
-#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Modifier {
-    #[default]
-    None,
-    Idf,
+    hnsw_config.is_none() || *hnsw_config == Some(HnswConfigDiff::default())
 }
 
 /// Params of single sparse vector data storage
-#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq)]
+#[derive(
+    Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
 pub struct SparseVectorParams {
     /// Custom params for index. If none - values from collection configuration are used.
@@ -1552,23 +1592,17 @@ impl SparseVectorParams {
     }
 }
 
-impl Anonymize for SparseVectorParams {
-    fn anonymize(&self) -> Self {
-        Self {
-            index: self.index.anonymize(),
-            modifier: self.modifier.clone(),
-        }
-    }
-}
-
 /// Configuration for sparse inverted index.
-#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Copy, Clone, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Hash, Deserialize, Serialize, JsonSchema, Anonymize, Copy, Clone, PartialEq, Eq, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub struct SparseIndexParams {
     /// We prefer a full scan search upto (excluding) this number of vectors.
     ///
     /// Note: this is number of vectors, not KiloBytes.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub full_scan_threshold: Option<usize>,
     /// Store index on disk. If set to false, the index will be stored in RAM. Default: false
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1585,16 +1619,6 @@ pub struct SparseIndexParams {
     ///   actual vector data does not need to conform to this range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datatype: Option<Datatype>,
-}
-
-impl Anonymize for SparseIndexParams {
-    fn anonymize(&self) -> Self {
-        SparseIndexParams {
-            full_scan_threshold: self.full_scan_threshold,
-            on_disk: self.on_disk,
-            datatype: self.datatype,
-        }
-    }
 }
 
 impl SparseIndexParams {
@@ -1625,7 +1649,7 @@ impl SparseIndexParams {
 ///          "distance": "Cosine"
 ///      }
 /// }
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Hash, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Hash, Eq)]
 #[serde(rename_all = "snake_case", untagged)]
 pub enum VectorsConfig {
     Single(VectorParams),
@@ -1724,20 +1748,6 @@ impl VectorsConfig {
     }
 }
 
-// TODO(sparse): Further unify `check_compatible` and `check_compatible_with_segment_config`?
-pub fn check_sparse_compatible(
-    self_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
-    other_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
-) -> CollectionResult<()> {
-    for (vector_name, _this) in self_config.iter() {
-        let Some(_other) = other_config.get(vector_name) else {
-            return Err(missing_vector_error(vector_name));
-        };
-    }
-
-    Ok(())
-}
-
 pub fn check_sparse_compatible_with_segment_config(
     self_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
     other: &HashMap<VectorNameBuf, segment::types::SparseVectorDataConfig>,
@@ -1781,15 +1791,6 @@ fn missing_vector_error(vector_name: &VectorName) -> CollectionError {
             "Vectors configuration is not compatible: \
              origin collection have vector {vector_name}, while other collection does not"
         ),
-    }
-}
-
-impl Anonymize for VectorsConfig {
-    fn anonymize(&self) -> Self {
-        match self {
-            VectorsConfig::Single(params) => VectorsConfig::Single(params.clone()),
-            VectorsConfig::Multi(params) => VectorsConfig::Multi(params.anonymize()),
-        }
     }
 }
 
@@ -1844,25 +1845,38 @@ impl VectorParamsBase {
 
 impl From<&VectorParams> for VectorParamsBase {
     fn from(params: &VectorParams) -> Self {
+        let &VectorParams {
+            size,
+            distance,
+            hnsw_config: _,
+            quantization_config: _,
+            on_disk: _,
+            datatype: _,
+            multivector_config: _,
+        } = params;
         Self {
-            size: params.size.get() as _, // TODO!?
-            distance: params.distance,
+            size: size.get() as _, // TODO!?
+            distance,
         }
     }
 }
 
 impl From<&segment::types::VectorDataConfig> for VectorParamsBase {
     fn from(config: &segment::types::VectorDataConfig) -> Self {
-        Self {
-            size: config.size,
-            distance: config.distance,
-        }
+        let &segment::types::VectorDataConfig {
+            size,
+            distance,
+            storage_type: _,
+            index: _,
+            quantization_config: _,
+            multivector_config: _,
+            datatype: _,
+        } = config;
+        Self { size, distance }
     }
 }
 
-#[derive(
-    Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Merge,
-)]
+#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct VectorParamsDiff {
     /// Update params for HNSW index. If empty object - it will be unset.
@@ -1935,9 +1949,7 @@ impl SparseVectorsConfig {
                 .sparse_vectors
                 .as_ref()
                 .and_then(|v| v.get(vector_name).map(|_| ()))
-                .ok_or_else(|| OperationError::VectorNameNotExists {
-                    received_name: vector_name.clone(),
-                })?;
+                .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))?;
         }
         Ok(())
     }
@@ -1981,86 +1993,6 @@ pub enum NodeType {
     Listener,
 }
 
-impl From<SearchRequestInternal> for CoreSearchRequest {
-    fn from(request: SearchRequestInternal) -> Self {
-        Self {
-            query: QueryEnum::Nearest(request.vector.into()),
-            filter: request.filter,
-            params: request.params,
-            limit: request.limit,
-            offset: request.offset.unwrap_or_default(),
-            with_payload: request.with_payload,
-            with_vector: request.with_vector,
-            score_threshold: request.score_threshold,
-        }
-    }
-}
-
-impl From<SearchRequestInternal> for ShardQueryRequest {
-    fn from(value: SearchRequestInternal) -> Self {
-        let SearchRequestInternal {
-            vector,
-            filter,
-            score_threshold,
-            limit,
-            offset,
-            params,
-            with_vector,
-            with_payload,
-        } = value;
-
-        Self {
-            prefetches: vec![],
-            query: Some(ScoringQuery::Vector(QueryEnum::Nearest(vector.into()))),
-            filter,
-            score_threshold,
-            limit,
-            offset: offset.unwrap_or_default(),
-            params,
-            with_vector: with_vector.unwrap_or_default(),
-            with_payload: with_payload.unwrap_or_default(),
-        }
-    }
-}
-
-impl From<CoreSearchRequest> for ShardQueryRequest {
-    fn from(value: CoreSearchRequest) -> Self {
-        let CoreSearchRequest {
-            query,
-            filter,
-            score_threshold,
-            limit,
-            offset,
-            params,
-            with_vector,
-            with_payload,
-        } = value;
-
-        Self {
-            prefetches: vec![],
-            query: Some(ScoringQuery::Vector(query)),
-            filter,
-            score_threshold,
-            limit,
-            offset,
-            params,
-            with_vector: with_vector.unwrap_or_default(),
-            with_payload: with_payload.unwrap_or_default(),
-        }
-    }
-}
-
-impl From<QueryEnum> for QueryVector {
-    fn from(query: QueryEnum) -> Self {
-        match query {
-            QueryEnum::Nearest(named) => QueryVector::Nearest(named.into()),
-            QueryEnum::RecommendBestScore(named) => QueryVector::Recommend(named.query),
-            QueryEnum::Discover(named) => QueryVector::Discovery(named.query),
-            QueryEnum::Context(named) => QueryVector::Context(named.query),
-        }
-    }
-}
-
 /// All the unresolved issues in a Qdrant instance
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct IssuesReport {
@@ -2068,9 +2000,10 @@ pub struct IssuesReport {
 }
 
 /// Metadata describing extra properties for each peer
-#[derive(Debug, Hash, Serialize, Deserialize, Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
 pub struct PeerMetadata {
     /// Peer Qdrant version
+    #[schemars(schema_with = "String::json_schema")]
     pub(crate) version: Version,
 }
 

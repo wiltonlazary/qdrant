@@ -3,12 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::grpc::qdrant::CollectionExists;
-use api::rest::models::{CollectionDescription, CollectionsResponse};
+use api::rest::models::{
+    CollectionDescription, CollectionsResponse, ShardKeyDescription, ShardKeysResponse,
+};
 use collection::config::ShardingMethod;
+#[cfg(feature = "staging")]
+use collection::operations::cluster_ops::TestSlowDownOperation;
 use collection::operations::cluster_ops::{
     AbortTransferOperation, ClusterOperations, DropReplicaOperation, MoveShardOperation,
-    ReplicateShardOperation, ReshardingDirection, RestartTransfer, RestartTransferOperation,
-    StartResharding,
+    ReplicatePoints, ReplicatePointsOperation, ReplicateShardOperation, ReshardingDirection,
+    RestartTransfer, RestartTransferOperation, StartResharding,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::snapshot_ops::SnapshotDescription;
@@ -17,13 +21,18 @@ use collection::operations::types::{
 };
 use collection::operations::verification::new_unchecked_verification_pass;
 use collection::shards::replica_set;
+use collection::shards::replica_set::replica_set_state;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
-use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
+use collection::shards::transfer::{
+    ShardTransfer, ShardTransferKey, ShardTransferMethod, ShardTransferRestart,
+};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use rand::seq::IteratorRandom;
 use storage::content_manager::collection_meta_ops::ShardTransferOperations::{Abort, Start};
+#[cfg(feature = "staging")]
+use storage::content_manager::collection_meta_ops::TestSlowDown;
 use storage::content_manager::collection_meta_ops::{
     CollectionMetaOperations, CreateShardKey, DropShardKey, ReshardingOperation,
     SetShardReplicaState, ShardTransferOperations, UpdateCollectionOperation,
@@ -31,15 +40,18 @@ use storage::content_manager::collection_meta_ops::{
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, AccessRequirements};
+use storage::rbac::AccessRequirements;
 use uuid::Uuid;
+
+use super::auth::Auth;
 
 pub async fn do_collection_exists(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
     name: &str,
 ) -> Result<CollectionExists, StorageError> {
-    let collection_pass = access.check_collection_access(name, AccessRequirements::new())?;
+    let collection_pass =
+        auth.check_collection_access(name, AccessRequirements::new(), "collection_exists")?;
 
     // if this returns Ok, it means the collection exists.
     // if not, we check that the error is NotFound
@@ -54,12 +66,12 @@ pub async fn do_collection_exists(
 
 pub async fn do_get_collection(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
     name: &str,
     shard_selection: Option<ShardId>,
 ) -> Result<CollectionInfo, StorageError> {
     let collection_pass =
-        access.check_collection_access(name, AccessRequirements::new().whole())?;
+        auth.check_collection_access(name, AccessRequirements::new(), "get_collection")?;
 
     let collection = toc.get_collection(&collection_pass).await?;
 
@@ -73,10 +85,10 @@ pub async fn do_get_collection(
 
 pub async fn do_list_collections(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
 ) -> Result<CollectionsResponse, StorageError> {
     let collections = toc
-        .all_collections(&access)
+        .all_collections(auth.access("list_collections"))
         .await
         .into_iter()
         .map(|pass| CollectionDescription {
@@ -85,6 +97,31 @@ pub async fn do_list_collections(
         .collect_vec();
 
     Ok(CollectionsResponse { collections })
+}
+
+pub async fn do_get_collection_shard_keys(
+    toc: &TableOfContent,
+    auth: &Auth,
+    name: &str,
+) -> Result<ShardKeysResponse, StorageError> {
+    let collection_pass =
+        auth.check_collection_access(name, AccessRequirements::new(), "get_collection_shard_keys")?;
+
+    let collection = toc.get_collection(&collection_pass).await?;
+
+    let state = collection.state().await;
+    let shard_keys = match state.config.params.sharding_method.unwrap_or_default() {
+        ShardingMethod::Auto => None,
+        ShardingMethod::Custom => Some(
+            state
+                .shards_key_mapping
+                .iter_shard_keys()
+                .map(|k| ShardKeyDescription { key: k.clone() })
+                .collect(),
+        ),
+    };
+
+    Ok(ShardKeysResponse { shard_keys })
 }
 
 /// Construct shards-replicas layout for the shard from the given scope of peers
@@ -128,13 +165,17 @@ fn generate_even_placement(
 
 pub async fn do_list_collection_aliases(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
     collection_name: &str,
 ) -> Result<CollectionsAliasesResponse, StorageError> {
-    let collection_pass =
-        access.check_collection_access(collection_name, AccessRequirements::new())?;
+    let collection_pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new(),
+        "list_collection_aliases",
+    )?;
+    let access = auth.unlogged_access(); // Do not log as it is just logger above
     let aliases: Vec<AliasDescription> = toc
-        .collection_aliases(&collection_pass, &access)
+        .collection_aliases(&collection_pass, access)
         .await?
         .into_iter()
         .map(|alias| AliasDescription {
@@ -147,19 +188,22 @@ pub async fn do_list_collection_aliases(
 
 pub async fn do_list_aliases(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
 ) -> Result<CollectionsAliasesResponse, StorageError> {
-    let aliases = toc.list_aliases(&access).await?;
+    let aliases = toc.list_aliases(auth.access("list_aliases")).await?;
     Ok(CollectionsAliasesResponse { aliases })
 }
 
 pub async fn do_list_snapshots(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
     collection_name: &str,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    let collection_pass = access
-        .check_collection_access(collection_name, AccessRequirements::new().whole().extras())?;
+    let collection_pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().extras(),
+        "list_snapshots",
+    )?;
     Ok(toc
         .get_collection(&collection_pass)
         .await?
@@ -169,13 +213,14 @@ pub async fn do_list_snapshots(
 
 pub async fn do_create_snapshot(
     toc: Arc<TableOfContent>,
-    access: Access,
+    auth: &Auth,
     collection_name: &str,
 ) -> Result<SnapshotDescription, StorageError> {
-    let collection_pass = access
+    let collection_pass = auth
         .check_collection_access(
             collection_name,
-            AccessRequirements::new().write().whole().extras(),
+            AccessRequirements::new().write().extras(),
+            "create_snapshot",
         )?
         .into_static();
 
@@ -186,11 +231,14 @@ pub async fn do_create_snapshot(
 
 pub async fn do_get_collection_cluster(
     toc: &TableOfContent,
-    access: Access,
+    auth: &Auth,
     name: &str,
 ) -> Result<CollectionClusterInfo, StorageError> {
-    let collection_pass =
-        access.check_collection_access(name, AccessRequirements::new().whole().extras())?;
+    let collection_pass = auth.check_collection_access(
+        name,
+        AccessRequirements::new().extras(),
+        "get_collection_cluster",
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
     Ok(collection.cluster_info(toc.this_peer_id).await?)
 }
@@ -199,12 +247,13 @@ pub async fn do_update_collection_cluster(
     dispatcher: &Dispatcher,
     collection_name: String,
     operation: ClusterOperations,
-    access: Access,
+    auth: Auth,
     wait_timeout: Option<Duration>,
 ) -> Result<bool, StorageError> {
-    let collection_pass = access.check_collection_access(
+    let collection_pass = auth.check_collection_access(
         &collection_name,
-        AccessRequirements::new().write().manage().whole().extras(),
+        AccessRequirements::new().write().manage().extras(),
+        "update_collection_cluster",
     )?;
 
     if dispatcher.consensus_state().is_none() {
@@ -244,7 +293,7 @@ pub async fn do_update_collection_cluster(
     let pass = new_unchecked_verification_pass();
 
     let collection = dispatcher
-        .toc(&access, &pass)
+        .toc(&auth, &pass)
         .get_collection(&collection_pass)
         .await?;
 
@@ -276,9 +325,10 @@ pub async fn do_update_collection_cluster(
                             from: move_shard.from_peer_id,
                             sync: false,
                             method: move_shard.method,
+                            filter: None,
                         }),
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -312,9 +362,71 @@ pub async fn do_update_collection_cluster(
                             from: replicate_shard.from_peer_id,
                             sync: true,
                             method: replicate_shard.method,
+                            filter: None,
                         }),
                     ),
-                    access,
+                    auth,
+                    wait_timeout,
+                )
+                .await
+        }
+        ClusterOperations::ReplicatePoints(ReplicatePointsOperation { replicate_points }) => {
+            let ReplicatePoints {
+                filter,
+                from_shard_key,
+                to_shard_key,
+            } = replicate_points;
+
+            let from_shard_ids = collection.get_shard_ids(&from_shard_key).await?;
+
+            // Temporary, before we support multi-source transfers
+            if from_shard_ids.len() != 1 {
+                return Err(StorageError::BadRequest {
+                    description: format!(
+                        "Only replicating from shard keys with exactly one shard is supported. Shard key {from_shard_key} has {} shards",
+                        from_shard_ids.len()
+                    ),
+                });
+            }
+
+            // validate shard key exists
+            let from_replicas = collection.get_replicas(&from_shard_key).await?;
+            let to_replicas = collection.get_replicas(&to_shard_key).await?;
+
+            debug_assert!(!from_replicas.is_empty());
+
+            if to_replicas.len() != 1 {
+                return Err(StorageError::BadRequest {
+                    description: format!(
+                        "Only replicating to shard keys with exactly one replica is supported. Shard key {to_shard_key} has {} replicas",
+                        to_replicas.len()
+                    ),
+                });
+            }
+
+            let (from_shard_id, from_peer_id) = from_replicas[0];
+            let (to_shard_id, to_peer_id) = to_replicas[0];
+
+            // validate source & target peers exist
+            validate_peer_exists(to_peer_id)?;
+            validate_peer_exists(from_peer_id)?;
+
+            // submit operation to consensus
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::TransferShard(
+                        collection_name,
+                        Start(ShardTransfer {
+                            shard_id: from_shard_id,
+                            to_shard_id: Some(to_shard_id),
+                            from: from_peer_id,
+                            to: to_peer_id,
+                            sync: true,
+                            method: Some(ShardTransferMethod::StreamRecords),
+                            filter,
+                        }),
+                    ),
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -345,7 +457,7 @@ pub async fn do_update_collection_cluster(
                             reason: "user request".to_string(),
                         },
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -372,7 +484,7 @@ pub async fn do_update_collection_cluster(
             dispatcher
                 .submit_collection_meta_op(
                     CollectionMetaOperations::UpdateCollection(update_operation),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -406,6 +518,18 @@ pub async fn do_update_collection_cluster(
                 .replication_factor
                 .unwrap_or(state.config.params.replication_factor)
                 .get() as usize;
+
+            if let Some(initial_state) = create_sharding_key.initial_state {
+                match initial_state {
+                    replica_set_state::ReplicaState::Active
+                    | replica_set_state::ReplicaState::Partial => {}
+                    _ => {
+                        return Err(StorageError::bad_request(format!(
+                            "Initial state cannot be {initial_state:?}, only Active or Partial are allowed",
+                        )));
+                    }
+                }
+            }
 
             let shard_keys_mapping = state.shards_key_mapping;
             if shard_keys_mapping.contains_key(&create_sharding_key.shard_key) {
@@ -444,8 +568,9 @@ pub async fn do_update_collection_cluster(
                         collection_name,
                         shard_key: create_sharding_key.shard_key,
                         placement: exact_placement,
+                        initial_state: create_sharding_key.initial_state,
                     }),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -483,7 +608,7 @@ pub async fn do_update_collection_cluster(
                         collection_name,
                         shard_key: drop_sharding_key.shard_key,
                     }),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -527,7 +652,7 @@ pub async fn do_update_collection_cluster(
                             method,
                         }),
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -551,12 +676,12 @@ pub async fn do_update_collection_cluster(
 
             let collection_state = collection.state().await;
 
-            if let Some(shard_key) = &shard_key {
-                if !collection_state.shards_key_mapping.contains_key(shard_key) {
-                    return Err(StorageError::bad_request(format!(
-                        "sharding key {shard_key} does not exist for collection {collection_name}",
-                    )));
-                }
+            if let Some(shard_key) = &shard_key
+                && !collection_state.shards_key_mapping.contains_key(shard_key)
+            {
+                return Err(StorageError::bad_request(format!(
+                    "sharding key {shard_key} does not exist for collection {collection_name}",
+                )));
             }
 
             let shard_id = match (direction, shard_key.as_ref()) {
@@ -648,7 +773,7 @@ pub async fn do_update_collection_cluster(
                             shard_key,
                         }),
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -674,7 +799,7 @@ pub async fn do_update_collection_cluster(
                             shard_key: state.shard_key.clone(),
                         }),
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -694,7 +819,7 @@ pub async fn do_update_collection_cluster(
                         collection_name.clone(),
                         ReshardingOperation::Finish(state.key()),
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -732,8 +857,8 @@ pub async fn do_update_collection_cluster(
             };
 
             let from_state = match state.direction {
-                ReshardingDirection::Up => replica_set::ReplicaState::Resharding,
-                ReshardingDirection::Down => replica_set::ReplicaState::ReshardingScaleDown,
+                ReshardingDirection::Up => replica_set_state::ReplicaState::Resharding,
+                ReshardingDirection::Down => replica_set_state::ReplicaState::ReshardingScaleDown,
             };
 
             dispatcher
@@ -742,10 +867,10 @@ pub async fn do_update_collection_cluster(
                         collection_name: collection_name.clone(),
                         shard_id,
                         peer_id,
-                        state: replica_set::ReplicaState::Active,
+                        state: replica_set_state::ReplicaState::Active,
                         from_state: Some(from_state),
                     }),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -774,7 +899,7 @@ pub async fn do_update_collection_cluster(
                             shard_key: state.shard_key.clone(),
                         }),
                     ),
-                    access,
+                    auth,
                     wait_timeout,
                 )
                 .await
@@ -803,7 +928,28 @@ pub async fn do_update_collection_cluster(
                             shard_key: state.shard_key.clone(),
                         }),
                     ),
-                    access,
+                    auth,
+                    wait_timeout,
+                )
+                .await
+        }
+
+        #[cfg(feature = "staging")]
+        ClusterOperations::TestSlowDown(TestSlowDownOperation { test_slow_down }) => {
+            if let Some(peer_id) = test_slow_down.peer_id {
+                validate_peer_exists(peer_id)?;
+            }
+
+            // Convert seconds (f64) to milliseconds (u64)
+            let duration_ms = (test_slow_down.duration * 1000.0) as u64;
+
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::TestSlowDown(TestSlowDown {
+                        peer_id: test_slow_down.peer_id,
+                        duration_ms,
+                    }),
+                    auth,
                     wait_timeout,
                 )
                 .await

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
 use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
     WriteOrdering,
@@ -11,24 +12,25 @@ use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::shared_storage_config::SharedStorageConfig;
 use collection::operations::types::{NodeType, VectorsConfig};
 use collection::operations::vector_params_builder::VectorParamsBuilder;
-use collection::operations::CollectionUpdateOperations;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
 use segment::types::{Distance, WithPayloadInterface, WithVector};
+use shard::snapshots::snapshot_data::SnapshotData;
 use tempfile::Builder;
 
 use crate::common::{
-    dummy_abort_shard_transfer, dummy_on_replica_failure, dummy_request_shard_transfer, REST_PORT,
-    TEST_OPTIMIZERS_CONFIG,
+    REST_PORT, TEST_OPTIMIZERS_CONFIG, dummy_abort_shard_transfer, dummy_on_replica_failure,
+    dummy_request_shard_transfer,
 };
 
 async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let collection_params = CollectionParams {
@@ -44,6 +46,7 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
@@ -74,13 +77,14 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         &config,
         Arc::new(storage_config),
         shard_distribution,
-        ChannelService::new(REST_PORT, None),
+        None,
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await
@@ -106,8 +110,15 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
         PointInsertOperationsInternal::PointsList(points),
     ));
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await
         .unwrap();
 
@@ -118,12 +129,10 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         .await
         .unwrap();
 
-    if let Err(err) = Collection::restore_snapshot(
-        &snapshots_path.path().join(snapshot_description.name),
-        recover_dir.path(),
-        0,
-        false,
-    ) {
+    let snapshot_data =
+        SnapshotData::new_packed_persistent(snapshots_path.path().join(snapshot_description.name));
+
+    if let Err(err) = Collection::restore_snapshot(snapshot_data, recover_dir.path(), 0, false) {
         panic!("Failed to restore snapshot: {err}")
     }
 
@@ -133,13 +142,13 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         recover_dir.path(),
         snapshots_path.path(),
         Default::default(),
-        ChannelService::new(REST_PORT, None),
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await;

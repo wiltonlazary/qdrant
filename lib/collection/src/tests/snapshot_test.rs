@@ -1,9 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use common::cpu::CpuBudget;
+use ahash::AHashMap;
+use common::budget::ResourceBudget;
 use segment::types::Distance;
+use shard::snapshots::snapshot_data::SnapshotData;
 use tempfile::Builder;
 
 use crate::collection::{Collection, RequestShardTransfer};
@@ -36,6 +38,7 @@ async fn _test_snapshot_collection(node_type: NodeType) {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let collection_params = CollectionParams {
@@ -54,6 +57,7 @@ async fn _test_snapshot_collection(node_type: NodeType) {
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
@@ -61,7 +65,7 @@ async fn _test_snapshot_collection(node_type: NodeType) {
 
     let collection_name = "test".to_string();
     let collection_name_rec = "test_rec".to_string();
-    let mut shards = HashMap::new();
+    let mut shards = AHashMap::new();
     shards.insert(0, HashSet::from([1]));
     shards.insert(1, HashSet::from([1]));
     shards.insert(2, HashSet::from([10_000])); // remote shard
@@ -80,13 +84,14 @@ async fn _test_snapshot_collection(node_type: NodeType) {
         &config,
         Arc::new(storage_config),
         CollectionShardDistribution { shards },
+        None,
         ChannelService::default(),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await
@@ -105,27 +110,23 @@ async fn _test_snapshot_collection(node_type: NodeType) {
             .prefix("test_collection_rec")
             .tempdir()
             .unwrap();
+        let snapshot_data = SnapshotData::new_packed_persistent(
+            snapshots_path.path().join(&snapshot_description.name),
+        );
+
         // Do not recover in local mode if some shards are remote
-        assert!(Collection::restore_snapshot(
-            &snapshots_path.path().join(&snapshot_description.name),
-            recover_dir.path(),
-            0,
-            false,
-        )
-        .is_err());
+        assert!(
+            Collection::restore_snapshot(snapshot_data, recover_dir.path(), 0, false,).is_err(),
+        );
     }
 
     let recover_dir = Builder::new()
         .prefix("test_collection_rec")
         .tempdir()
         .unwrap();
-
-    if let Err(err) = Collection::restore_snapshot(
-        &snapshots_path.path().join(snapshot_description.name),
-        recover_dir.path(),
-        0,
-        true,
-    ) {
+    let snapshot_data =
+        SnapshotData::new_packed_persistent(snapshots_path.path().join(&snapshot_description.name));
+    if let Err(err) = Collection::restore_snapshot(snapshot_data, recover_dir.path(), 0, true) {
         panic!("Failed to restore snapshot: {err}")
     }
 
@@ -141,7 +142,7 @@ async fn _test_snapshot_collection(node_type: NodeType) {
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await;

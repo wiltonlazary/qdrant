@@ -27,6 +27,15 @@ fi
         "size": 4,
         "distance": "Dot"
       }
+   },
+   "sparse_vectors_config": {
+      "map": {
+        "sparse": {
+          "index": {
+            "on_disk": true
+          }
+        }
+      }
    }
 }' $QDRANT_HOST qdrant.Collections/Create
 
@@ -53,6 +62,83 @@ fi
     {"id": { "num": 4 }, "vectors": {"vector": {"data": [0.18, 0.01, 0.85, 0.80]}}, "payload": {"city": {"list_value": {"values": [{ "string_value": "London" }, { "string_value": "Moscow" }]}}}},
     {"id": { "uuid": "98a9a4b1-4ef2-46fb-8315-a97d874fe1d7" }, "vectors": {"vector": {"data": [0.24, 0.18, 0.22, 0.44]}}, "payload": {"count":{"list_value": {"values": [{ "integer_value": 0 }]}}}},
     {"id": { "uuid": "f0e09527-b096-42a8-94e9-ea94d342b925" }, "vectors": {"vector": {"data": [0.35, 0.08, 0.11, 0.44]}}}
+  ]
+}' $QDRANT_HOST qdrant.Points/Upsert
+
+# Upsert point with empty payload
+"${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "points": [
+    {
+      "id": { "num": 1 },
+      "vectors": { "vector": { "data": [0.05, 0.61, 0.76, 0.74] }},
+      "payload": {}
+    }
+  ]
+}' $QDRANT_HOST qdrant.Points/Upsert
+
+# Retrieve point by ID
+response=$("${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "with_payload": {"enable": true},
+  "with_vectors": {"enable": true},
+  "ids": [{ "num": 1 }]
+}' $QDRANT_HOST qdrant.Points/Get)
+
+payload_exists=$(echo "$response" | jq '(.result[0].payload != null)')
+
+if [[ "$payload_exists" == true ]]; then
+  echo "Payload should be empty."
+  exit 1
+fi
+
+# Insert invalid sparse vector, check that validation error is returned
+"${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "points": [
+    {
+      "id": { "num": 100 },
+      "vectors": {
+        "vectors": {
+          "vectors": {
+            "sparse": {
+              "data": [],
+              "sparse": {
+                "indices": [0, 2, 1, 2],
+                "values": [0.1, 0.2, 0.3, 0.4]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}' $QDRANT_HOST qdrant.Points/Upsert 2>&1 | grep -q "Validation error in body" || {
+  echo "Expected validation error not returned for invalid sparse vector"
+  exit 1
+}
+
+
+# Insert correct sparse vector
+"${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "points": [
+    {
+      "id": { "num": 100 },
+      "vectors": {
+        "vectors": {
+          "vectors": {
+            "sparse": {
+              "data": [],
+              "sparse": {
+                "indices": [0, 2, 1, 5],
+                "values": [0.1, 0.2, 0.3, 0.4]
+              }
+            }
+          }
+        }
+      }
+    }
   ]
 }' $QDRANT_HOST qdrant.Points/Upsert
 
@@ -120,6 +206,34 @@ fi
   "positive": [{ "num": 1 }],
   "negative": [{ "num": 2 }]
 }' $QDRANT_HOST qdrant.Points/Recommend
+
+# old format
+"${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "target": {
+    "single": {
+        "vector": {
+            "data": [0.2,0.1,0.9,0.1]
+        }
+    }
+  },
+  "limit": 1
+}' $QDRANT_HOST qdrant.Points/Discover
+
+# new format
+"${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "target": {
+    "single": {
+        "vector": {
+            "dense": {
+                "data": [0.2,0.1,0.9,0.1]
+            }
+        }
+    }
+  },
+  "limit": 1
+}' $QDRANT_HOST qdrant.Points/Discover
 
 # city facet
 "${docker_grpcurl[@]}" -d '{

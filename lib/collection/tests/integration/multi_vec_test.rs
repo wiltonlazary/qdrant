@@ -5,6 +5,7 @@ use std::path::Path;
 use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
 use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
     WriteOrdering,
@@ -14,7 +15,6 @@ use collection::operations::types::{
     CollectionError, PointRequestInternal, RecommendRequestInternal, VectorsConfig,
 };
 use collection::operations::vector_params_builder::VectorParamsBuilder;
-use collection::operations::CollectionUpdateOperations;
 use collection::recommendations::recommend_by;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::data_types::named_vectors::NamedVectors;
@@ -22,7 +22,7 @@ use segment::data_types::vectors::{NamedVector, VectorStructInternal};
 use segment::types::{Distance, VectorName, WithPayloadInterface, WithVector};
 use tempfile::Builder;
 
-use crate::common::{new_local_collection, N_SHARDS, TEST_OPTIMIZERS_CONFIG};
+use crate::common::{N_SHARDS, TEST_OPTIMIZERS_CONFIG, new_local_collection};
 
 const VECTOR1_NAME: &VectorName = "vec1";
 const VECTOR2_NAME: &VectorName = "vec2";
@@ -38,6 +38,7 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let vector_params1 = VectorParamsBuilder::new(4, Distance::Dot).build();
@@ -62,6 +63,7 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let snapshot_path = collection_path.join("snapshots");
@@ -107,8 +109,15 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
         PointInsertOperationsInternal::PointsList(points),
     ));
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await
         .unwrap();
 

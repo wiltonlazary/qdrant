@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use common::types::PointOffsetType;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::shader_builder::ShaderBuilderParameters;
 use crate::common::check_stopped;
@@ -14,6 +15,7 @@ use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 /// Size of transfer buffer for links.
 const LINKS_TRANSFER_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 struct GpuLinksParamsBuffer {
     m: u32,
@@ -163,6 +165,10 @@ impl GpuLinks {
         Ok(())
     }
 
+    pub fn links_buffer(&self) -> Arc<gpu::Buffer> {
+        self.links_buffer.clone()
+    }
+
     pub fn upload_links(
         &mut self,
         level: usize,
@@ -181,6 +187,7 @@ impl GpuLinks {
             .filter(|&point_id| {
                 !graph_layers_builder.links_layers()[point_id][level]
                     .read()
+                    .links()
                     .is_empty()
             })
             .collect();
@@ -190,7 +197,7 @@ impl GpuLinks {
 
             for &point_id in points_slice {
                 let links = graph_layers_builder.links_layers()[point_id][level].read();
-                self.set_links(point_id as PointOffsetType, &links)?;
+                self.set_links(point_id as PointOffsetType, links.links())?;
             }
             self.apply_gpu_patches(gpu_context)?;
             gpu_context.run()?;
@@ -245,17 +252,15 @@ impl GpuLinks {
             gpu_context.run()?;
             gpu_context.wait_finish(GPU_TIMEOUT)?;
 
-            let mut links =
-                vec![PointOffsetType::default(); chunk_size * (self.links_capacity + 1)];
-            download_buffer.download_slice(&mut links, 0)?;
+            let links = download_buffer
+                .download_vec::<PointOffsetType>(0, chunk_size * (self.links_capacity + 1))?;
 
             for (index, chunk) in links.chunks(self.links_capacity + 1).enumerate() {
                 let point_id = points[start + index] as usize;
                 let links_count = chunk[0] as usize;
                 let links = &chunk[1..=links_count];
                 let mut dst = graph_layers_builder.links_layers()[point_id][level].write();
-                dst.clear();
-                dst.extend(links.iter().copied().filter(|&other_point_id| {
+                dst.fill_from(links.iter().copied().filter(|&other_point_id| {
                     let is_correct_link =
                         level < graph_layers_builder.links_layers()[other_point_id as usize].len();
                     if !is_correct_link {
@@ -327,7 +332,7 @@ impl GpuLinks {
         self.patch_buffer
             .upload(&(links.len() as u32), patch_start_index)?;
         patch_start_index += std::mem::size_of::<PointOffsetType>();
-        self.patch_buffer.upload_slice(links, patch_start_index)?;
+        self.patch_buffer.upload(links, patch_start_index)?;
         self.patched_points.push((point_id, links.len()));
 
         Ok(())

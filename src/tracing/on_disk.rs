@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::io;
 use std::sync::Mutex;
-use std::{fs, io};
 
 use anyhow::Context as _;
 use common::ext::OptionExt;
+use fs_err as fs;
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::{fmt, registry, Layer};
+use tracing_subscriber::{Layer, fmt, registry};
 
 use super::*;
 
@@ -17,6 +18,7 @@ pub struct Config {
     pub log_level: Option<String>,
     pub format: Option<config::LogFormat>,
     pub span_events: Option<HashSet<config::SpanEvent>>,
+    pub buffer_size_bytes: Option<usize>,
 }
 
 impl Config {
@@ -27,6 +29,7 @@ impl Config {
             log_level,
             span_events,
             format,
+            buffer_size_bytes,
         } = other;
 
         self.enabled.replace_if_some(enabled);
@@ -34,6 +37,7 @@ impl Config {
         self.log_level.replace_if_some(log_level);
         self.span_events.replace_if_some(span_events);
         self.format.replace_if_some(format);
+        self.buffer_size_bytes.replace_if_some(buffer_size_bytes);
     }
 }
 
@@ -67,17 +71,22 @@ where
     }
 
     let Some(log_file) = &config.log_file else {
-        return Err(anyhow::format_err!("log file is not specified"));
+        return Err(anyhow::format_err!(
+            "log file is not specified (it can only be specified in the config file)"
+        ));
     };
 
     let writer = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_file)
-        .with_context(|| format!("failed to open {log_file} log-file"))?;
+        .with_context(|| format!("failed to open log file {log_file}"))?;
 
     let layer = fmt::Layer::default()
-        .with_writer(Mutex::new(io::BufWriter::new(writer)))
+        .with_writer(Mutex::new(io::BufWriter::with_capacity(
+            config.buffer_size_bytes.unwrap_or(8192),
+            writer,
+        )))
         .with_span_events(config::SpanEvent::unwrap_or_default_config(
             &config.span_events,
         ))

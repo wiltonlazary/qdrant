@@ -1,16 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use api::rest::OrderByInterface;
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
-use rand::{rng, Rng};
-use segment::data_types::vectors::NamedVectorStruct;
+use rand::{Rng, rng};
+use segment::data_types::vectors::NamedQuery;
 use segment::types::{
     Distance, ExtendedPointId, Payload, PayloadFieldSchema, PayloadSchemaType, SearchParams,
 };
 use serde_json::{Map, Value};
+use shard::query::query_enum::QueryEnum;
 use tempfile::Builder;
 
 use crate::collection::{Collection, RequestShardTransfer};
@@ -18,7 +20,6 @@ use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
 };
-use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{
@@ -29,7 +30,8 @@ use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
-use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
 use crate::shards::shard::{PeerId, ShardId};
 
 const DIM: u64 = 4;
@@ -42,6 +44,7 @@ async fn fixture() -> Collection {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
+        wal_retain_closed: 1,
     };
 
     let collection_params = CollectionParams {
@@ -60,13 +63,14 @@ async fn fixture() -> Collection {
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
         uuid: None,
+        metadata: None,
     };
 
     let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
 
     let collection_name = "test".to_string();
-    let shards: HashMap<ShardId, HashSet<PeerId>> = (0..SHARD_COUNT)
+    let shards: AHashMap<ShardId, HashSet<PeerId>> = (0..SHARD_COUNT)
         .map(|i| (i, HashSet::from([PEER_ID])))
         .collect();
 
@@ -81,13 +85,14 @@ async fn fixture() -> Collection {
         &config,
         storage_config.clone(),
         CollectionShardDistribution { shards },
+        None,
         ChannelService::default(),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await
@@ -98,6 +103,7 @@ async fn fixture() -> Collection {
         .create_payload_index(
             "num".parse().unwrap(),
             PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to create payload index");
@@ -132,7 +138,7 @@ async fn fixture() -> Collection {
             ])),
         ));
         shard
-            .update_local(op, true)
+            .update_local(op, true, None, HwMeasurementAcc::new(), false)
             .await
             .expect("failed to insert points");
     }
@@ -201,11 +207,14 @@ async fn test_scroll_dedup() {
     assert!(!result.points.is_empty(), "expected some points");
 
     let mut seen = HashSet::new();
-    for point_id in result.points.iter().map(|point| point.id) {
+    for record in result.points.iter() {
         assert!(
-            seen.insert(point_id),
-            "got point id {point_id:?} more than once, they should be deduplicated",
+            seen.insert((record.id, record.order_value)),
+            "got point id {:?} with order value {:?} more than once, they should be deduplicated",
+            record.id,
+            record.order_value,
         );
+        assert!(record.order_value.is_some());
     }
 }
 
@@ -249,7 +258,7 @@ async fn test_search_dedup() {
     let points = collection
         .search(
             CoreSearchRequest {
-                query: QueryEnum::Nearest(NamedVectorStruct::Default(vec![0.1, 0.2, 0.3, 0.4])),
+                query: QueryEnum::Nearest(NamedQuery::default_dense(vec![0.1, 0.2, 0.3, 0.4])),
                 filter: None,
                 params: Some(SearchParams {
                     exact: true,

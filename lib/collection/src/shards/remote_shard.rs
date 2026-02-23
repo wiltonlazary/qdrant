@@ -11,13 +11,15 @@ use api::grpc::qdrant::shard_snapshots_client::ShardSnapshotsClient;
 use api::grpc::qdrant::{
     CollectionOperationResponse, CoreSearchBatchPointsInternal, CountPoints, CountPointsInternal,
     CountResponse, FacetCountsInternal, GetCollectionInfoRequest, GetCollectionInfoRequestInternal,
-    GetPoints, GetPointsInternal, GetShardRecoveryPointRequest, HealthCheckRequest,
-    InitiateShardTransferRequest, QueryBatchPointsInternal, QueryBatchResponseInternal,
-    QueryShardPoints, RecoverShardSnapshotRequest, RecoverSnapshotResponse, ScrollPoints,
-    ScrollPointsInternal, SearchBatchResponse, ShardSnapshotLocation,
-    UpdateShardCutoffPointRequest, WaitForShardStateRequest,
+    GetPoints, GetPointsInternal, GetShardOptimizationsRequest, GetShardRecoveryPointRequest,
+    HealthCheckRequest, InitiateShardTransferRequest, QueryBatchPointsInternal,
+    QueryBatchResponseInternal, QueryShardPoints, RecoverShardSnapshotRequest,
+    RecoverSnapshotResponse, ScrollPoints, ScrollPointsInternal, SearchBatchResponse,
+    ShardSnapshotLocation, UpdateShardCutoffPointRequest, WaitForShardStateRequest,
 };
 use api::grpc::transport_channel_pool::{AddTimeout, MAX_GRPC_CHANNEL_TIMEOUT};
+use api::grpc::update_operation::Update;
+use api::grpc::{UpdateBatchInternal, UpdateOperation, WithPayloadSelector};
 use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::types::TelemetryDetail;
@@ -31,28 +33,34 @@ use segment::data_types::order_by::OrderBy;
 use segment::types::{
     ExtendedPointId, Filter, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
 };
+use semver::Version;
+use shard::count::CountRequestInternal;
+use shard::retrieve::record_internal::RecordInternal;
+use shard::scroll::ScrollRequestInternal;
+use shard::search::CoreSearchRequestBatch;
 use tokio::runtime::Handle;
+use tonic::Status;
 use tonic::codegen::InterceptedService;
 use tonic::transport::{Channel, Uri};
-use tonic::Status;
 use url::Url;
 
 use super::conversions::{
-    internal_delete_vectors, internal_delete_vectors_by_filter, internal_update_vectors,
+    internal_conditional_upsert_points, internal_delete_vectors, internal_delete_vectors_by_filter,
+    internal_update_vectors,
 };
 use super::local_shard::clock_map::RecoveryPoint;
-use super::replica_set::ReplicaState;
 use crate::operations::conversions::try_record_from_grpc;
 use crate::operations::payload_ops::PayloadOps;
 use crate::operations::point_ops::{PointOperations, WriteOrdering};
 use crate::operations::snapshot_ops::SnapshotPriority;
 use crate::operations::types::{
-    CollectionError, CollectionInfo, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, PointRequestInternal, RecordInternal, UpdateResult,
+    CollectionError, CollectionInfo, CollectionResult, CoreSearchRequest, CountResult,
+    OptimizationsRequestOptions, OptimizationsResponse, PointRequestInternal, UpdateResult,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::vector_ops::VectorOperations;
 use crate::operations::{CollectionUpdateOperations, FieldIndexOperations, OperationWithClockTag};
+use crate::shards::CollectionId;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::conversions::{
     internal_clear_payload, internal_clear_payload_by_filter, internal_create_index,
@@ -60,10 +68,10 @@ use crate::shards::conversions::{
     internal_delete_points_by_filter, internal_set_payload, internal_sync_points,
     internal_upsert_points, try_scored_point_from_grpc,
 };
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_trait::ShardOperation;
 use crate::shards::telemetry::RemoteShardTelemetry;
-use crate::shards::CollectionId;
 
 /// Timeout for transferring and recovering a shard snapshot on a remote peer.
 const SHARD_SNAPSHOT_TRANSFER_RECOVER_TIMEOUT: Duration = MAX_GRPC_CHANNEL_TIMEOUT;
@@ -97,6 +105,14 @@ impl RemoteShard {
             telemetry_search_durations: OperationDurationsAggregator::new(),
             telemetry_update_durations: OperationDurationsAggregator::new(),
         }
+    }
+
+    /// Checks that remote shard is at least at the given version
+    /// - Returns `true` if we know that the peer is at least at the given version
+    /// - Returns `false` if we know that the peer not at the given version or version is unknown
+    pub fn check_version(&self, version: &Version) -> bool {
+        self.channel_service
+            .peer_is_at_version(self.peer_id, version)
     }
 
     pub fn restore_snapshot(_snapshot_path: &Path) {
@@ -188,15 +204,17 @@ impl RemoteShard {
     pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> RemoteShardTelemetry {
         RemoteShardTelemetry {
             shard_id: self.id,
-            peer_id: Some(self.peer_id),
-            searches: self
-                .telemetry_search_durations
-                .lock()
-                .get_statistics(detail),
-            updates: self
-                .telemetry_update_durations
-                .lock()
-                .get_statistics(detail),
+            peer_id: self.peer_id,
+            searches: Some(
+                self.telemetry_search_durations
+                    .lock()
+                    .get_statistics(detail),
+            ),
+            updates: Some(
+                self.telemetry_update_durations
+                    .lock()
+                    .get_statistics(detail),
+            ),
         }
     }
 
@@ -215,6 +233,252 @@ impl RemoteShard {
         Ok(res)
     }
 
+    pub async fn forward_update_batch(
+        &self,
+        operations: Vec<OperationWithClockTag>,
+        wait: bool,
+        timeout: Option<Duration>,
+        ordering: WriteOrdering,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<UpdateResult> {
+        let mut updates = Vec::with_capacity(operations.len());
+
+        let shard_id = Some(self.id);
+        let collection_name = &self.collection_id;
+        let ordering = Some(ordering);
+        let timeout = timeout.map(|t| t.as_secs());
+
+        for operation in operations {
+            let update_op = match operation.operation {
+                CollectionUpdateOperations::PointOperation(point_ops) => match point_ops {
+                    PointOperations::UpsertPoints(point_insert_operations) => {
+                        let request = internal_upsert_points(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            point_insert_operations,
+                            wait,
+                            timeout,
+                            ordering,
+                        )?;
+
+                        Update::Upsert(request)
+                    }
+                    PointOperations::UpsertPointsConditional(conditional_upsert) => {
+                        let request = internal_conditional_upsert_points(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            conditional_upsert,
+                            wait,
+                            timeout,
+                            ordering,
+                        )?;
+                        Update::Upsert(request)
+                    }
+                    PointOperations::DeletePoints { ids } => {
+                        let request = internal_delete_points(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            ids,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::Delete(request)
+                    }
+                    PointOperations::DeletePointsByFilter(filter) => {
+                        let request = internal_delete_points_by_filter(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            filter,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::Delete(request)
+                    }
+                    PointOperations::SyncPoints(operation) => {
+                        let request = internal_sync_points(
+                            shard_id,
+                            None, // TODO!?
+                            collection_name.clone(),
+                            operation,
+                            wait,
+                            timeout,
+                            ordering,
+                        )?;
+                        Update::Sync(request)
+                    }
+                },
+                CollectionUpdateOperations::VectorOperation(vector_ops) => match vector_ops {
+                    VectorOperations::UpdateVectors(update_operation) => {
+                        let request = internal_update_vectors(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            update_operation,
+                            wait,
+                            timeout,
+                            ordering,
+                        )?;
+                        Update::UpdateVectors(request)
+                    }
+                    VectorOperations::DeleteVectors(ids, vector_names) => {
+                        let request = internal_delete_vectors(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            ids.points,
+                            vector_names.clone(),
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::DeleteVectors(request)
+                    }
+                    VectorOperations::DeleteVectorsByFilter(filter, vector_names) => {
+                        let request = internal_delete_vectors_by_filter(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            filter,
+                            vector_names.clone(),
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::DeleteVectors(request)
+                    }
+                },
+                CollectionUpdateOperations::PayloadOperation(payload_ops) => match payload_ops {
+                    PayloadOps::SetPayload(set_payload) => {
+                        let request = internal_set_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            set_payload,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::SetPayload(request)
+                    }
+                    PayloadOps::DeletePayload(delete_payload) => {
+                        let request = internal_delete_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            delete_payload,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::DeletePayload(request)
+                    }
+                    PayloadOps::ClearPayload { points } => {
+                        let request = internal_clear_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            points,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::ClearPayload(request)
+                    }
+                    PayloadOps::ClearPayloadByFilter(filter) => {
+                        let request = internal_clear_payload_by_filter(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            filter,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::ClearPayload(request)
+                    }
+                    PayloadOps::OverwritePayload(set_payload) => {
+                        let request = internal_set_payload(
+                            shard_id,
+                            operation.clock_tag,
+                            collection_name.clone(),
+                            set_payload,
+                            wait,
+                            timeout,
+                            ordering,
+                        );
+                        Update::OverwritePayload(request)
+                    }
+                },
+                CollectionUpdateOperations::FieldIndexOperation(field_index_op) => {
+                    match field_index_op {
+                        FieldIndexOperations::CreateIndex(create_index) => {
+                            let request = internal_create_index(
+                                shard_id,
+                                operation.clock_tag,
+                                collection_name.clone(),
+                                create_index,
+                                wait,
+                                timeout,
+                                ordering,
+                            );
+                            Update::CreateFieldIndex(request)
+                        }
+                        FieldIndexOperations::DeleteIndex(delete_index) => {
+                            let request = internal_delete_index(
+                                shard_id,
+                                operation.clock_tag,
+                                collection_name.clone(),
+                                delete_index,
+                                wait,
+                                timeout,
+                                ordering,
+                            );
+                            Update::DeleteFieldIndex(request)
+                        }
+                    }
+                }
+                #[cfg(feature = "staging")]
+                CollectionUpdateOperations::StagingOperation(_) => {
+                    // Staging operations should not be forwarded to remote shards
+                    continue;
+                }
+            };
+            updates.push(UpdateOperation {
+                update: Some(update_op),
+            });
+        }
+
+        let batch_request = &UpdateBatchInternal {
+            operations: updates,
+        };
+
+        let point_operation_response = self
+            .with_points_client(|mut client| async move {
+                client
+                    .update_batch(tonic::Request::new(batch_request.clone()))
+                    .await
+            })
+            .await?
+            .into_inner();
+
+        if let Some(hw_usage) = point_operation_response.hardware_usage {
+            hw_measurement_acc.accumulate_request(hw_usage);
+        }
+
+        match point_operation_response.result {
+            None => Err(CollectionError::service_error(
+                "Malformed UpdateResult type".to_string(),
+            )),
+            Some(update_result) => update_result.try_into().map_err(|e: Status| e.into()),
+        }
+    }
+
     /// # Cancel safety
     ///
     /// This method is cancel safe.
@@ -222,7 +486,9 @@ impl RemoteShard {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
+        timeout: Option<Duration>,
         ordering: WriteOrdering,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `RemoteShard::execute_update_operation` is cancel safe, so this method is cancel safe.
 
@@ -231,7 +497,9 @@ impl RemoteShard {
             self.collection_id.clone(),
             operation,
             wait,
+            timeout,
             Some(ordering),
+            hw_measurement_acc,
         )
         .await
     }
@@ -239,19 +507,28 @@ impl RemoteShard {
     /// # Cancel safety
     ///
     /// This method is cancel safe.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_update_operation(
         &self,
         shard_id: Option<ShardId>,
         collection_name: String,
         operation: OperationWithClockTag,
         wait: bool,
+        timeout: Option<Duration>,
         ordering: Option<WriteOrdering>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // Cancelling remote request should always be safe on the client side and update API
         // *should be* cancel safe on the server side, so this method is cancel safe.
 
         let mut timer = ScopeDurationMeasurer::new(&self.telemetry_update_durations);
         timer.set_success(false);
+
+        let default_timeout = self.channel_service.request_timeout();
+
+        // We want to know if operation wrote into WAL before re break connection on client side
+        // So, we always want to propagate explicit timeout to the remote side
+        let timeout = Some(timeout.unwrap_or(default_timeout).as_secs());
 
         let point_operation_response = match operation.operation {
             CollectionUpdateOperations::PointOperation(point_ops) => match point_ops {
@@ -262,6 +539,23 @@ impl RemoteShard {
                         collection_name,
                         point_insert_operations,
                         wait,
+                        timeout,
+                        ordering,
+                    )?;
+                    self.with_points_client(|mut client| async move {
+                        client.upsert(tonic::Request::new(request.clone())).await
+                    })
+                    .await?
+                    .into_inner()
+                }
+                PointOperations::UpsertPointsConditional(conditional_upsert) => {
+                    let request = &internal_conditional_upsert_points(
+                        shard_id,
+                        operation.clock_tag,
+                        collection_name,
+                        conditional_upsert,
+                        wait,
+                        timeout,
                         ordering,
                     )?;
                     self.with_points_client(|mut client| async move {
@@ -277,6 +571,7 @@ impl RemoteShard {
                         collection_name,
                         ids,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -292,6 +587,7 @@ impl RemoteShard {
                         collection_name,
                         filter,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -307,6 +603,7 @@ impl RemoteShard {
                         collection_name,
                         operation,
                         wait,
+                        timeout,
                         ordering,
                     )?;
                     self.with_points_client(|mut client| async move {
@@ -324,6 +621,7 @@ impl RemoteShard {
                         collection_name,
                         update_operation,
                         wait,
+                        timeout,
                         ordering,
                     )?;
                     self.with_points_client(|mut client| async move {
@@ -342,6 +640,7 @@ impl RemoteShard {
                         ids.points,
                         vector_names.clone(),
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -360,6 +659,7 @@ impl RemoteShard {
                         filter,
                         vector_names.clone(),
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -379,6 +679,7 @@ impl RemoteShard {
                         collection_name,
                         set_payload,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -396,6 +697,7 @@ impl RemoteShard {
                         collection_name,
                         delete_payload,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -413,6 +715,7 @@ impl RemoteShard {
                         collection_name,
                         points,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -430,6 +733,7 @@ impl RemoteShard {
                         collection_name,
                         filter,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -447,6 +751,7 @@ impl RemoteShard {
                         collection_name,
                         set_payload,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -467,6 +772,7 @@ impl RemoteShard {
                         collection_name,
                         create_index,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -484,6 +790,7 @@ impl RemoteShard {
                         collection_name,
                         delete_index,
                         wait,
+                        timeout,
                         ordering,
                     );
                     self.with_points_client(|mut client| async move {
@@ -495,7 +802,33 @@ impl RemoteShard {
                     .into_inner()
                 }
             },
+            #[cfg(feature = "staging")]
+            CollectionUpdateOperations::StagingOperation(staging_op) => {
+                // TODO: Add gRPC support to forward staging operations to remote shards
+                // For now, staging operations only execute on local shards
+                match staging_op {
+                    shard::operations::staging::StagingOperations::Delay(delay_op) => {
+                        let delay =
+                            std::time::Duration::from_secs_f64(delay_op.duration_sec.into_inner());
+                        log::debug!(
+                            "StagingOperation::Delay: skipping remote shard {} (duration: {delay:?})",
+                            self.id
+                        );
+                    }
+                }
+                timer.set_success(true);
+                return Ok(UpdateResult {
+                    operation_id: None,
+                    status: crate::operations::types::UpdateStatus::Completed,
+                    clock_tag: operation.clock_tag,
+                });
+            }
         };
+
+        if let Some(hw_usage) = point_operation_response.hardware_usage {
+            hw_measurement_acc.accumulate_request(hw_usage);
+        }
+
         match point_operation_response.result {
             None => Err(CollectionError::service_error(
                 "Malformed UpdateResult type".to_string(),
@@ -621,6 +954,36 @@ impl RemoteShard {
         Ok(())
     }
 
+    /// Get optimizations info from the remote shard via gRPC.
+    pub async fn optimizations(
+        &self,
+        options: OptimizationsRequestOptions,
+    ) -> CollectionResult<OptimizationsResponse> {
+        let res = self
+            .with_collections_client(|mut client| async move {
+                client
+                    .get_shard_optimizations(GetShardOptimizationsRequest {
+                        collection_name: self.collection_id.clone(),
+                        shard_id: self.id,
+                        with_queued: options.queued,
+                        completed_limit: options.completed_limit.map(|l| l as u32),
+                        with_idle_segments: options.idle_segments,
+                    })
+                    .await
+            })
+            .await?
+            .into_inner();
+
+        let response: OptimizationsResponse = serde_json::from_slice(&res.optimizations_json)
+            .map_err(|err| {
+                CollectionError::service_error(format!(
+                    "Failed to deserialize optimizations response from remote shard: {err}"
+                ))
+            })?;
+
+        Ok(response)
+    }
+
     pub async fn health_check(&self) -> CollectionResult<()> {
         let _ = self
             .with_qdrant_client(|mut client| async move {
@@ -643,7 +1006,7 @@ impl RemoteShard {
     ) -> CollectionResult<Option<Duration>> {
         match timeout {
             None => Ok(timeout),
-            Some(t) if t.is_zero() => Err(CollectionError::timeout(0, operation)),
+            Some(t) if t.is_zero() => Err(CollectionError::timeout(Duration::ZERO, operation)),
             Some(t) => {
                 // round up to avoid losing completely timeouts that are under 1 second
                 let timeout_secs = t.as_secs_f32().ceil() as u64;
@@ -665,39 +1028,61 @@ impl ShardOperation for RemoteShard {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
-        _hw_measurement_acc: HwMeasurementAcc, // TODO(io_measurement) fill this with response data
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `RemoteShard::execute_update_operation` is cancel safe, so this method is cancel safe.
 
         // targets the shard explicitly
         let shard_id = Some(self.id);
-        self.execute_update_operation(shard_id, self.collection_id.clone(), operation, wait, None)
-            .await
+        self.execute_update_operation(
+            shard_id,
+            self.collection_id.clone(),
+            operation,
+            wait,
+            timeout,
+            None,
+            hw_measurement_acc,
+        )
+        .await
     }
 
     async fn scroll_by(
         &self,
-        offset: Option<ExtendedPointId>,
-        limit: usize,
-        with_payload_interface: &WithPayloadInterface,
-        with_vector: &WithVector,
-        filter: Option<&Filter>,
+        request: Arc<ScrollRequestInternal>,
         _search_runtime_handle: &Handle,
-        order_by: Option<&OrderBy>,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let processed_timeout = Self::process_read_timeout(timeout, "scroll")?;
+        let ScrollRequestInternal {
+            filter,
+            offset,
+            limit,
+            with_payload,
+            with_vector,
+            order_by,
+        } = request.as_ref();
+
+        let with_payload = with_payload
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(ScrollRequestInternal::default_with_payload);
+
+        let is_payload_required = with_payload.is_required();
+        let order_by = order_by.clone().map(OrderBy::from);
+        let filter = filter.clone();
+
         let scroll_points = ScrollPoints {
             collection_name: self.collection_id.clone(),
-            filter: filter.map(|f| f.clone().into()),
+            filter: filter.map(api::grpc::qdrant::Filter::from),
             offset: offset.map(|o| o.into()),
-            limit: Some(limit as u32),
-            with_payload: Some(with_payload_interface.clone().into()),
+            limit: limit.map(|x| x as u32),
+            with_payload: Some(WithPayloadSelector::from(with_payload)),
             with_vectors: Some(with_vector.clone().into()),
             read_consistency: None,
             shard_key_selector: None,
-            order_by: order_by.map(|o| o.clone().into()),
+            order_by: order_by.map(api::grpc::qdrant::OrderBy::from),
             timeout: processed_timeout.map(|t| t.as_secs()),
         };
         let scroll_request = &ScrollPointsInternal {
@@ -716,26 +1101,34 @@ impl ShardOperation for RemoteShard {
             .await?
             .into_inner();
 
-        // We need the `____ordered_with____` value even if the user didn't request payload
-        let parse_payload = with_payload_interface.is_required() || order_by.is_some();
-
-        if let Some(usage) = scroll_response.usage {
-            hw_measurement_acc.accumulate_request(
-                usage.cpu as usize,
-                usage.payload_io_read as usize,
-                usage.payload_io_write as usize,
-                usage.vector_io_read as usize,
-                usage.vector_io_write as usize,
-            );
+        if let Some(hw_usage) = scroll_response.usage.unwrap_or_default().hardware {
+            hw_measurement_acc.accumulate_request(hw_usage);
         }
 
         let result: Result<Vec<RecordInternal>, Status> = scroll_response
             .result
             .into_iter()
-            .map(|point| try_record_from_grpc(point, parse_payload))
+            .map(|point| try_record_from_grpc(point, is_payload_required))
             .collect();
 
         result.map_err(|e| e.into())
+    }
+
+    async fn local_scroll_by_id(
+        &self,
+        _offset: Option<ExtendedPointId>,
+        _limit: usize,
+        _with_payload_interface: &WithPayloadInterface,
+        _with_vector: &WithVector,
+        _filter: Option<&Filter>,
+        _search_runtime_handle: &Handle,
+        _timeout: Option<Duration>,
+        _hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
+        debug_assert!(false, "RemoteShard does not support local_scroll_by_id");
+        Err(CollectionError::service_error(
+            "RemoteShard does not support local_scroll_by_id".to_string(),
+        ))
     }
 
     async fn info(&self) -> CollectionResult<CollectionInfo> {
@@ -756,6 +1149,7 @@ impl ShardOperation for RemoteShard {
         let result: Result<CollectionInfo, Status> = get_collection_response.try_into();
         result.map_err(|e| e.into())
     }
+
     async fn core_search(
         &self,
         batch_request: Arc<CoreSearchRequestBatch>,
@@ -798,14 +1192,8 @@ impl ShardOperation for RemoteShard {
             usage,
         } = search_batch_response;
 
-        if let Some(usage) = usage {
-            hw_measurement_acc.accumulate_request(
-                usage.cpu as usize,
-                usage.payload_io_read as usize,
-                usage.payload_io_write as usize,
-                usage.vector_io_read as usize,
-                usage.vector_io_write as usize,
-            );
+        if let Some(hw_usage) = usage.unwrap_or_default().hardware {
+            hw_measurement_acc.accumulate_request(hw_usage);
         }
 
         let result: Result<Vec<Vec<ScoredPoint>>, Status> = result
@@ -869,14 +1257,8 @@ impl ShardOperation for RemoteShard {
             usage,
         } = count_response;
 
-        if let Some(usage) = usage {
-            hw_measurement_acc.accumulate_request(
-                usage.cpu as usize,
-                usage.payload_io_read as usize,
-                usage.payload_io_write as usize,
-                usage.vector_io_read as usize,
-                usage.vector_io_write as usize,
-            );
+        if let Some(hw_usage) = usage.unwrap_or_default().hardware {
+            hw_measurement_acc.accumulate_request(hw_usage);
         }
 
         result.map_or_else(
@@ -924,14 +1306,8 @@ impl ShardOperation for RemoteShard {
             .await?
             .into_inner();
 
-        if let Some(usage) = get_response.usage {
-            hw_measurement_acc.accumulate_request(
-                usage.cpu as usize,
-                usage.payload_io_read as usize,
-                usage.payload_io_write as usize,
-                usage.vector_io_read as usize,
-                usage.vector_io_write as usize,
-            );
+        if let Some(hw_usage) = get_response.usage.unwrap_or_default().hardware {
+            hw_measurement_acc.accumulate_request(hw_usage);
         }
 
         let result: Result<Vec<RecordInternal>, Status> = get_response
@@ -984,17 +1360,12 @@ impl ShardOperation for RemoteShard {
         let QueryBatchResponseInternal {
             results,
             time: _,
-            usage,
+            hardware_usage,
+            inference_usage: _, // Remote shards don't have inference usage, so we can ignore it
         } = batch_response;
 
-        if let Some(usage) = usage {
-            hw_measurement_acc.accumulate_request(
-                usage.cpu as usize,
-                usage.payload_io_read as usize,
-                usage.payload_io_write as usize,
-                usage.vector_io_read as usize,
-                usage.vector_io_write as usize,
-            );
+        if let Some(hw_usage) = hardware_usage {
+            hw_measurement_acc.accumulate_request(hw_usage);
         }
 
         let result = results
@@ -1027,7 +1398,7 @@ impl ShardOperation for RemoteShard {
         request: Arc<FacetParams>,
         _search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-        _hw_measurement_acc: HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse> {
         let processed_timeout = Self::process_read_timeout(timeout, "facet")?;
         let mut timer = ScopeDurationMeasurer::new(&self.telemetry_search_durations);
@@ -1063,7 +1434,9 @@ impl ShardOperation for RemoteShard {
             .await?
             .into_inner();
 
-        // TODO(io_measurement): measure remote io usage here!
+        if let Some(hw_usage) = response.usage {
+            hw_measurement_acc.accumulate_request(hw_usage);
+        }
 
         let hits = response
             .hits
@@ -1076,5 +1449,9 @@ impl ShardOperation for RemoteShard {
         timer.set_success(true);
 
         Ok(result)
+    }
+
+    async fn stop_gracefully(self) {
+        // No background operations to stop on RemoteShard
     }
 }

@@ -1,17 +1,23 @@
+use std::borrow::Cow;
 use std::{env, io};
 
 use api::grpc::transport_channel_pool::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_GRPC_TIMEOUT, DEFAULT_POOL_SIZE,
 };
 use collection::operations::validation;
+use collection::shards::shard::PeerId;
+use common::flags::FeatureFlags;
 use config::{Config, ConfigError, Environment, File, FileFormat, Source};
 use serde::Deserialize;
 use storage::types::StorageConfig;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
+use crate::common::audit::AuditConfig;
 use crate::common::debugger::DebuggerConfig;
 use crate::common::inference::config::InferenceConfig;
 use crate::tracing;
+
+const MAX_PEER_ID: u64 = (1 << 53) - 1;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/config.yaml");
 
@@ -21,6 +27,13 @@ pub struct ServiceConfig {
     pub host: String,
     pub http_port: u16,
     pub grpc_port: Option<u16>, // None means that gRPC is disabled
+
+    /// If specified, qdrant will serve a separate service for `/metrics` on this port.
+    /// Separate port is not protected by API keys and dedicated for internal monitoring systems.
+    /// This port should not be exposed to untrusted networks.
+    #[serde(default)]
+    pub metrics_port: Option<u16>,
+
     pub max_request_size_mb: usize,
     pub max_workers: Option<usize>,
     #[serde(default = "default_cors")]
@@ -30,6 +43,10 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub verify_https_client_certificate: bool,
     pub api_key: Option<String>,
+
+    /// Same as `api_key`, can be used for rolling key rotation.
+    pub alt_api_key: Option<String>,
+
     pub read_only_api_key: Option<String>,
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
@@ -53,6 +70,11 @@ pub struct ServiceConfig {
     /// Whether to enable reporting of measured hardware utilization in API responses.
     #[serde(default)]
     pub hardware_reporting: Option<bool>,
+
+    /// Global prefix for metrics.
+    #[serde(default)]
+    #[validate(custom(function = validate_metrics_prefix))]
+    pub metrics_prefix: Option<String>,
 }
 
 impl ServiceConfig {
@@ -64,6 +86,9 @@ impl ServiceConfig {
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
 pub struct ClusterConfig {
     pub enabled: bool, // disabled by default
+    #[serde(default)]
+    #[validate(range(min = 1, max = MAX_PEER_ID))]
+    pub peer_id: Option<PeerId>,
     #[serde(default = "default_timeout_ms")]
     #[validate(range(min = 1))]
     pub grpc_timeout_ms: u64,
@@ -135,7 +160,7 @@ impl Default for ConsensusConfig {
 pub struct TlsConfig {
     pub cert: String,
     pub key: String,
-    pub ca_cert: String,
+    pub ca_cert: Option<String>,
     #[serde(default = "default_tls_cert_ttl")]
     #[validate(range(min = 1))]
     pub cert_ttl: Option<u64>,
@@ -215,6 +240,11 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub gpu: Option<GpuConfig>,
+    #[serde(default)]
+    pub feature_flags: FeatureFlags,
+    /// Audit logging configuration.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
 }
 
 impl Settings {
@@ -223,12 +253,12 @@ impl Settings {
         let config_exists = |path| File::with_name(path).collect().is_ok();
 
         // Check if custom config file exists, report error if not
-        if let Some(ref path) = custom_config_path {
-            if !config_exists(path) {
-                load_errors.push(LogMsg::Error(format!(
-                    "Config file via --config-path is not found: {path}"
-                )));
-            }
+        if let Some(path) = &custom_config_path
+            && !config_exists(path)
+        {
+            load_errors.push(LogMsg::Error(format!(
+                "Config file via --config-path is not found: {path}"
+            )));
         }
 
         let env = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
@@ -283,10 +313,7 @@ impl Settings {
     }
 
     pub fn tls_config_is_undefined_error() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "TLS config is not defined in the Qdrant config file",
-        )
+        io::Error::other("TLS config is not defined in the Qdrant config file")
     }
 
     pub fn validate_and_warn(&self) {
@@ -296,18 +323,40 @@ impl Settings {
         // Using HMAC-SHA256, recommended secret size is 32 bytes
         const JWT_RECOMMENDED_SECRET_LENGTH: usize = 256 / 8;
 
+        let all_keys_are_empty = self
+            .service
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+            && self
+                .service
+                .alt_api_key
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty();
+
+        let min_length = [
+            self.service.api_key.as_ref(),
+            self.service.alt_api_key.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|key| key.len())
+        .min()
+        .unwrap_or_default();
+
+        let any_api_key_is_short = min_length < JWT_RECOMMENDED_SECRET_LENGTH;
+
         // Log if JWT RBAC is enabled but no API key is set
         if self.service.jwt_rbac.unwrap_or_default() {
-            if self.service.api_key.clone().unwrap_or_default().is_empty() {
+            if all_keys_are_empty {
                 log::warn!("JWT RBAC configured but no API key set, JWT RBAC is not enabled")
             // Log if JWT RAC is enabled, API key is set but smaller than recommended size for JWT secret
-            } else if self.service.api_key.clone().unwrap_or_default().len()
-                < JWT_RECOMMENDED_SECRET_LENGTH
-            {
+            } else if any_api_key_is_short {
                 log::warn!(
-                "It is highly recommended to use an API key of {} bytes when JWT RBAC is enabled",
-                JWT_RECOMMENDED_SECRET_LENGTH
-            )
+                    "It is highly recommended to use an API key of {JWT_RECOMMENDED_SECRET_LENGTH} bytes when JWT RBAC is enabled",
+                )
             }
         }
 
@@ -394,11 +443,33 @@ const fn default_tls_cert_ttl() -> Option<u64> {
     Some(3600)
 }
 
+/// Custom validation function for metrics prefixes.
+fn validate_metrics_prefix(prefix: &str) -> Result<(), ValidationError> {
+    // Prefix is not required
+    if prefix.is_empty() {
+        return Ok(());
+    }
+
+    // Only allow alphanumeric characters or '_'
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(
+            ValidationError::new("invalid_metrics_prefix").with_message(Cow::Borrowed(
+                "Metrics prefix must be of all alphanumeric characters, with an exception for '_'",
+            )),
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::Write;
 
+    use fs_err as fs;
     use sealed_test::prelude::*;
 
     use super::*;
@@ -416,15 +487,20 @@ mod tests {
             .expect("failed to validate default config");
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#[sealed_test] uses std::fs::copy"
+    )]
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test(files = ["config/config.yaml", "config/development.yaml"])]
     fn test_runtime_development_config() {
-        env::set_var("RUN_MODE", "development");
+        unsafe { env::set_var("RUN_MODE", "development") };
 
         // `sealed_test` copies files into the same directory as the test runs in.
         // We need them in a subdirectory.
-        std::fs::create_dir("config").expect("failed to create `config` subdirectory.");
-        std::fs::copy("config.yaml", "config/config.yaml").expect("failed to copy `config.yaml`.");
-        std::fs::copy("development.yaml", "config/development.yaml")
+        fs::create_dir("config").expect("failed to create `config` subdirectory.");
+        fs::copy("config.yaml", "config/config.yaml").expect("failed to copy `config.yaml`.");
+        fs::copy("development.yaml", "config/development.yaml")
             .expect("failed to copy `development.yaml`.");
 
         // Read config
@@ -437,6 +513,7 @@ mod tests {
         assert!(config.load_errors.is_empty(), "must not have load errors")
     }
 
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test]
     fn test_no_config_files() {
         let non_existing_config_path = "config/non_existing_config".to_string();
@@ -452,6 +529,7 @@ mod tests {
         assert!(!config.load_errors.is_empty(), "must have load errors")
     }
 
+    #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test]
     fn test_custom_config() {
         let path = "config/custom.yaml";

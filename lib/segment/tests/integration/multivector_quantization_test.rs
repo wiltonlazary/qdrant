@@ -1,22 +1,24 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cpu::CpuPermit;
+use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::ScoredPointOffset;
-use itertools::Itertools;
+use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{
-    only_default_multi_vector, MultiDenseVectorInternal, QueryVector, DEFAULT_VECTOR_NAME,
+    DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, QueryVector, only_default_multi_vector,
 };
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_multi_vector};
+use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
 use segment::json_path::JsonPath;
 use segment::segment_constructor::build_segment;
@@ -26,18 +28,12 @@ use segment::types::{
     QuantizationSearchParams, Range, ScalarQuantizationConfig, SearchParams, SegmentConfig,
     SeqNumberType, VectorDataConfig, VectorStorageType,
 };
-use segment::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use segment::vector_storage::query::{ContextPair, DiscoveryQuery, RecoQuery};
+use segment::vector_storage::quantized::quantized_vectors::{
+    QuantizedVectors, QuantizedVectorsStorageType,
+};
 use tempfile::Builder;
 
-const MAX_EXAMPLE_PAIRS: usize = 4;
 const MAX_VECTORS_COUNT: usize = 3;
-
-enum QueryVariant {
-    Nearest,
-    RecommendBestScore,
-    Discovery,
-}
 
 enum QuantizationVariant {
     Scalar,
@@ -45,49 +41,18 @@ enum QuantizationVariant {
     Binary,
 }
 
-fn random_vector<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> MultiDenseVectorInternal {
-    let count = rnd.random_range(1..=MAX_VECTORS_COUNT);
-    let mut vector = random_multi_vector(rnd, dim, count);
+fn random_vector<R: Rng + ?Sized>(rng: &mut R, dim: usize) -> MultiDenseVectorInternal {
+    let count = rng.random_range(1..=MAX_VECTORS_COUNT);
+    let mut vector = random_multi_vector(rng, dim, count);
     // for BQ change range to [-0.5; 0.5]
     vector.flattened_vectors.iter_mut().for_each(|x| *x -= 0.5);
     vector
 }
 
-fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_pairs: usize = rnd.random_range(1..MAX_EXAMPLE_PAIRS);
-
-    let target = random_vector(rnd, dim).into();
-
-    let pairs = (0..num_pairs)
-        .map(|_| {
-            let positive = random_vector(rnd, dim).into();
-            let negative = random_vector(rnd, dim).into();
-            ContextPair { positive, negative }
-        })
-        .collect_vec();
-
-    DiscoveryQuery::new(target, pairs).into()
-}
-
-fn random_reco_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_examples: usize = rnd.random_range(1..MAX_EXAMPLE_PAIRS);
-
-    let positive = (0..num_examples)
-        .map(|_| random_vector(rnd, dim).into())
-        .collect_vec();
-    let negative = (0..num_examples)
-        .map(|_| random_vector(rnd, dim).into())
-        .collect_vec();
-
-    RecoQuery::new(positive, negative).into()
-}
-
-fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rnd: &mut R, dim: usize) -> QueryVector {
-    match variant {
-        QueryVariant::Nearest => random_vector(rnd, dim).into(),
-        QueryVariant::Discovery => random_discovery_query(rnd, dim),
-        QueryVariant::RecommendBestScore => random_reco_query(rnd, dim),
-    }
+fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rng: &mut R, dim: usize) -> QueryVector {
+    segment::fixtures::query_fixtures::random_query(variant, rng, |rng: &mut R| {
+        random_vector(rng, dim).into()
+    })
 }
 
 fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> usize {
@@ -117,8 +82,17 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     false,
     20., // min_acc out of 100
 )]
-#[case::recommend_binary_dot(
-    QueryVariant::RecommendBestScore,
+#[case::recobestscore_binary_dot(
+    QueryVariant::RecoBestScore,
+    QuantizationVariant::Binary,
+    Distance::Dot,
+    128, // dim
+    64, // ef
+    false,
+    20., // min_acc out of 100
+)]
+#[case::recosumscores_binary_dot(
+    QueryVariant::RecoSumScores,
     QuantizationVariant::Binary,
     Distance::Dot,
     128, // dim
@@ -144,8 +118,17 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     false,
     15., // min_acc out of 100
 )]
-#[case::recommend_binary_cosine(
-    QueryVariant::RecommendBestScore,
+#[case::recobestscore_binary_cosine(
+    QueryVariant::RecoBestScore,
+    QuantizationVariant::Binary,
+    Distance::Cosine,
+    128, // dim
+    64, // ef
+    false,
+    15., // min_acc out of 100
+)]
+#[case::recosumscores_binary_cosine(
+    QueryVariant::RecoSumScores,
     QuantizationVariant::Binary,
     Distance::Cosine,
     128, // dim
@@ -200,6 +183,7 @@ fn test_multivector_quantization_hnsw(
 ) {
     use segment::payload_json;
     use segment::segment_constructor::VectorIndexBuildArgs;
+    use segment::types::HnswGlobalConfig;
 
     let stopped = AtomicBool::new(false);
 
@@ -209,7 +193,7 @@ fn test_multivector_quantization_hnsw(
     let full_scan_threshold = 16; // KB
     let num_payload_values = 2;
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let quantized_data_path = dir.path();
@@ -218,7 +202,14 @@ fn test_multivector_quantization_hnsw(
     let storage_type = if on_disk {
         VectorStorageType::ChunkedMmap
     } else {
-        VectorStorageType::Memory
+        #[cfg(feature = "rocksdb")]
+        {
+            VectorStorageType::Memory
+        }
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            VectorStorageType::InRamChunkedMmap
+        }
     };
     let config = SegmentConfig {
         vector_data: HashMap::from([(
@@ -245,9 +236,9 @@ fn test_multivector_quantization_hnsw(
 
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
+        let vector = random_vector(&mut rng, dim);
 
-        let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
+        let int_payload = random_int_payload(&mut rng, num_payload_values..=num_payload_values);
         let payload = payload_json! {int_key: int_payload};
 
         segment
@@ -266,7 +257,11 @@ fn test_multivector_quantization_hnsw(
     segment
         .payload_index
         .borrow_mut()
-        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new(int_key),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
 
     let quantization_config = match quantization_variant {
@@ -283,6 +278,8 @@ fn test_multivector_quantization_hnsw(
         .into(),
         QuantizationVariant::Binary => BinaryQuantizationConfig {
             always_ram: Some(false),
+            encoding: None,
+            query_encoding: None,
         }
         .into(),
     };
@@ -293,6 +290,7 @@ fn test_multivector_quantization_hnsw(
             QuantizedVectors::create(
                 &vector_storage.vector_storage.borrow(),
                 &quantization_config,
+                QuantizedVectorsStorageType::Immutable,
                 quantized_data_path,
                 4,
                 &stopped,
@@ -300,9 +298,14 @@ fn test_multivector_quantization_hnsw(
             .unwrap();
         }
         // test persistence, load quantized vectors
-        let quantized_vectors =
-            QuantizedVectors::load(&vector_storage.vector_storage.borrow(), quantized_data_path)
-                .unwrap();
+        let quantized_vectors = QuantizedVectors::load(
+            &quantization_config,
+            &vector_storage.vector_storage.borrow(),
+            quantized_data_path,
+            &stopped,
+        )
+        .unwrap()
+        .unwrap();
         vector_storage.quantized_vectors = Arc::new(AtomicRefCell::new(Some(quantized_vectors)));
     });
 
@@ -313,10 +316,11 @@ fn test_multivector_quantization_hnsw(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit_cpu_count = 1; // single-threaded for deterministic build
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
     let hnsw_index = HNSWIndex::build(
         HnswIndexOpenArgs {
             path: hnsw_dir.path(),
@@ -334,7 +338,11 @@ fn test_multivector_quantization_hnsw(
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
+            feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -343,10 +351,10 @@ fn test_multivector_quantization_hnsw(
     let mut sames = 0;
     let attempts = 100;
     for _ in 0..attempts {
-        let query = random_query(&query_variant, &mut rnd, dim);
+        let query = random_query(&query_variant, &mut rng, dim);
 
         let range_size = 40;
-        let left_range = rnd.random_range(0..400);
+        let left_range = rng.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
@@ -354,8 +362,8 @@ fn test_multivector_quantization_hnsw(
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

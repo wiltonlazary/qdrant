@@ -1,18 +1,18 @@
-use actix_web::{delete, get, web, Responder};
+use actix_web::{Responder, delete, get, web};
 use collection::operations::types::IssuesReport;
 use storage::rbac::{Access, AccessRequirements};
 
-use crate::actix::auth::ActixAccess;
+use crate::actix::auth::ActixAuth;
 
 #[get("/issues")]
-async fn get_issues(ActixAccess(access): ActixAccess) -> impl Responder {
+async fn get_issues(ActixAuth(auth): ActixAuth) -> impl Responder {
     crate::actix::helpers::time(async move {
-        match access {
+        match auth.access("issues") {
             Access::Global(_) => Ok(IssuesReport {
                 issues: issues::all_issues(),
             }),
             Access::Collection(collection_access_list) => {
-                let requirements = AccessRequirements::new().whole();
+                let requirements = AccessRequirements::new();
 
                 let mut allowed_issues = Vec::new();
                 for collection_name in collection_access_list.meeting_requirements(requirements) {
@@ -30,9 +30,9 @@ async fn get_issues(ActixAccess(access): ActixAccess) -> impl Responder {
 }
 
 #[delete("/issues")]
-async fn clear_issues(ActixAccess(access): ActixAccess) -> impl Responder {
+async fn clear_issues(ActixAuth(auth): ActixAuth) -> impl Responder {
     crate::actix::helpers::time(async move {
-        access.check_global_access(AccessRequirements::new().manage())?;
+        auth.check_global_access(AccessRequirements::new().manage(), "clear_issues")?;
         issues::clear();
         Ok(true)
     })

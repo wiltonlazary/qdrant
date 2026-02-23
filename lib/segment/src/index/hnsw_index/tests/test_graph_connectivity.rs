@@ -1,20 +1,22 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cpu::CpuPermit;
+use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::PointOffsetType;
 use rand::rng;
 use tempfile::Builder;
 
-use crate::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
+use crate::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
 use crate::entry::entry_point::SegmentEntry;
 use crate::fixtures::index_fixtures::random_vector;
 use crate::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use crate::index::hnsw_index::num_rayon_threads;
-use crate::segment_constructor::simple_segment_constructor::build_simple_segment;
 use crate::segment_constructor::VectorIndexBuildArgs;
-use crate::types::{Distance, HnswConfig, SeqNumberType};
+use crate::segment_constructor::simple_segment_constructor::build_simple_segment;
+use crate::types::{Distance, HnswConfig, HnswGlobalConfig, SeqNumberType};
 
 #[test]
 fn test_graph_connectivity() {
@@ -27,7 +29,7 @@ fn test_graph_connectivity() {
     let distance = Distance::Cosine;
     let full_scan_threshold = 10_000;
 
-    let mut rnd = rng();
+    let mut rng = rng();
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
@@ -37,7 +39,7 @@ fn test_graph_connectivity() {
     let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
+        let vector = random_vector(&mut rng, dim);
 
         segment
             .upsert_point(
@@ -58,10 +60,11 @@ fn test_graph_connectivity() {
         max_indexing_threads: 4,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let hnsw_index = HNSWIndex::build(
         HnswIndexOpenArgs {
@@ -78,7 +81,11 @@ fn test_graph_connectivity() {
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
+            feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();

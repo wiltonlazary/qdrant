@@ -1,19 +1,20 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use common::counter::hardware_counter::HardwareCounterCell;
-use parking_lot::RwLock;
-use rand::rngs::ThreadRng;
 use rand::Rng;
+use rand::rngs::ThreadRng;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::only_default_vector;
 use segment::entry::entry_point::SegmentEntry;
 use segment::payload_json;
 use segment::segment::Segment;
 use segment::segment_constructor::simple_segment_constructor::{
-    build_multivec_segment, build_simple_segment, VECTOR1_NAME, VECTOR2_NAME,
+    VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment, build_simple_segment,
 };
-use segment::types::{Distance, Payload, PointIdType, SeqNumberType};
+use segment::types::{Distance, HnswGlobalConfig, Payload, PointIdType, SeqNumberType};
+use shard::segment_holder::locked::LockedSegmentHolder;
 
 use crate::collection_manager::holders::segment_holder::SegmentHolder;
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
@@ -22,6 +23,8 @@ use crate::collection_manager::optimizers::segment_optimizer::OptimizerThreshold
 use crate::config::CollectionParams;
 use crate::operations::types::VectorsConfig;
 use crate::operations::vector_params_builder::VectorParamsBuilder;
+
+pub const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn empty_segment(path: &Path) -> Segment {
     build_simple_segment(path, 4, Distance::Dot).unwrap()
@@ -44,10 +47,10 @@ impl PointIdGenerator {
     pub fn unique(&mut self) -> PointIdType {
         for _ in 0..100_000 {
             let id = self.random();
-            if let PointIdType::NumId(num) = id {
-                if self.used.insert(num) {
-                    return id;
-                }
+            if let PointIdType::NumId(num) = id
+                && self.used.insert(num)
+            {
+                return id;
             }
         }
         panic!("failed to generate unique point ID after 100000 attempts");
@@ -207,7 +210,7 @@ pub fn build_segment_2(path: &Path) -> Segment {
     segment2
 }
 
-pub fn build_test_holder(path: &Path) -> RwLock<SegmentHolder> {
+pub fn build_test_holder(path: &Path) -> LockedSegmentHolder {
     let segment1 = build_segment_1(path);
     let segment2 = build_segment_2(path);
 
@@ -216,7 +219,7 @@ pub fn build_test_holder(path: &Path) -> RwLock<SegmentHolder> {
     let _sid1 = holder.add_new(segment1);
     let _sid2 = holder.add_new(segment2);
 
-    RwLock::new(holder)
+    LockedSegmentHolder::new(holder)
 }
 
 pub(crate) fn get_merge_optimizer(
@@ -241,6 +244,7 @@ pub(crate) fn get_merge_optimizer(
             ..CollectionParams::empty()
         },
         Default::default(),
+        HnswGlobalConfig::default(),
         Default::default(),
     )
 }
@@ -266,6 +270,7 @@ pub(crate) fn get_indexing_optimizer(
             ..CollectionParams::empty()
         },
         Default::default(),
+        HnswGlobalConfig::default(),
         Default::default(),
     )
 }

@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
-use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::index::PayloadIndex;
+use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::json_path::JsonPath;
 use segment::payload_json;
-use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::payload_storage::PayloadStorage;
+use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::types::{Condition, FieldCondition, Filter, Match, Payload, PayloadSchemaType, Range};
 use tempfile::Builder;
 
@@ -60,6 +61,7 @@ fn test_filtering_context_consistency() {
     let mut points = HashMap::new();
 
     let hw_counter = HardwareCounterCell::new();
+    let is_stopped = AtomicBool::new(false);
 
     for (idx, payload) in nested_payloads().into_iter().enumerate() {
         points.insert(idx, payload.clone());
@@ -77,26 +79,47 @@ fn test_filtering_context_consistency() {
         HashMap::new(),
         dir.path(),
         true,
+        true,
     )
     .unwrap();
 
     index
-        .set_indexed(&JsonPath::new("f"), PayloadSchemaType::Integer)
+        .set_indexed(&JsonPath::new("f"), PayloadSchemaType::Integer, &hw_counter)
         .unwrap();
     index
-        .set_indexed(&JsonPath::new("arr1[].a"), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new("arr1[].a"),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&JsonPath::new("arr1[].b"), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new("arr1[].b"),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&JsonPath::new("arr1[].c"), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new("arr1[].c"),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&JsonPath::new("arr1[].d"), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new("arr1[].d"),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&JsonPath::new("arr1[].text"), PayloadSchemaType::Text)
+        .set_indexed(
+            &JsonPath::new("arr1[].text"),
+            PayloadSchemaType::Text,
+            &hw_counter,
+        )
         .unwrap();
 
     {
@@ -121,7 +144,7 @@ fn test_filtering_context_consistency() {
         );
 
         let nested_filter_0 = Filter::new_must(nested_condition_0);
-        let res0 = index.query_points(&nested_filter_0, &hw_counter);
+        let res0 = index.query_points(&nested_filter_0, &hw_counter, &is_stopped);
 
         let filter_context = index.filter_context(&nested_filter_0, &hw_counter);
 
@@ -159,7 +182,7 @@ fn test_filtering_context_consistency() {
 
         let nested_filter_1 = Filter::new_must(nested_condition_1);
 
-        let res1 = index.query_points(&nested_filter_1, &hw_counter);
+        let res1 = index.query_points(&nested_filter_1, &hw_counter, &is_stopped);
 
         let filter_context = index.filter_context(&nested_filter_1, &hw_counter);
 
@@ -194,7 +217,7 @@ fn test_filtering_context_consistency() {
 
         let nested_filter_2 = Filter::new_must(nested_condition_2);
 
-        let res2 = index.query_points(&nested_filter_2, &hw_counter);
+        let res2 = index.query_points(&nested_filter_2, &hw_counter, &is_stopped);
 
         let filter_context = index.filter_context(&nested_filter_2, &hw_counter);
 
@@ -239,7 +262,7 @@ fn test_filtering_context_consistency() {
             must_not: None,
         };
 
-        let res3 = index.query_points(&nested_filter_3, &hw_counter);
+        let res3 = index.query_points(&nested_filter_3, &hw_counter, &is_stopped);
 
         let filter_context = index.filter_context(&nested_filter_3, &hw_counter);
 

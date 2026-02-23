@@ -9,7 +9,7 @@ use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 
-use crate::common::utils::{check_is_empty, check_is_null, IndexesMap};
+use crate::common::utils::{IndexesMap, check_is_empty, check_is_null};
 use crate::id_tracker::IdTrackerSS;
 use crate::index::field_index::FieldIndex;
 use crate::payload_storage::condition_checker::ValueChecker;
@@ -119,14 +119,18 @@ pub fn check_payload<'a, R>(
     query: &Filter,
     point_id: PointOffsetType,
     field_indexes: &HashMap<PayloadKeyType, R>,
+    hw_counter: &HardwareCounterCell,
 ) -> bool
 where
     R: AsRef<Vec<FieldIndex>>,
 {
     let checker = |condition: &Condition| match condition {
-        Condition::Field(field_condition) => {
-            check_field_condition(field_condition, get_payload().deref(), field_indexes)
-        }
+        Condition::Field(field_condition) => check_field_condition(
+            field_condition,
+            get_payload().deref(),
+            field_indexes,
+            hw_counter,
+        ),
         Condition::IsEmpty(is_empty) => check_is_empty_condition(is_empty, get_payload().deref()),
         Condition::IsNull(is_null) => check_is_null_condition(is_null, get_payload().deref()),
         Condition::HasId(has_id) => id_tracker
@@ -154,13 +158,14 @@ where
                         &nested.nested.filter,
                         point_id,
                         &nested_indexes,
+                        hw_counter,
                     )
                 })
         }
 
         Condition::CustomIdChecker(cond) => id_tracker
             .and_then(|id_tracker| id_tracker.external_id(point_id))
-            .is_some_and(|point_id| cond.check(point_id)),
+            .is_some_and(|point_id| cond.0.check(point_id)),
 
         Condition::Filter(_) => unreachable!(),
     };
@@ -183,6 +188,7 @@ pub fn check_field_condition<R>(
     field_condition: &FieldCondition,
     payload: &impl PayloadContainer,
     field_indexes: &HashMap<PayloadKeyType, R>,
+    hw_counter: &HardwareCounterCell,
 ) -> bool
 where
     R: AsRef<Vec<FieldIndex>>,
@@ -190,12 +196,18 @@ where
     let field_values = payload.get_value(&field_condition.key);
     let field_indexes = field_indexes.get(&field_condition.key);
 
+    if field_values.is_empty() {
+        return field_condition.check_empty();
+    }
+
     // This covers a case, when a field index affects the result of the condition.
     if let Some(field_indexes) = field_indexes {
         for p in field_values {
             let mut index_checked = false;
             for index in field_indexes.as_ref() {
-                if let Some(index_check_res) = index.special_check_condition(field_condition, p) {
+                if let Some(index_check_res) =
+                    index.special_check_condition(field_condition, p, hw_counter)
+                {
                     if index_check_res {
                         // If at least one object matches the condition, we can return true
                         return true;
@@ -265,9 +277,11 @@ impl ConditionChecker for SimpleConditionChecker {
                         PayloadStorageEnum::InMemoryPayloadStorage(s) => {
                             s.payload_ptr(point_id).map(|x| x.into())
                         }
+                        #[cfg(feature = "rocksdb")]
                         PayloadStorageEnum::SimplePayloadStorage(s) => {
                             s.payload_ptr(point_id).map(|x| x.into())
                         }
+                        #[cfg(feature = "rocksdb")]
                         PayloadStorageEnum::OnDiskPayloadStorage(s) => {
                             // Warn: Possible panic here
                             // Currently, it is possible that `read_payload` fails with Err,
@@ -304,34 +318,31 @@ impl ConditionChecker for SimpleConditionChecker {
             query,
             point_id,
             &IndexesMap::new(),
+            &HardwareCounterCell::new(),
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::str::FromStr;
 
-    use tempfile::Builder;
+    use ahash::AHashSet;
+    use ordered_float::OrderedFloat;
 
     use super::*;
-    use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
-    use crate::id_tracker::simple_id_tracker::SimpleIdTracker;
     use crate::id_tracker::IdTracker;
+    use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
     use crate::json_path::JsonPath;
     use crate::payload_json;
-    use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
     use crate::payload_storage::PayloadStorage;
+    use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
     use crate::types::{
         DateTimeWrapper, FieldCondition, GeoBoundingBox, GeoPoint, PayloadField, Range, ValuesCount,
     };
 
     #[test]
     fn test_condition_checker() {
-        let dir = Builder::new().prefix("db_dir").tempdir().unwrap();
-        let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
-
         let payload = payload_json! {
             "location": {
                 "lon": 13.404954,
@@ -351,8 +362,8 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         let mut payload_storage: PayloadStorageEnum =
-            SimplePayloadStorage::open(db.clone()).unwrap().into();
-        let mut id_tracker = SimpleIdTracker::open(db).unwrap();
+            PayloadStorageEnum::InMemoryPayloadStorage(InMemoryPayloadStorage::default());
+        let mut id_tracker = InMemoryIdTracker::new();
 
         id_tracker.set_link(0.into(), 0).unwrap();
         id_tracker.set_link(1.into(), 1).unwrap();
@@ -487,28 +498,16 @@ mod tests {
         let in_berlin = Condition::Field(FieldCondition::new_geo_bounding_box(
             JsonPath::new("location"),
             GeoBoundingBox {
-                top_left: GeoPoint {
-                    lon: 13.08835,
-                    lat: 52.67551,
-                },
-                bottom_right: GeoPoint {
-                    lon: 13.76116,
-                    lat: 52.33826,
-                },
+                top_left: GeoPoint::new_unchecked(13.08835, 52.67551),
+                bottom_right: GeoPoint::new_unchecked(13.76116, 52.33826),
             },
         ));
 
         let in_moscow = Condition::Field(FieldCondition::new_geo_bounding_box(
             JsonPath::new("location"),
             GeoBoundingBox {
-                top_left: GeoPoint {
-                    lon: 37.0366,
-                    lat: 56.1859,
-                },
-                bottom_right: GeoPoint {
-                    lon: 38.2532,
-                    lat: 55.317,
-                },
+                top_left: GeoPoint::new_unchecked(37.0366, 56.1859),
+                bottom_right: GeoPoint::new_unchecked(38.2532, 55.317),
             },
         ));
 
@@ -518,7 +517,7 @@ mod tests {
                 lt: None,
                 gt: None,
                 gte: None,
-                lte: Some(5.),
+                lte: Some(OrderedFloat(5.)),
             },
         ));
 
@@ -635,17 +634,17 @@ mod tests {
         assert!(!payload_checker.check(0, &query));
 
         // id Filter
-        let ids: HashSet<_> = vec![1, 2, 3].into_iter().map(|x| x.into()).collect();
+        let ids: AHashSet<_> = vec![1, 2, 3].into_iter().map(|x| x.into()).collect();
 
         let query = Filter::new_must_not(Condition::HasId(ids.into()));
         assert!(!payload_checker.check(2, &query));
 
-        let ids: HashSet<_> = vec![1, 2, 3].into_iter().map(|x| x.into()).collect();
+        let ids: AHashSet<_> = vec![1, 2, 3].into_iter().map(|x| x.into()).collect();
 
         let query = Filter::new_must_not(Condition::HasId(ids.into()));
         assert!(payload_checker.check(10, &query));
 
-        let ids: HashSet<_> = vec![1, 2, 3].into_iter().map(|x| x.into()).collect();
+        let ids: AHashSet<_> = vec![1, 2, 3].into_iter().map(|x| x.into()).collect();
 
         let query = Filter::new_must(Condition::HasId(ids.into()));
         assert!(payload_checker.check(2, &query));

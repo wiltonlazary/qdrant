@@ -1,34 +1,33 @@
 use std::future::Future;
 use std::iter::Peekable;
+use std::sync::Arc;
 use std::time::Duration;
 
 use api::rest::RecommendStrategy;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::data_types::vectors::{
-    DenseVector, NamedQuery, NamedVectorStruct, TypedMultiDenseVector, VectorElementType,
-    VectorInternal, VectorRef, DEFAULT_VECTOR_NAME,
+    DenseVector, NamedQuery, TypedMultiDenseVector, VectorElementType, VectorInternal, VectorRef,
 };
 use segment::types::{
     Condition, ExtendedPointId, Filter, HasIdCondition, PointIdType, ScoredPoint,
 };
 use segment::vector_storage::query::RecoQuery;
+use shard::query::query_enum::QueryEnum;
+use shard::search::CoreSearchRequestBatch;
 use sparse::common::sparse_vector::SparseVector;
-use tokio::sync::RwLockReadGuard;
 
 use crate::collection::Collection;
 use crate::common::batching::batch_requests;
 use crate::common::fetch_vectors::{
-    convert_to_vectors, convert_to_vectors_owned, resolve_referenced_vectors_batch,
-    ReferencedVectors,
+    ReferencedVectors, convert_to_vectors, convert_to_vectors_owned,
+    resolve_referenced_vectors_batch,
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
-use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
-    CollectionError, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
-    RecommendRequestInternal, UsingVector,
+    CollectionError, CollectionResult, CoreSearchRequest, RecommendRequestInternal, UsingVector,
 };
 
 fn avg_vectors<'a>(
@@ -145,7 +144,7 @@ pub fn avg_vector_for_recommendation<'a>(
     Ok(search_vector)
 }
 
-pub async fn recommend_by<'a, F, Fut>(
+pub async fn recommend_by<F, Fut>(
     request: RecommendRequestInternal,
     collection: &Collection,
     collection_by_name: F,
@@ -156,7 +155,7 @@ pub async fn recommend_by<'a, F, Fut>(
 ) -> CollectionResult<Vec<ScoredPoint>>
 where
     F: Fn(String) -> Fut,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     if request.limit == 0 {
         return Ok(vec![]);
@@ -212,10 +211,17 @@ pub fn recommend_into_core_search(
             reference_vectors_ids_to_exclude,
             all_vectors_records_map,
         ),
-        RecommendStrategy::BestScore => Ok(recommend_by_best_score(
+        RecommendStrategy::BestScore => Ok(recommend_by_custom_score(
             request,
             reference_vectors_ids_to_exclude,
             all_vectors_records_map,
+            QueryEnum::RecommendBestScore,
+        )),
+        RecommendStrategy::SumScores => Ok(recommend_by_custom_score(
+            request,
+            reference_vectors_ids_to_exclude,
+            all_vectors_records_map,
+            QueryEnum::RecommendSumScores,
         )),
     }
 }
@@ -236,7 +242,7 @@ pub fn recommend_into_core_search(
 /// * `collection_by_name` - function to retrieve collection by name, used to retrieve points from other collections
 /// * `timeout` - timeout for the whole batch, in the searching stage. E.g. time in preprocessing won't be counted
 ///
-pub async fn recommend_batch_by<'a, F, Fut>(
+pub async fn recommend_batch_by<F, Fut>(
     request_batch: Vec<(RecommendRequestInternal, ShardSelectorInternal)>,
     collection: &Collection,
     collection_by_name: F,
@@ -246,7 +252,7 @@ pub async fn recommend_batch_by<'a, F, Fut>(
 ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
 where
     F: Fn(String) -> Fut,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     let start = std::time::Instant::now();
 
@@ -266,7 +272,7 @@ where
                     });
                 }
             }
-            RecommendStrategy::BestScore => {
+            RecommendStrategy::BestScore | RecommendStrategy::SumScores => {
                 if request.positive.is_empty() && request.negative.is_empty() {
                     return Err(CollectionError::BadRequest {
                         description: "At least one positive or negative vector ID required with this strategy"
@@ -370,19 +376,14 @@ fn recommend_by_avg_vector(
         lookup_collection_name,
     );
 
-    let vector_name = match using {
-        None => DEFAULT_VECTOR_NAME.to_owned(),
-        Some(UsingVector::Name(name)) => name,
-    };
-
     let search_vector =
         avg_vector_for_recommendation(positive_vectors, negative_vectors.peekable())?;
 
     Ok(CoreSearchRequest {
-        query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
-            search_vector,
-            vector_name,
-        )),
+        query: QueryEnum::Nearest(NamedQuery {
+            query: search_vector,
+            using: using.map(|name| name.as_name()),
+        }),
         filter: Some(Filter {
             should: None,
             min_should: None,
@@ -401,10 +402,11 @@ fn recommend_by_avg_vector(
     })
 }
 
-fn recommend_by_best_score(
+fn recommend_by_custom_score(
     request: RecommendRequestInternal,
     reference_vectors_ids_to_exclude: Vec<PointIdType>,
     all_vectors_records_map: &ReferencedVectors,
+    query_variant: impl Fn(NamedQuery<RecoQuery<VectorInternal>>) -> QueryEnum,
 ) -> CoreSearchRequest {
     let lookup_vector_name = request.get_lookup_vector_name();
 
@@ -439,7 +441,7 @@ fn recommend_by_best_score(
         lookup_collection_name,
     );
 
-    let query = QueryEnum::RecommendBestScore(NamedQuery {
+    let query = query_variant(NamedQuery {
         query: RecoQuery::new(positive, negative),
         using: using.map(|x| match x {
             UsingVector::Name(name) => name,

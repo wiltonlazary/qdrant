@@ -7,10 +7,10 @@ use parking_lot::RwLock;
 use rocksdb::DB;
 use serde_json::Value;
 
+use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
-use crate::common::rocksdb_wrapper::{DatabaseColumnWrapper, DB_PAYLOAD_CF};
-use crate::common::Flusher;
+use crate::common::rocksdb_wrapper::{DB_PAYLOAD_CF, DatabaseColumnWrapper};
 use crate::json_path::JsonPath;
 use crate::payload_storage::PayloadStorage;
 use crate::types::Payload;
@@ -70,6 +70,12 @@ impl OnDiskPayloadStorage {
             })?
             .transpose()
             .map_err(OperationError::from)
+    }
+
+    /// Destroy this payload storage, remove persisted data from RocksDB
+    pub fn destroy(&self) -> OperationResult<()> {
+        self.db_wrapper.remove_column_family()?;
+        Ok(())
     }
 }
 
@@ -133,6 +139,15 @@ impl PayloadStorage for OnDiskPayloadStorage {
         }
     }
 
+    fn get_sequential(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        // No sequential access optimizations for rocksdb.
+        self.get(point_id, hw_counter)
+    }
+
     fn delete(
         &mut self,
         point_id: PointOffsetType,
@@ -163,7 +178,8 @@ impl PayloadStorage for OnDiskPayloadStorage {
         Ok(payload)
     }
 
-    fn wipe(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
+    #[cfg(test)]
+    fn clear_all(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
         self.db_wrapper.recreate_column_family()
     }
 
@@ -171,11 +187,16 @@ impl PayloadStorage for OnDiskPayloadStorage {
         self.db_wrapper.flusher()
     }
 
-    fn iter<F>(&self, mut callback: F) -> OperationResult<()>
+    fn iter<F>(&self, mut callback: F, hw_counter: &HardwareCounterCell) -> OperationResult<()>
     where
         F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
     {
+        // TODO(io_measurements): Replace with write-back counter.
+        let counter = hw_counter.payload_io_read_counter();
+
         for (key, val) in self.db_wrapper.lock_db().iter()? {
+            counter.incr_delta(key.len() + val.len());
+
             let do_continue = callback(
                 serde_cbor::from_slice(&key)?,
                 &serde_cbor::from_slice(&val)?,
@@ -193,5 +214,9 @@ impl PayloadStorage for OnDiskPayloadStorage {
 
     fn get_storage_size_bytes(&self) -> OperationResult<usize> {
         self.db_wrapper.get_storage_size_bytes()
+    }
+
+    fn is_on_disk(&self) -> bool {
+        true
     }
 }

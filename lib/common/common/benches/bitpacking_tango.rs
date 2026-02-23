@@ -9,7 +9,7 @@ use itertools::Itertools as _;
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
 use tango_bench::{
-    benchmark_fn, tango_benchmarks, tango_main, Bencher, Benchmark, ErasedSampler, IntoBenchmarks,
+    Bencher, Benchmark, ErasedSampler, IntoBenchmarks, benchmark_fn, tango_benchmarks, tango_main,
 };
 use zerocopy::IntoBytes;
 
@@ -90,12 +90,12 @@ fn benchmarks_bitpacking_links() -> impl IntoBenchmarks {
 
                 common::bitpacking_links::pack_links(
                     &mut links,
-                    std::iter::repeat_with(|| {
+                    &mut std::iter::repeat_with(|| {
                         rng.random_range(0..1u64 << bits_per_unsorted) as u32
                     })
                     .unique()
                     .take(sorted_count + unsorted_count)
-                    .collect(),
+                    .collect_vec(),
                     bits_per_unsorted,
                     sorted_count,
                 );

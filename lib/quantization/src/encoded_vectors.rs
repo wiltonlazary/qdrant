@@ -1,6 +1,9 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::mmap::MmapFlusher;
+use common::typelevel::TBool;
+use common::types::PointOffsetType;
 use serde::{Deserialize, Serialize};
 
 use crate::EncodingError;
@@ -15,25 +18,67 @@ pub enum DistanceType {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VectorParameters {
     pub dim: usize,
-    pub count: usize,
     pub distance_type: DistanceType,
     pub invert: bool,
+
+    // Deprecated, use `EncodedVectors::vectors_count` from quantization instead.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "count")]
+    pub deprecated_count: Option<usize>,
 }
 
-pub trait EncodedVectors<TEncodedQuery: Sized>: Sized {
-    fn save(&self, data_path: &Path, meta_path: &Path) -> std::io::Result<()>;
+pub trait EncodedVectors: Sized {
+    type EncodedQuery;
 
-    fn load(
-        data_path: &Path,
-        meta_path: &Path,
-        vector_parameters: &VectorParameters,
-    ) -> std::io::Result<Self>;
+    fn is_on_disk(&self) -> bool;
 
-    fn encode_query(&self, query: &[f32]) -> TEncodedQuery;
+    fn encode_query(&self, query: &[f32]) -> Self::EncodedQuery;
 
-    fn score_point(&self, query: &TEncodedQuery, i: u32, hw_couter: &HardwareCounterCell) -> f32;
+    fn score_point(
+        &self,
+        query: &Self::EncodedQuery,
+        i: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> f32;
 
-    fn score_internal(&self, i: u32, j: u32, hw_couter: &HardwareCounterCell) -> f32;
+    fn score_internal(
+        &self,
+        i: PointOffsetType,
+        j: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> f32;
+
+    /// Return size in bytes of a quantized vector
+    fn quantized_vector_size(&self) -> usize;
+
+    /// Construct a query from stored vector, so it can be used for scoring.
+    /// Some implementations may not support this, in which case they should return `None`.
+    fn encode_internal_vector(&self, id: PointOffsetType) -> Option<Self::EncodedQuery>;
+
+    fn upsert_vector(
+        &mut self,
+        id: PointOffsetType,
+        vector: &[f32],
+        hw_counter: &HardwareCounterCell,
+    ) -> std::io::Result<()>;
+
+    fn vectors_count(&self) -> usize;
+
+    fn flusher(&self) -> MmapFlusher;
+
+    fn files(&self) -> Vec<PathBuf>;
+
+    fn immutable_files(&self) -> Vec<PathBuf>;
+
+    type SupportsBytes: TBool;
+    fn score_bytes(
+        &self,
+        enabled: Self::SupportsBytes,
+        query: &Self::EncodedQuery,
+        bytes: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32;
 }
 
 impl DistanceType {
@@ -62,10 +107,11 @@ pub(crate) fn validate_vector_parameters<'a>(
         }
         count += 1;
     }
-    if count != vector_parameters.count {
+    if let Some(vectors_count) = vector_parameters.deprecated_count
+        && count != vectors_count
+    {
         return Err(EncodingError::ArgumentsError(format!(
-            "Vector count {} does not match vector parameters count {}",
-            count, vector_parameters.count
+            "Vector count {count} does not match vector parameters count {vectors_count}"
         )));
     }
     Ok(())

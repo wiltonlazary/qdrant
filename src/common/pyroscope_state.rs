@@ -3,7 +3,7 @@ pub mod pyro {
 
     use pyroscope::pyroscope::PyroscopeAgentRunning;
     use pyroscope::{PyroscopeAgent, PyroscopeError};
-    use pyroscope_pprofrs::{pprof_backend, PprofConfig};
+    use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 
     use crate::common::debugger::PyroscopeConfig;
 
@@ -24,7 +24,7 @@ pub mod pyro {
                 &config.identifier
             );
             // TODO: Add more tags like peerId and peerUrl
-            let agent = PyroscopeAgent::builder(config.url.to_string(), "qdrant".to_string())
+            let agent = PyroscopeAgent::builder(config.url.clone(), "qdrant".to_string())
                 .backend(backend_impl)
                 .tags(vec![("app", "Qdrant"), ("identifier", &config.identifier)])
                 .build()?;
@@ -43,7 +43,7 @@ pub mod pyro {
                             agent: Some(agent),
                         }),
                         Err(err) => {
-                            log::warn!("Pyroscope agent failed to start {}", err);
+                            log::warn!("Pyroscope agent failed to start {err}");
                             None
                         }
                     }
@@ -55,18 +55,18 @@ pub mod pyro {
         pub fn stop_agent(&mut self) -> bool {
             log::info!("Stopping pyroscope agent");
             if let Some(agent) = self.agent.take() {
-                match agent.stop() {
+                return match agent.stop() {
                     Ok(stopped_agent) => {
                         log::info!("Stopped pyroscope agent. Shutting it down");
                         stopped_agent.shutdown();
                         log::info!("Pyroscope agent shut down completed.");
-                        return true;
+                        true
                     }
                     Err(err) => {
-                        log::warn!("Pyroscope agent failed to stop {}", err);
-                        return false;
+                        log::warn!("Pyroscope agent failed to stop {err}");
+                        false
                     }
-                }
+                };
             }
             true
         }

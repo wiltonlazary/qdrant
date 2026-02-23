@@ -21,7 +21,7 @@ pub struct SegmentConfigV5 {
     pub storage_type: StorageTypeV5,
     /// Defines payload storage type
     #[serde(default)]
-    pub payload_storage_type: PayloadStorageType,
+    pub payload_storage_type: Option<PayloadStorageType>,
     /// Quantization parameters. If none - quantization is disabled.
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
@@ -49,9 +49,11 @@ impl From<SegmentConfigV5> for SegmentConfig {
                         .as_ref()
                         .and(old_data.quantization_config),
                     // Mmap if explicitly on disk, otherwise convert old storage type
-                    storage_type: (old_data.on_disk == Some(true))
-                        .then_some(VectorStorageType::Mmap)
-                        .unwrap_or_else(|| old_segment.storage_type.into()),
+                    storage_type: if old_data.on_disk == Some(true) {
+                        VectorStorageType::Mmap
+                    } else {
+                        old_segment.storage_type.into()
+                    },
                     multivector_config: None,
                     datatype: None,
                 };
@@ -60,10 +62,20 @@ impl From<SegmentConfigV5> for SegmentConfig {
             })
             .collect();
 
+        // ToDo: remove this whole thing once we drop rocksdb support
+
+        #[cfg(feature = "rocksdb")]
+        let default_storage_type = PayloadStorageType::OnDisk;
+
+        #[cfg(not(feature = "rocksdb"))]
+        let default_storage_type = PayloadStorageType::Mmap;
+
         SegmentConfig {
             vector_data,
             sparse_vector_data: Default::default(),
-            payload_storage_type: old_segment.payload_storage_type,
+            payload_storage_type: old_segment
+                .payload_storage_type
+                .unwrap_or(default_storage_type),
         }
     }
 }
@@ -124,9 +136,11 @@ pub struct SegmentStateV5 {
 
 impl From<SegmentStateV5> for SegmentState {
     fn from(old: SegmentStateV5) -> Self {
+        let SegmentStateV5 { version, config } = old;
         Self {
-            version: old.version,
-            config: old.config.into(),
+            initial_version: None,
+            version,
+            config: config.into(),
         }
     }
 }
@@ -152,6 +166,7 @@ mod tests {
                             max_indexing_threads: 0,
                             on_disk: None,
                             payload_m: Some(10),
+                            inline_storage: None,
                         }),
                         quantization_config: None,
                         on_disk: None,
@@ -183,9 +198,10 @@ mod tests {
                 max_indexing_threads: 0,
                 on_disk: None,
                 payload_m: None,
+                inline_storage: None,
             }),
             storage_type: StorageTypeV5::InMemory,
-            payload_storage_type: PayloadStorageType::default(),
+            payload_storage_type: None,
             quantization_config: None,
         };
 
@@ -258,9 +274,10 @@ mod tests {
                 max_indexing_threads: 0,
                 on_disk: None,
                 payload_m: None,
+                inline_storage: None,
             }),
             storage_type: StorageTypeV5::InMemory,
-            payload_storage_type: PayloadStorageType::default(),
+            payload_storage_type: None,
             quantization_config: Some(QuantizationConfig::Scalar(ScalarQuantization {
                 scalar: ScalarQuantizationConfig {
                     r#type: Default::default(),

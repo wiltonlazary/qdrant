@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use api::rest::models::{CollectionsResponse, HardwareUsage, VersionInfo};
+use api::rest::models::{CollectionsResponse, ShardKeysResponse, Usage, VersionInfo};
 use api::rest::schema::PointInsertOperations;
 use api::rest::{
     FacetRequest, FacetResponse, QueryGroupsRequest, QueryRequest, QueryRequestBatch,
@@ -17,21 +17,21 @@ use collection::operations::snapshot_ops::{
 use collection::operations::types::{
     AliasDescription, CollectionClusterInfo, CollectionExistence, CollectionInfo,
     CollectionsAliasesResponse, CountRequest, CountResult, DiscoverRequest, DiscoverRequestBatch,
-    GroupsResult, PointGroup, PointRequest, RecommendGroupsRequest, RecommendRequest,
-    RecommendRequestBatch, ScrollRequest, ScrollResult, SearchGroupsRequest, SearchRequest,
-    SearchRequestBatch, UpdateResult,
+    GroupsResult, OptimizationsResponse, PointGroup, PointRequest, RecommendGroupsRequest,
+    RecommendRequest, RecommendRequestBatch, ScrollRequest, ScrollResult, SearchGroupsRequest,
+    SearchRequest, SearchRequestBatch, UpdateResult,
 };
 use collection::operations::vector_ops::DeleteVectors;
-use schemars::gen::SchemaSettings;
 use schemars::JsonSchema;
+use schemars::r#gen::SchemaSettings;
 use serde::Serialize;
 use storage::content_manager::collection_meta_ops::{
     ChangeAliasesOperation, CreateCollection, UpdateCollection,
 };
 use storage::types::ClusterStatus;
 
-use crate::common::helpers::LocksOption;
 use crate::common::telemetry::TelemetryData;
+use crate::common::telemetry_ops::distributed_telemetry::DistributedTelemetryData;
 use crate::common::update::{CreateFieldIndex, UpdateOperations};
 
 mod actix;
@@ -70,7 +70,6 @@ struct AllDefinitions {
     ar: ClusterOperations,
     at: SearchRequestBatch,
     au: RecommendRequestBatch,
-    av: LocksOption,
     aw: SnapshotRecover,
     ax: CollectionsAliasesResponse,
     ay: AliasDescription,
@@ -97,13 +96,16 @@ struct AllDefinitions {
     bk: SearchMatrixPairsResponse,
     bl: FacetRequest,
     bm: FacetResponse,
-    bn: HardwareUsage,
+    bn: Usage,
+    bo: ShardKeysResponse,
+    bp: OptimizationsResponse,
+    bq: DistributedTelemetryData,
 }
 
 fn save_schema<T: JsonSchema>() {
     let settings = SchemaSettings::draft07();
-    let gen = settings.into_generator();
-    let schema = gen.into_root_schema_for::<T>();
+    let generator = settings.into_generator();
+    let schema = generator.into_root_schema_for::<T>();
     let schema_str = serde_json::to_string_pretty(&schema).unwrap();
     println!("{schema_str}")
 }

@@ -1,9 +1,10 @@
-use std::collections::HashSet;
-use std::fs::File;
 use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::tar_ext;
+use common::tar_unpack::tar_unpack_file;
+use fs_err as fs;
+use fs_err::File;
 use rstest::rstest;
 use tempfile::Builder;
 
@@ -12,11 +13,12 @@ use crate::common::operation_error::OperationError::PointIdError;
 use crate::common::{check_named_vectors, check_vector, check_vector_name};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::query_context::QueryContext;
-use crate::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
-use crate::entry::entry_point::SegmentEntry;
+use crate::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
+use crate::entry::SnapshotEntry as _;
+use crate::entry::entry_point::{NonAppendableSegmentEntry as _, SegmentEntry as _};
 use crate::segment_constructor::load_segment;
 use crate::segment_constructor::simple_segment_constructor::{
-    build_multivec_segment, build_simple_segment, VECTOR1_NAME, VECTOR2_NAME,
+    VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment, build_simple_segment,
 };
 use crate::types::{Distance, Filter, Payload, SnapshotFormat, WithPayload, WithVector};
 
@@ -198,25 +200,26 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
         .tempfile()
         .unwrap();
     let segment_id = segment
-        .current_path
+        .segment_path
         .file_stem()
         .and_then(|f| f.to_str())
         .unwrap();
 
+    segment.flush(true).unwrap();
+
     // snapshotting!
-    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(&parent_snapshot_tar).unwrap());
+    let tar =
+        tar_ext::BuilderExt::new_seekable_owned(File::create(parent_snapshot_tar.path()).unwrap());
     segment
-        .take_snapshot(temp_dir.path(), &tar, format, &mut HashSet::new())
+        .take_snapshot(temp_dir.path(), &tar, format, None)
         .unwrap();
     tar.blocking_finish().unwrap();
 
     let parent_snapshot_unpacked = Builder::new().prefix("parent_snapshot").tempdir().unwrap();
-    tar::Archive::new(File::open(&parent_snapshot_tar).unwrap())
-        .unpack(parent_snapshot_unpacked.path())
-        .unwrap();
+    tar_unpack_file(parent_snapshot_tar.path(), parent_snapshot_unpacked.path()).unwrap();
 
     // Should be exactly one entry in the snapshot.
-    let mut entries = parent_snapshot_unpacked.path().read_dir().unwrap();
+    let mut entries = fs::read_dir(parent_snapshot_unpacked.path()).unwrap();
     let entry = entries.next().unwrap().unwrap();
     assert!(entries.next().is_none());
 
@@ -236,7 +239,7 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
     Segment::restore_snapshot_in_place(&entry.path()).unwrap();
 
     // Should be exactly one entry in the snapshot.
-    let mut entries = parent_snapshot_unpacked.path().read_dir().unwrap();
+    let mut entries = fs::read_dir(parent_snapshot_unpacked.path()).unwrap();
     let entry = entries.next().unwrap().unwrap();
     assert!(entries.next().is_none());
 
@@ -244,9 +247,8 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
     assert!(entry.path().is_dir());
     assert_eq!(entry.file_name(), segment_id);
 
-    let restored_segment = load_segment(&entry.path(), &AtomicBool::new(false))
-        .unwrap()
-        .unwrap();
+    let restored_segment =
+        load_segment(&entry.path(), Uuid::nil(), &AtomicBool::new(false)).unwrap();
 
     // validate restored snapshot is the same as original segment
     assert_eq!(
@@ -263,45 +265,14 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
     );
 
     for id in segment.iter_points() {
-        let vectors = segment.all_vectors(id).unwrap();
-        let restored_vectors = restored_segment.all_vectors(id).unwrap();
+        let vectors = segment.all_vectors(id, &hw_counter).unwrap();
+        let restored_vectors = restored_segment.all_vectors(id, &hw_counter).unwrap();
         assert_eq!(vectors, restored_vectors);
 
         let payload = segment.payload(id, &hw_counter).unwrap();
         let restored_payload = restored_segment.payload(id, &hw_counter).unwrap();
         assert_eq!(payload, restored_payload);
     }
-}
-
-#[test]
-fn test_background_flush() {
-    let data = r#"
-        {
-            "name": "John Doe",
-            "age": 43,
-            "metadata": {
-                "height": 50,
-                "width": 60
-            }
-        }"#;
-
-    let segment_base_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-
-    let hw_counter = HardwareCounterCell::new();
-
-    let mut segment = build_simple_segment(segment_base_dir.path(), 2, Distance::Dot).unwrap();
-    segment
-        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]), &hw_counter)
-        .unwrap();
-
-    let payload: Payload = serde_json::from_str(data).unwrap();
-    segment
-        .set_full_payload(0, 0.into(), &payload, &hw_counter)
-        .unwrap();
-    segment.flush(false, false).unwrap();
-
-    // call flush second time to check that background flush finished successful
-    segment.flush(true, false).unwrap();
 }
 
 #[test]
@@ -342,7 +313,11 @@ fn test_check_consistency() {
     assert_eq!(search_result[0].id, 6.into());
     assert_eq!(search_result[1].id, 4.into());
 
-    assert!(segment.vector(DEFAULT_VECTOR_NAME, 6.into()).is_ok());
+    assert!(
+        segment
+            .vector(DEFAULT_VECTOR_NAME, 6.into(), &hw_counter)
+            .is_ok()
+    );
 
     let internal_id = segment.lookup_internal_id(6.into()).unwrap();
 
@@ -367,12 +342,12 @@ fn test_check_consistency() {
 
     // querying by external id is broken
     assert!(
-        matches!(segment.vector(DEFAULT_VECTOR_NAME, 6.into()), Err(PointIdError {missed_point_id }) if missed_point_id == 6.into())
+        matches!(segment.vector(DEFAULT_VECTOR_NAME, 6.into(), &hw_counter), Err(PointIdError {missed_point_id }) if missed_point_id == 6.into())
     );
 
     // but querying by internal id still works
     matches!(
-        segment.vector_by_offset(DEFAULT_VECTOR_NAME, internal_id),
+        segment.vector_by_offset(DEFAULT_VECTOR_NAME, internal_id, &hw_counter),
         Ok(Some(_))
     );
 
@@ -381,7 +356,7 @@ fn test_check_consistency() {
 
     // querying by internal id now consistent
     matches!(
-        segment.vector_by_offset(DEFAULT_VECTOR_NAME, internal_id),
+        segment.vector_by_offset(DEFAULT_VECTOR_NAME, internal_id, &hw_counter),
         Ok(None)
     );
 }
@@ -492,17 +467,13 @@ fn test_point_vector_count_multivec() {
     assert_eq!(segment_info.num_vectors, 6); // We don't propagate deletes to vectors at this time
 
     // Delete vector 'a' of point 6, vector count should decrease by 1
-    segment
-        .delete_vector(106, 6.into(), VECTOR1_NAME, &hw_counter)
-        .unwrap();
+    segment.delete_vector(106, 6.into(), VECTOR1_NAME).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 3);
     assert_eq!(segment_info.num_vectors, 5);
 
     // Deleting it again shouldn't chain anything
-    segment
-        .delete_vector(107, 6.into(), VECTOR1_NAME, &hw_counter)
-        .unwrap();
+    segment.delete_vector(107, 6.into(), VECTOR1_NAME).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 3);
     assert_eq!(segment_info.num_vectors, 5);
@@ -512,7 +483,9 @@ fn test_point_vector_count_multivec() {
     segment
         .replace_all_vectors(
             internal_8,
+            0,
             &NamedVectors::from_pairs([(VECTOR1_NAME.into(), vec![0.1])]),
+            &hw_counter,
         )
         .unwrap();
     let segment_info = segment.info();
@@ -523,10 +496,12 @@ fn test_point_vector_count_multivec() {
     segment
         .replace_all_vectors(
             internal_8,
+            0,
             &NamedVectors::from_pairs([
                 (VECTOR1_NAME.into(), vec![0.1]),
                 (VECTOR2_NAME.into(), vec![0.1]),
             ]),
+            &hw_counter,
         )
         .unwrap();
     let segment_info = segment.info();
@@ -559,7 +534,7 @@ fn test_vector_compatibility_checks() {
     let internal_id = segment.lookup_internal_id(point_id).unwrap();
 
     // A set of broken vectors
-    let wrong_vectors_single = vec![
+    let wrong_vectors_single = [
         // Incorrect dimensionality
         (VECTOR1_NAME, vec![]),
         (VECTOR1_NAME, vec![0.0, 1.0, 0.0]),
@@ -571,7 +546,7 @@ fn test_vector_compatibility_checks() {
         ("aa", vec![0.0, 0.1, 0.2, 0.3]),
         ("bb", vec![0.0, 0.1]),
     ];
-    let wrong_vectors_multi = vec![
+    let wrong_vectors_multi = [
         // Incorrect dimensionality
         NamedVectors::from_ref(VECTOR1_NAME, [].as_slice().into()),
         NamedVectors::from_ref(VECTOR1_NAME, [0.0, 1.0, 0.0].as_slice().into()),
@@ -599,7 +574,7 @@ fn test_vector_compatibility_checks() {
             ("bb".into(), vec![1.0, 0.9]),
         ]),
     ];
-    let wrong_names = vec!["aa", "bb", ""];
+    let wrong_names = ["aa", "bb", ""];
 
     for (vector_name, vector) in wrong_vectors_single.iter() {
         let query_vector = vector.to_owned().into();
@@ -650,15 +625,15 @@ fn test_vector_compatibility_checks() {
             .err()
             .unwrap();
         segment
-            .update_vectors(internal_id, vectors.clone())
+            .update_vectors(internal_id, 0, vectors.clone(), &hw_counter)
             .err()
             .unwrap();
         segment
-            .insert_new_vectors(point_id, &vectors)
+            .insert_new_vectors(point_id, 0, &vectors, &hw_counter)
             .err()
             .unwrap();
         segment
-            .replace_all_vectors(internal_id, &vectors)
+            .replace_all_vectors(internal_id, 0, &vectors, &hw_counter)
             .err()
             .unwrap();
     }
@@ -667,14 +642,17 @@ fn test_vector_compatibility_checks() {
         check_vector_name(wrong_name, &segment.segment_config)
             .err()
             .unwrap();
-        segment.vector(wrong_name, point_id).err().unwrap();
         segment
-            .delete_vector(101, point_id, wrong_name, &hw_counter)
+            .vector(wrong_name, point_id, &hw_counter)
+            .err()
+            .unwrap();
+        segment
+            .delete_vector(101, point_id, wrong_name)
             .err()
             .unwrap();
         segment.available_vector_count(wrong_name).err().unwrap();
         segment
-            .vector_by_offset(wrong_name, internal_id)
+            .vector_by_offset(wrong_name, internal_id, &hw_counter)
             .err()
             .unwrap();
     }

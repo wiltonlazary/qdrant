@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
@@ -6,20 +7,19 @@ use itertools::Itertools;
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{Condition, Filter, HasIdCondition, ScoredPoint};
 use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery};
-use tokio::sync::RwLockReadGuard;
+use shard::query::query_enum::QueryEnum;
+use shard::search::CoreSearchRequestBatch;
 
 use crate::collection::Collection;
 use crate::common::batching::batch_requests;
 use crate::common::fetch_vectors::{
-    convert_to_vectors, resolve_referenced_vectors_batch, ReferencedVectors,
+    ReferencedVectors, convert_to_vectors, resolve_referenced_vectors_batch,
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
-use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
-    CollectionError, CollectionResult, CoreSearchRequest, CoreSearchRequestBatch,
-    DiscoverRequestInternal,
+    CollectionError, CollectionResult, CoreSearchRequest, DiscoverRequestInternal,
 };
 
 fn discovery_into_core_search(
@@ -124,7 +124,7 @@ fn discovery_into_core_search(
     Ok(core_search)
 }
 
-pub async fn discover<'a, F, Fut>(
+pub async fn discover<F, Fut>(
     request: DiscoverRequestInternal,
     collection: &Collection,
     collection_by_name: F,
@@ -135,7 +135,7 @@ pub async fn discover<'a, F, Fut>(
 ) -> CollectionResult<Vec<ScoredPoint>>
 where
     F: Fn(String) -> Fut,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     if request.limit == 0 {
         return Ok(vec![]);
@@ -155,7 +155,7 @@ where
     Ok(results.into_iter().next().unwrap())
 }
 
-pub async fn discover_batch<'a, F, Fut>(
+pub async fn discover_batch<F, Fut>(
     request_batch: Vec<(DiscoverRequestInternal, ShardSelectorInternal)>,
     collection: &Collection,
     collection_by_name: F,
@@ -165,7 +165,7 @@ pub async fn discover_batch<'a, F, Fut>(
 ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
 where
     F: Fn(String) -> Fut,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     let start = std::time::Instant::now();
     // shortcuts batch if all requests with limit=0
@@ -214,7 +214,7 @@ where
         request_batch,
         |(_req, shard)| shard,
         |(req, _), acc| {
-            discovery_into_core_search(&collection.name(), req, &all_vectors_records_map).map(
+            discovery_into_core_search(collection.name(), req, &all_vectors_records_map).map(
                 |core_req| {
                     acc.push(core_req);
                 },

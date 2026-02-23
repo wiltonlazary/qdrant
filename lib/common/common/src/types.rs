@@ -1,13 +1,16 @@
 use std::cmp::Ordering;
 
 use ordered_float::OrderedFloat;
+use strum::EnumIter;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Type of vector matching score
 pub type ScoreType = f32;
 /// Type of point index inside a segment
 pub type PointOffsetType = u32;
 
-#[derive(Copy, Clone, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Debug, Default, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
 pub struct ScoredPointOffset {
     pub idx: PointOffsetType,
     pub score: ScoreType,
@@ -33,11 +36,39 @@ pub struct TelemetryDetail {
     pub histograms: bool,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+impl TelemetryDetail {
+    pub fn new(level: DetailsLevel, histograms: bool) -> Self {
+        Self { level, histograms }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, EnumIter)]
 pub enum DetailsLevel {
+    /// Minimal information level
+    /// - app info
+    /// - minimal telemetry by endpoint
+    /// - cluster status
     Level0,
+    /// Detailed common info level
+    /// - app info details
+    /// - system info
+    ///   - hardware flags
+    ///   - hardware usage per collection
+    ///   - RAM usage
+    /// - cluster basic details
+    /// - collections basic info
     Level1,
+    /// Detailed consensus info - peers info
+    /// Collections:
+    ///  - detailed config
+    ///  - Shards - basic config
     Level2,
+    /// Shards:
+    ///  - detailed config
+    ///  - Optimizers info
+    Level3,
+    /// Segment level telemetry
+    Level4,
 }
 
 impl Default for TelemetryDetail {
@@ -54,7 +85,10 @@ impl From<usize> for DetailsLevel {
         match value {
             0 => DetailsLevel::Level0,
             1 => DetailsLevel::Level1,
-            _ => DetailsLevel::Level2,
+            2 => DetailsLevel::Level2,
+            3 => DetailsLevel::Level3,
+            4 => DetailsLevel::Level4,
+            _ => DetailsLevel::Level4,
         }
     }
 }

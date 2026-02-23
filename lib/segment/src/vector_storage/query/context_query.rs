@@ -1,14 +1,16 @@
+use std::hash::Hash;
 use std::iter::{self, Chain, Once};
 
 use common::math::fast_sigmoid;
 use common::types::ScoreType;
 use itertools::Itertools;
+use serde::Serialize;
 
 use super::{Query, TransformInto};
 use crate::common::operation_error::OperationResult;
 use crate::data_types::vectors::{QueryVector, VectorInternal};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Hash)]
 pub struct ContextPair<T> {
     pub positive: T,
     pub negative: T,
@@ -80,7 +82,7 @@ impl<T> From<(T, T)> for ContextPair<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Hash)]
 pub struct ContextQuery<T> {
     pub pairs: Vec<ContextPair<T>>,
 }

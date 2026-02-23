@@ -5,6 +5,7 @@ use crate::common::types::DimWeight;
 pub const DEFAULT_MAX_NEXT_WEIGHT: DimWeight = f32::NEG_INFINITY;
 
 #[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
 pub struct GenericPostingElement<W> {
     /// Record ID
     pub record_id: PointOffsetType,
@@ -13,6 +14,7 @@ pub struct GenericPostingElement<W> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
 pub struct PostingElement {
     /// Record ID
     pub record_id: PointOffsetType,
@@ -21,6 +23,7 @@ pub struct PostingElement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
 pub struct PostingElementEx {
     /// Record ID
     pub record_id: PointOffsetType,
@@ -56,6 +59,13 @@ pub trait PostingListIter {
 
     fn last_id(&self) -> Option<PointOffsetType>;
 
+    /// Size of the weight element
+    fn element_size(&self) -> usize;
+
+    /// Tries to find the element with ID == id and returns it.
+    /// If the element is not found, the iterator is advanced to the next element with ID > id
+    /// and None is returned.
+    /// If the iterator is already at the end, None is returned.
     fn skip_to(&mut self, record_id: PointOffsetType) -> Option<PostingElementEx>;
 
     fn skip_to_end(&mut self);

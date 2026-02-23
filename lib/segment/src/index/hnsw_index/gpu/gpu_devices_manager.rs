@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use itertools::Itertools;
 use parking_lot::{Mutex, MutexGuard};
@@ -80,10 +80,11 @@ impl GpuDevicesMaganer {
                     .filter_map(|&device_index| filtered_physical_devices.get(device_index))
                     // Try to create a gpu device.
                     .filter_map(|physical_device| {
-                        match gpu::Device::new_with_queue_index(
+                        match gpu::Device::new_with_params(
                             instance.clone(),
                             physical_device,
                             queue_index,
+                            false,
                         ) {
                             Ok(device) => {
                                 log::info!("Initialized GPU device: {:?}", &physical_device.name);
@@ -116,7 +117,10 @@ impl GpuDevicesMaganer {
         })
     }
 
-    pub fn lock_device(&self, stopped: &AtomicBool) -> OperationResult<Option<LockedGpuDevice>> {
+    pub fn lock_device(
+        &self,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Option<LockedGpuDevice<'_>>> {
         if self.devices.is_empty() {
             return Ok(None);
         }

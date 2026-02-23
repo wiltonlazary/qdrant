@@ -44,7 +44,7 @@ impl EtaCalculator {
         if self.0.len() >= 2 && now - self.0.get_signed(-2).unwrap().0 < Self::DURATION {
             *self.0.back_mut().unwrap() = (now, current_progress);
         } else {
-            self.0.push((now, current_progress));
+            self.0.enqueue((now, current_progress));
         }
     }
 
@@ -97,9 +97,10 @@ mod tests {
             max_relative = 0.02,
         );
         // Emulate a stall.
-        assert!(eta
-            .estimate_raw(now + Duration::from_secs(20), 100)
-            .is_none());
+        assert!(
+            eta.estimate_raw(now + Duration::from_secs(20), 100)
+                .is_none(),
+        );
 
         // Change the speed.
         let delta = Duration::from_millis(5000);

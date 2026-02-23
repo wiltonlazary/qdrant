@@ -1,11 +1,11 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::Future;
 use itertools::Itertools;
-use tokio::sync::RwLockReadGuard;
 
-use super::group_by::{group_by, GroupRequest};
+use super::group_by::{GroupRequest, group_by};
 use crate::collection::Collection;
 use crate::lookup::lookup_ids;
 use crate::lookup::types::PseudoId;
@@ -17,7 +17,7 @@ use crate::operations::types::{CollectionError, CollectionResult, PointGroup};
 pub struct GroupBy<'a, F, Fut>
 where
     F: Fn(String) -> Fut + Clone,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     group_by: GroupRequest,
     collection: &'a Collection,
@@ -32,7 +32,7 @@ where
 impl<'a, F, Fut> GroupBy<'a, F, Fut>
 where
     F: Fn(String) -> Fut + Clone,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     /// Creates a basic GroupBy builder
     pub fn new(
@@ -73,8 +73,8 @@ where
             tokio::time::timeout(timeout, self.run())
                 .await
                 .map_err(|_| {
-                    log::debug!("GroupBy timeout reached: {} seconds", timeout.as_secs());
-                    CollectionError::timeout(timeout.as_secs() as usize, "GroupBy")
+                    log::debug!("GroupBy timeout reached: {timeout:?}");
+                    CollectionError::timeout(timeout, "GroupBy")
                 })?
         } else {
             self.run().await

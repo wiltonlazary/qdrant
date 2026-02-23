@@ -1,27 +1,30 @@
 use std::borrow::Cow;
 use std::mem::size_of;
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::{BitSlice, BitVec};
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::ext::BitSliceExt as _;
 use common::types::PointOffsetType;
 use log::debug;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
-use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::bitvec::bitvec_set_deleted;
-use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
 use crate::vector_storage::common::StoredRecord;
-use crate::vector_storage::{DenseVectorStorage, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{
+    AccessPattern, DenseVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum,
+};
 
 type StoredDenseVector<T> = StoredRecord<Vec<T>>;
 
@@ -88,6 +91,39 @@ fn open_simple_dense_vector_storage_impl<T: PrimitiveVectorElement>(
 }
 
 pub fn open_simple_dense_vector_storage(
+    storage_element_type: VectorStorageDatatype,
+    database: Arc<RwLock<DB>>,
+    database_column_name: &str,
+    dim: usize,
+    distance: Distance,
+    stopped: &AtomicBool,
+) -> OperationResult<VectorStorageEnum> {
+    match storage_element_type {
+        VectorStorageDatatype::Float32 => open_simple_dense_full_vector_storage(
+            database,
+            database_column_name,
+            dim,
+            distance,
+            stopped,
+        ),
+        VectorStorageDatatype::Float16 => open_simple_dense_half_vector_storage(
+            database,
+            database_column_name,
+            dim,
+            distance,
+            stopped,
+        ),
+        VectorStorageDatatype::Uint8 => open_simple_dense_byte_vector_storage(
+            database,
+            database_column_name,
+            dim,
+            distance,
+            stopped,
+        ),
+    }
+}
+
+pub fn open_simple_dense_full_vector_storage(
     database: Arc<RwLock<DB>>,
     database_column_name: &str,
     dim: usize,
@@ -164,6 +200,7 @@ impl<T: PrimitiveVectorElement> SimpleDenseVectorStorage<T> {
         key: PointOffsetType,
         deleted: bool,
         vector: Option<&[T]>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         // Write vector state to buffer record
         let record = &mut self.update_buffer;
@@ -172,12 +209,22 @@ impl<T: PrimitiveVectorElement> SimpleDenseVectorStorage<T> {
             record.vector.copy_from_slice(vector);
         }
 
-        // Store updated record
-        self.db_wrapper.put(
-            bincode::serialize(&key).unwrap(),
-            bincode::serialize(&record).unwrap(),
-        )?;
+        let key_enc = bincode::serialize(&key).unwrap();
+        let record_enc = bincode::serialize(&record).unwrap();
 
+        hw_counter
+            .vector_io_write_counter()
+            .incr_delta(key_enc.len() + record_enc.len());
+
+        // Store updated record
+        self.db_wrapper.put(key_enc, record_enc)?;
+
+        Ok(())
+    }
+
+    /// Destroy this vector storage, remove persisted data from RocksDB
+    pub fn destroy(&self) -> OperationResult<()> {
+        self.db_wrapper.remove_column_family()?;
         Ok(())
     }
 }
@@ -187,7 +234,7 @@ impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for SimpleDenseVectorStora
         self.dim
     }
 
-    fn get_dense(&self, key: PointOffsetType) -> &[T] {
+    fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> &[T] {
         self.vectors.get(key as VectorOffsetType)
     }
 }
@@ -209,24 +256,30 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
         self.vectors.len()
     }
 
-    fn get_vector(&self, key: PointOffsetType) -> CowVector {
-        self.get_vector_opt(key).expect("vector not found")
+    fn get_vector<P: AccessPattern>(&self, key: PointOffsetType) -> CowVector<'_> {
+        self.get_vector_opt::<P>(key).expect("vector not found")
     }
 
     /// Get vector by key, if it exists.
-    fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
+    fn get_vector_opt<P: AccessPattern>(&self, key: PointOffsetType) -> Option<CowVector<'_>> {
+        // In memory so no optimization to be done for access pattern.
         self.vectors
             .get_opt(key as VectorOffsetType)
             .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
     }
 
-    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         let vector: &[VectorElementType] = vector.try_into()?;
         let vector = T::slice_from_float_cow(Cow::from(vector));
         self.vectors
             .insert(key as VectorOffsetType, vector.as_ref())?;
         self.set_deleted(key, false);
-        self.update_stored(key, false, Some(vector.as_ref()))?;
+        self.update_stored(key, false, Some(vector.as_ref()), hw_counter)?;
         Ok(())
     }
 
@@ -236,13 +289,19 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let start_index = self.vectors.len() as PointOffsetType;
+        let dispose_hw = HardwareCounterCell::disposable(); // This function is only used for internal operations.
         for (other_vector, other_deleted) in other_vectors {
             check_process_stopped(stopped)?;
             // Do not perform preprocessing - vectors should be already processed
             let other_vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
             let new_id = self.vectors.push(other_vector.as_ref())? as PointOffsetType;
             self.set_deleted(new_id, other_deleted);
-            self.update_stored(new_id, other_deleted, Some(other_vector.as_ref()))?;
+            self.update_stored(
+                new_id,
+                other_deleted,
+                Some(other_vector.as_ref()),
+                &dispose_hw,
+            )?;
         }
         let end_index = self.vectors.len() as PointOffsetType;
         Ok(start_index..end_index)
@@ -259,13 +318,14 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
     fn delete_vector(&mut self, key: PointOffsetType) -> OperationResult<bool> {
         let is_deleted = !self.set_deleted(key, true);
         if is_deleted {
-            self.update_stored(key, true, None)?;
+            // Not measuring deletions
+            self.update_stored(key, true, None, &HardwareCounterCell::disposable())?;
         }
         Ok(is_deleted)
     }
 
     fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key as usize).map(|b| *b).unwrap_or(false)
+        self.deleted.get_bit(key as usize).unwrap_or(false)
     }
 
     fn deleted_vector_count(&self) -> usize {
@@ -274,5 +334,97 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
 
     fn deleted_vector_bitslice(&self) -> &BitSlice {
         self.deleted.as_bitslice()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
+    use crate::segment_constructor::migrate_rocksdb_dense_vector_storage_to_mmap;
+    use crate::vector_storage::Sequential;
+
+    const RAND_SEED: u64 = 42;
+
+    /// Create RocksDB based dense vector storage.
+    ///
+    /// Migrate it to the mmap based dense vector storage and assert vector data is correct.
+    #[test]
+    fn test_migrate_simple_to_mmap() {
+        const POINT_COUNT: PointOffsetType = 128;
+        const DIM: usize = 128;
+        const DELETE_PROBABILITY: f64 = 0.1;
+
+        let mut rng = StdRng::seed_from_u64(RAND_SEED);
+
+        let db_dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let db = open_db(db_dir.path(), &[DB_VECTOR_CF]).unwrap();
+
+        // Create simple dense vector storage, insert test points and delete some of them again
+        let mut storage = open_simple_dense_full_vector_storage(
+            db,
+            DB_VECTOR_CF,
+            DIM,
+            Distance::Dot,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        for internal_id in 0..POINT_COUNT {
+            let point = std::iter::repeat_with(|| rng.random_range(-1.0..1.0))
+                .take(DIM)
+                .collect::<Vec<_>>();
+            storage
+                .insert_vector(
+                    internal_id,
+                    VectorRef::from(&point),
+                    &HardwareCounterCell::disposable(),
+                )
+                .unwrap();
+            if rng.random_bool(DELETE_PROBABILITY) {
+                storage.delete_vector(internal_id).unwrap();
+            }
+        }
+
+        let deleted_vector_count = storage.deleted_vector_count();
+        let total_vector_count = storage.total_vector_count();
+
+        // Migrate from RocksDB to mmap storage
+        let storage_dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let new_storage =
+            migrate_rocksdb_dense_vector_storage_to_mmap(&storage, DIM, storage_dir.path())
+                .expect("failed to migrate from RocksDB to mmap");
+
+        // Destroy persisted RocksDB dense vector data
+        match storage {
+            VectorStorageEnum::DenseSimple(storage) => storage.destroy().unwrap(),
+            VectorStorageEnum::DenseSimpleByte(storage) => storage.destroy().unwrap(),
+            VectorStorageEnum::DenseSimpleHalf(storage) => storage.destroy().unwrap(),
+            _ => unreachable!("unexpected vector storage type"),
+        }
+
+        // We can drop RocksDB storage now
+        db_dir.close().expect("failed to drop RocksDB storage");
+
+        // Assert vector counts and data
+        let mut rng = StdRng::seed_from_u64(RAND_SEED);
+        assert_eq!(new_storage.deleted_vector_count(), deleted_vector_count);
+        assert_eq!(new_storage.total_vector_count(), total_vector_count);
+        for internal_id in 0..POINT_COUNT {
+            let point = std::iter::repeat_with(|| rng.random_range(-1.0..1.0))
+                .take(DIM)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                new_storage.get_vector::<Sequential>(internal_id),
+                CowVector::from(point),
+            );
+            assert_eq!(
+                new_storage.is_deleted_vector(internal_id),
+                rng.random_bool(DELETE_PROBABILITY)
+            );
+        }
     }
 }

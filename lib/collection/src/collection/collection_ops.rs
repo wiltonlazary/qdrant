@@ -1,26 +1,29 @@
 use std::cmp;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use futures::{future, TryStreamExt as _};
-use lazy_static::lazy_static;
-use segment::types::{QuantizationConfig, StrictModeConfig};
+use futures::{TryStreamExt as _, future};
+use segment::types::{Payload, QuantizationConfig, StrictModeConfig};
 use semver::Version;
+use shard::count::CountRequestInternal;
 
 use super::Collection;
 use crate::operations::config_diff::*;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 use crate::optimizers_builder::OptimizersConfig;
-use crate::shards::replica_set::{Change, ReplicaState};
+use crate::shards::replica_set::Change;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::PeerId;
 
-lazy_static! {
-    /// When dropping a shard, only cancel all related shard transfers to and from it when all nodes
-    /// are running at least this version. That way, we avoid getting an inconsistent state in
-    /// consensus if some nodes are still running an older version.
-    static ref ABORT_TRANSFERS_ON_SHARD_DROP_FROM_VERSION: Version = Version::parse("1.9.0-dev").unwrap();
-}
+/// Old logic for aborting shard transfers on shard drop, had a bug: it dropped all transfers
+/// regardless of the shard id. In order to keep consensus consistent, we can only
+/// enable new fixed logic once cluster fully switched to this version.
+/// Otherwise, some node might follow old logic and some - new logic.
+///
+/// See: <https://github.com/qdrant/qdrant/pull/7792>
+pub static ABORT_TRANSFERS_ON_SHARD_DROP_FIX_FROM_VERSION: LazyLock<Version> =
+    LazyLock::new(|| Version::parse("1.16.3-dev").expect("valid version string"));
 
 impl Collection {
     /// Updates collection params:
@@ -34,7 +37,7 @@ impl Collection {
     ) -> CollectionResult<()> {
         {
             let mut config = self.collection_config.write().await;
-            config.params = params_diff.update(&config.params)?;
+            config.params = config.params.update(&params_diff);
         }
         self.collection_config.read().await.save(&self.path)?;
         Ok(())
@@ -51,7 +54,7 @@ impl Collection {
     ) -> CollectionResult<()> {
         {
             let mut config = self.collection_config.write().await;
-            config.hnsw_config = hnsw_config_diff.update(&config.hnsw_config)?;
+            config.hnsw_config = config.hnsw_config.update(&hnsw_config_diff);
         }
         self.collection_config.read().await.save(&self.path)?;
         Ok(())
@@ -104,8 +107,7 @@ impl Collection {
     ) -> CollectionResult<()> {
         {
             let mut config = self.collection_config.write().await;
-            config.optimizer_config =
-                DiffConfig::update(optimizer_config_diff, &config.optimizer_config)?;
+            config.optimizer_config = config.optimizer_config.update(&optimizer_config_diff);
         }
         self.collection_config.read().await.save(&self.path)?;
         Ok(())
@@ -163,6 +165,22 @@ impl Collection {
         Ok(())
     }
 
+    pub async fn update_metadata(&self, metadata: Payload) -> CollectionResult<()> {
+        let mut collection_config_guard: tokio::sync::RwLockWriteGuard<
+            '_,
+            crate::config::CollectionConfigInternal,
+        > = self.collection_config.write().await;
+
+        if let Some(current_metadata) = collection_config_guard.metadata.as_mut() {
+            current_metadata.merge(&metadata);
+        } else {
+            collection_config_guard.metadata = Some(metadata);
+        }
+        drop(collection_config_guard);
+        self.collection_config.read().await.save(&self.path)?;
+        Ok(())
+    }
+
     /// Updates the strict mode configuration and saves it to disk.
     pub async fn update_strict_mode_config(
         &self,
@@ -171,7 +189,7 @@ impl Collection {
         {
             let mut config = self.collection_config.write().await;
             if let Some(current_config) = config.strict_mode_config.as_mut() {
-                *current_config = strict_mode_diff.update(current_config)?;
+                *current_config = current_config.update(&strict_mode_diff);
             } else {
                 config.strict_mode_config = Some(strict_mode_diff);
             }
@@ -222,25 +240,32 @@ impl Collection {
             // Check that we are not removing the *last* replica or the last *active* replica
             //
             // `is_last_active_replica` counts both `Active` and `ReshardingScaleDown` replicas!
-            if peers.len() == 1 || replica_set.is_last_active_replica(peer_id) {
+            if peers.len() == 1 || replica_set.is_last_source_of_truth_replica(peer_id) {
                 return Err(CollectionError::BadRequest {
-                    description: format!("Shard {shard_id} must have at least one active replica after removing {peer_id}"),
+                    description: format!(
+                        "Shard {shard_id} must have at least one active replica after removing {peer_id}",
+                    ),
                 });
             }
 
-            let all_nodes_cancel_transfers = self
+            let all_nodes_fixed_cancellation = self
                 .channel_service
-                .all_peers_at_version(&ABORT_TRANSFERS_ON_SHARD_DROP_FROM_VERSION);
-            if all_nodes_cancel_transfers {
-                // Collect shard transfers related to removed shard...
-                let transfers = shard_holder
-                    .get_transfers(|transfer| transfer.from == peer_id || transfer.to == peer_id);
+                .all_peers_at_version(&ABORT_TRANSFERS_ON_SHARD_DROP_FIX_FROM_VERSION);
 
-                // ...and cancel transfer tasks and remove transfers from internal state
-                for transfer in transfers {
-                    self.abort_shard_transfer(transfer.key(), Some(&shard_holder))
-                        .await?;
-                }
+            // Collect shard transfers related to removed shard...
+            let transfers = if all_nodes_fixed_cancellation {
+                shard_holder.get_related_transfers(peer_id, shard_id)
+            } else {
+                // This is the old buggy logic, but we have to keep it
+                // for maintaining consistency in a cluster with mixed versions.
+                shard_holder
+                    .get_transfers(|transfer| transfer.from == peer_id || transfer.to == peer_id)
+            };
+
+            // ...and cancel transfer tasks and remove transfers from internal state
+            for transfer in transfers {
+                self.abort_shard_transfer_and_resharding(transfer.key(), Some(&shard_holder))
+                    .await?;
             }
 
             replica_set.remove_peer(peer_id).await?;
@@ -263,12 +288,20 @@ impl Collection {
     ///
     /// Partially blocking. Stopping existing optimizers is blocking. Starting new optimizers is
     /// not blocking.
+    ///
+    /// ## Cancel safety
+    ///
+    /// This function is cancel safe, and will always run to completion.
     pub async fn recreate_optimizers_blocking(&self) -> CollectionResult<()> {
-        let shard_holder = self.shards_holder.read().await;
-        let updates = shard_holder
-            .all_shards()
-            .map(|replica_set| replica_set.on_optimizer_config_update());
-        future::try_join_all(updates).await?;
+        let shards_holder = self.shards_holder.clone();
+        tokio::task::spawn(async move {
+            let shard_holder = shards_holder.read().await;
+            let updates = shard_holder
+                .all_shards()
+                .map(|replica_set| replica_set.on_optimizer_config_update());
+            future::try_join_all(updates).await
+        })
+        .await??;
         Ok(())
     }
 
@@ -294,37 +327,45 @@ impl Collection {
 
         let mut info = match requests.try_next().await? {
             Some(info) => info,
-            None => CollectionInfo::empty(self.collection_config.read().await.clone()),
+            None => CollectionInfo::empty(
+                self.collection_config.read().await.clone(),
+                self.payload_index_schema.read().clone(),
+            ),
         };
 
         while let Some(response) = requests.try_next().await? {
-            info.status = cmp::max(info.status, response.status);
-            info.optimizer_status = cmp::max(info.optimizer_status, response.optimizer_status);
-            info.vectors_count = info
-                .vectors_count
-                .zip(response.vectors_count)
-                .map(|(a, b)| a + b);
+            let CollectionInfo {
+                status,
+                optimizer_status,
+                warnings,
+                indexed_vectors_count,
+                points_count,
+                segments_count,
+                config: _,
+                payload_schema,
+                update_queue,
+            } = response;
+            info.status = cmp::max(info.status, status);
+            info.optimizer_status = cmp::max(info.optimizer_status, optimizer_status);
             info.indexed_vectors_count = info
                 .indexed_vectors_count
-                .zip(response.indexed_vectors_count)
+                .zip(indexed_vectors_count)
                 .map(|(a, b)| a + b);
-            info.points_count = info
-                .points_count
-                .zip(response.points_count)
-                .map(|(a, b)| a + b);
-            info.segments_count += response.segments_count;
-
-            for (key, response_schema) in response.payload_schema {
+            info.points_count = info.points_count.zip(points_count).map(|(a, b)| a + b);
+            info.segments_count += segments_count;
+            info.warnings.extend(warnings);
+            if let Some(queue) = &mut info.update_queue {
+                queue.length += update_queue.map(|q| q.length).unwrap_or(0);
+            } else {
+                info.update_queue = update_queue;
+            }
+            for (key, response_schema) in payload_schema {
                 info.payload_schema
                     .entry(key)
                     .and_modify(|info_schema| info_schema.points += response_schema.points)
                     .or_insert(response_schema);
             }
         }
-
-        // Do not display vectors count, as it is an approximate number
-        // and many users are confused by its behavior
-        info.vectors_count = None;
 
         Ok(info)
     }
@@ -395,5 +436,45 @@ impl Collection {
             resharding_operations,
         };
         Ok(info)
+    }
+
+    pub async fn optimizations(
+        &self,
+        options: OptimizationsRequestOptions,
+    ) -> CollectionResult<OptimizationsResponse> {
+        let shards_holder = self.shards_holder.read().await;
+
+        let futures: Vec<_> = shards_holder
+            .all_shards()
+            .map(|shard| shard.optimizations(options))
+            .collect();
+
+        let shard_responses = future::try_join_all(futures).await?;
+
+        let mut merged = OptimizationsResponse::default();
+        for shard_response in shard_responses {
+            merged.merge(shard_response);
+        }
+
+        // Sort from newest to oldest
+        merged
+            .running
+            .sort_by_key(|v| cmp::Reverse(v.progress.started_at));
+
+        if let Some(completed) = &mut merged.completed {
+            completed.sort_by_key(|v| cmp::Reverse(v.progress.started_at));
+            if let Some(limit) = options.completed_limit {
+                completed.truncate(limit);
+            }
+        }
+
+        Ok(merged)
+    }
+
+    pub async fn print_warnings(&self) {
+        let warnings = self.collection_config.read().await.get_warnings();
+        for warning in warnings {
+            log::warn!("Collection {}: {}", self.name(), warning.message);
+        }
     }
 }

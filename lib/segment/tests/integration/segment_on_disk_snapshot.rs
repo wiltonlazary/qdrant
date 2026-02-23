@@ -1,14 +1,15 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
-use common::cpu::CpuPermit;
 use common::tar_ext;
+use common::tar_unpack::tar_unpack_file;
+use fs_err as fs;
+use fs_err::File;
 use rstest::rstest;
 use segment::data_types::index::{IntegerIndexParams, KeywordIndexParams};
-use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
-use segment::entry::entry_point::SegmentEntry;
-use segment::index::hnsw_index::num_rayon_threads;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
+use segment::entry::entry_point::{NonAppendableSegmentEntry, SegmentEntry};
+use segment::entry::snapshot_entry::SnapshotEntry as _;
 use segment::json_path::JsonPath;
 use segment::segment::Segment;
 use segment::segment_constructor::load_segment;
@@ -19,6 +20,7 @@ use segment::types::{
     SegmentConfig, SnapshotFormat, VectorDataConfig, VectorStorageType,
 };
 use tempfile::Builder;
+use uuid::Uuid;
 
 /// This test tests snapshotting and restoring a segment with all on-disk components.
 #[rstest]
@@ -26,6 +28,7 @@ use tempfile::Builder;
 #[case::streamable(SnapshotFormat::Streamable)]
 fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
     use common::counter::hardware_counter::HardwareCounterCell;
+    use segment::types::HnswGlobalConfig;
 
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -78,8 +81,10 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
                     r#type: segment::data_types::index::KeywordIndexType::Keyword,
                     is_tenant: None,
                     on_disk: Some(true),
+                    enable_hnsw: None,
                 }),
             )),
+            &hw_counter,
         )
         .unwrap();
     segment
@@ -93,8 +98,10 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
                     range: Some(true),
                     is_principal: None,
                     on_disk: Some(true),
+                    enable_hnsw: None,
                 }),
             )),
+            &hw_counter,
         )
         .unwrap();
 
@@ -112,6 +119,7 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
                     max_indexing_threads: 2,
                     on_disk: Some(true), // mmap index
                     payload_m: None,
+                    inline_storage: None,
                 }),
                 quantization_config: None,
                 multivector_config: None,
@@ -119,21 +127,19 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
             },
         )]),
         sparse_vector_data: Default::default(),
-        payload_storage_type: PayloadStorageType::OnDisk, // on-disk payload
+        payload_storage_type: PayloadStorageType::Mmap,
     };
 
     let segment_base_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let segment_builder_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let mut segment_builder = SegmentBuilder::new(
-        segment_base_dir.path(),
         segment_builder_dir.path(),
         &segment_config,
+        &HnswGlobalConfig::default(),
     )
     .unwrap();
     segment_builder.update(&[&segment], &false.into()).unwrap();
-    let segment = segment_builder
-        .build(CpuPermit::dummy(num_rayon_threads(0) as u32), &false.into())
-        .unwrap();
+    let segment = segment_builder.build_for_test(segment_base_dir.path());
 
     let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
     // The segment snapshot is a part of a parent collection/shard snapshot.
@@ -143,25 +149,25 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
         .tempfile()
         .unwrap();
     let segment_id = segment
-        .current_path
+        .segment_path
         .file_stem()
         .and_then(|f| f.to_str())
         .unwrap();
 
     // snapshotting!
-    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(&parent_snapshot_tar).unwrap());
+    let tar =
+        tar_ext::BuilderExt::new_seekable_owned(File::create(parent_snapshot_tar.path()).unwrap());
     segment
-        .take_snapshot(temp_dir.path(), &tar, format, &mut HashSet::new())
+        .take_snapshot(temp_dir.path(), &tar, format, None)
         .unwrap();
     tar.blocking_finish().unwrap();
 
     let parent_snapshot_unpacked = Builder::new().prefix("parent_snapshot").tempdir().unwrap();
-    tar::Archive::new(File::open(&parent_snapshot_tar).unwrap())
-        .unpack(parent_snapshot_unpacked.path())
-        .unwrap();
+
+    tar_unpack_file(parent_snapshot_tar.path(), parent_snapshot_unpacked.path()).unwrap();
 
     // Should be exactly one entry in the snapshot.
-    let mut entries = parent_snapshot_unpacked.path().read_dir().unwrap();
+    let mut entries = fs::read_dir(parent_snapshot_unpacked.path()).unwrap();
     let entry = entries.next().unwrap().unwrap();
     assert!(entries.next().is_none());
 
@@ -181,7 +187,7 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
     Segment::restore_snapshot_in_place(&entry.path()).unwrap();
 
     // Should be exactly one entry in the snapshot.
-    let mut entries = parent_snapshot_unpacked.path().read_dir().unwrap();
+    let mut entries = fs::read_dir(parent_snapshot_unpacked.path()).unwrap();
     let entry = entries.next().unwrap().unwrap();
     assert!(entries.next().is_none());
 
@@ -189,9 +195,8 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
     assert!(entry.path().is_dir());
     assert_eq!(entry.file_name(), segment_id);
 
-    let restored_segment = load_segment(&entry.path(), &AtomicBool::new(false))
-        .unwrap()
-        .unwrap();
+    let restored_segment =
+        load_segment(&entry.path(), Uuid::nil(), &AtomicBool::new(false)).unwrap();
 
     // validate restored snapshot is the same as original segment
     assert_eq!(
@@ -210,8 +215,8 @@ fn test_on_disk_segment_snapshot(#[case] format: SnapshotFormat) {
     let hw_counter = HardwareCounterCell::new();
 
     for id in segment.iter_points() {
-        let vectors = segment.all_vectors(id).unwrap();
-        let restored_vectors = restored_segment.all_vectors(id).unwrap();
+        let vectors = segment.all_vectors(id, &hw_counter).unwrap();
+        let restored_vectors = restored_segment.all_vectors(id, &hw_counter).unwrap();
         assert_eq!(vectors, restored_vectors);
 
         let payload = segment.payload(id, &hw_counter).unwrap();

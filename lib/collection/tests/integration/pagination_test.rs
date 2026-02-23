@@ -1,15 +1,15 @@
 use api::rest::SearchRequestInternal;
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
     WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
-use collection::operations::CollectionUpdateOperations;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::WithPayloadInterface;
 use tempfile::Builder;
 
-use crate::common::{simple_collection_fixture, N_SHARDS};
+use crate::common::{N_SHARDS, simple_collection_fixture};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collection_paginated_search() {
@@ -37,8 +37,15 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
         PointInsertOperationsInternal::PointsList(points),
     ));
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(
+            insert_points,
+            true,
+            None,
+            WriteOrdering::default(),
+            hw_counter,
+        )
         .await
         .unwrap();
 

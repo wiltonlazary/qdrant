@@ -3,7 +3,7 @@ use std::path::Path;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::vectors::{only_default_vector, DenseVector, VectorRef};
+use segment::data_types::vectors::{DenseVector, VectorRef, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::payload_json;
@@ -137,7 +137,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
                     VectorDataConfig {
                         size: 4,
                         distance: Distance::Dot,
-                        storage_type: VectorStorageType::Memory,
+                        storage_type: VectorStorageType::default(),
                         index: Indexes::Plain {},
                         quantization_config: None,
                         multivector_config: None,
@@ -149,7 +149,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
                     VectorDataConfig {
                         size: 1,
                         distance: Distance::Dot,
-                        storage_type: VectorStorageType::Memory,
+                        storage_type: VectorStorageType::default(),
                         index: Indexes::Plain {},
                         quantization_config: None,
                         multivector_config: None,
@@ -161,7 +161,7 @@ pub fn build_segment_3(path: &Path) -> Segment {
                     VectorDataConfig {
                         size: 4,
                         distance: Distance::Euclid,
-                        storage_type: VectorStorageType::Memory,
+                        storage_type: VectorStorageType::default(),
                         index: Indexes::Plain {},
                         quantization_config: None,
                         multivector_config: None,
@@ -263,6 +263,7 @@ pub fn build_segment_sparse_1(path: &Path) -> Segment {
                 SparseVectorDataConfig {
                     index: SparseIndexConfig::new(None, SparseIndexType::MutableRam, None),
                     storage_type: SparseVectorStorageType::default(),
+                    modifier: None,
                 },
             )]),
             payload_storage_type: Default::default(),
@@ -355,6 +356,7 @@ pub fn build_segment_sparse_2(path: &Path) -> Segment {
                 SparseVectorDataConfig {
                     index: SparseIndexConfig::new(None, SparseIndexType::MutableRam, None),
                     storage_type: SparseVectorStorageType::default(),
+                    modifier: None,
                 },
             )]),
             payload_storage_type: Default::default(),

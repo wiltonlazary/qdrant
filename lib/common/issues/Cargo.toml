@@ -6,7 +6,7 @@ authors = [
     "Qdrant Team <info@qdrant.tech>",
 ]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lints]
@@ -20,4 +20,4 @@ http-serde = "2.1.1"
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serial_test = { version = "3.2.0", default-features = false }
+serial_test = { version = "3.3.1", default-features = false }

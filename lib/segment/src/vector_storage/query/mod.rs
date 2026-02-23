@@ -5,11 +5,13 @@ use crate::data_types::vectors::DenseVector;
 
 mod context_query;
 mod discovery_query;
+mod feedback_query;
 mod reco_query;
 
 pub use context_query::{ContextPair, ContextQuery};
 pub use discovery_query::DiscoveryQuery;
-pub use reco_query::RecoQuery;
+pub use feedback_query::{FeedbackItem, NaiveFeedbackCoefficients, NaiveFeedbackQuery};
+pub use reco_query::{RecoBestScoreQuery, RecoQuery, RecoSumScoresQuery};
 
 pub trait TransformInto<Output, T = DenseVector, U = DenseVector> {
     /// Change the underlying type of the query, or just process it in some way.

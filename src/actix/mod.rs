@@ -2,7 +2,9 @@ pub mod actix_telemetry;
 pub mod api;
 mod auth;
 mod certificate_helpers;
+mod forwarded;
 pub mod helpers;
+pub mod metrics_service;
 pub mod web_ui;
 
 use std::io;
@@ -10,16 +12,16 @@ use std::sync::Arc;
 
 use ::api::rest::models::{ApiResponse, ApiStatus, VersionInfo};
 use actix_cors::Cors;
-use actix_multipart::form::tempfile::TempFileConfig;
 use actix_multipart::form::MultipartFormConfig;
+use actix_multipart::form::tempfile::TempFileConfig;
 use actix_web::middleware::{Compress, Condition, Logger, NormalizePath};
-use actix_web::{error, get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, error, get, web};
 use actix_web_extras::middleware::Condition as ConditionEx;
 use api::facet_api::config_facet_api;
 use collection::operations::validation;
 use collection::operations::verification::new_unchecked_verification_pass;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::Access;
+use storage::rbac::{Access, Auth};
 
 use crate::actix::api::cluster_api::config_cluster_api;
 use crate::actix::api::collections_api::config_collections_api;
@@ -28,6 +30,7 @@ use crate::actix::api::debug_api::config_debugger_api;
 use crate::actix::api::discovery_api::config_discovery_api;
 use crate::actix::api::issues_api::config_issues_api;
 use crate::actix::api::local_shard_api::config_local_shard_api;
+use crate::actix::api::profiler_api::config_profiler_api;
 use crate::actix::api::query_api::config_query_api;
 use crate::actix::api::recommend_api::config_recommend_api;
 use crate::actix::api::retrieve_api::{get_point, get_points, scroll_points};
@@ -36,14 +39,14 @@ use crate::actix::api::service_api::config_service_api;
 use crate::actix::api::shards_api::config_shards_api;
 use crate::actix::api::snapshot_api::config_snapshots_api;
 use crate::actix::api::update_api::config_update_api;
-use crate::actix::auth::{Auth, WhitelistItem};
-use crate::actix::web_ui::{web_ui_factory, web_ui_folder, WEB_UI_PATH};
+use crate::actix::auth::{AuthTransform, WhitelistItem};
+use crate::actix::web_ui::{WEB_UI_PATH, web_ui_factory, web_ui_folder};
 use crate::common::auth::AuthKeys;
 use crate::common::debugger::DebuggerState;
 use crate::common::health;
 use crate::common::http_client::HttpClient;
 use crate::common::telemetry::TelemetryCollector;
-use crate::settings::{max_web_workers, Settings};
+use crate::settings::{Settings, max_web_workers};
 use crate::tracing::LoggerHandle;
 
 #[get("/")]
@@ -61,16 +64,10 @@ pub fn init(
     actix_web::rt::System::new().block_on(async {
         // Nothing to verify here.
         let pass = new_unchecked_verification_pass();
-        let auth_keys = AuthKeys::try_create(
-            &settings.service,
-            dispatcher
-                .toc(&Access::full("For JWT validation"), &pass)
-                .clone(),
-        );
-        let upload_dir = dispatcher
-            .toc(&Access::full("For upload dir"), &pass)
-            .upload_dir()
-            .unwrap();
+        let auth = Auth::new_internal(Access::full("Service initialization"));
+        let auth_keys =
+            AuthKeys::try_create(&settings.service, dispatcher.toc(&auth, &pass).clone());
+        let upload_dir = dispatcher.toc(&auth, &pass).upload_dir().unwrap();
         let dispatcher_data = web::Data::from(dispatcher);
         let actix_telemetry_collector = telemetry_collector
             .lock()
@@ -113,7 +110,7 @@ pub fn init(
                 // api_key middleware
                 // note: the last call to `wrap()` or `wrap_fn()` is executed first
                 .wrap(ConditionEx::from_option(auth_keys.as_ref().map(
-                    |auth_keys| Auth::new(auth_keys.clone(), api_key_whitelist.clone()),
+                    |auth_keys| AuthTransform::new(auth_keys.clone(), api_key_whitelist.clone()),
                 )))
                 // Normalize path
                 .wrap(NormalizePath::trim())
@@ -157,6 +154,7 @@ pub fn init(
                 .configure(config_shards_api)
                 .configure(config_issues_api)
                 .configure(config_debugger_api)
+                .configure(config_profiler_api)
                 .configure(config_local_shard_api)
                 // Ordering of services is important for correct path pattern matching
                 // See: <https://github.com/qdrant/qdrant/issues/3543>
@@ -189,7 +187,7 @@ pub fn init(
             );
 
             let config = certificate_helpers::actix_tls_server_config(&settings)
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+                .map_err(io::Error::other)?;
             server.bind_rustls_0_23(bind_addr, config)?
         } else {
             log::info!("TLS disabled for REST API");
@@ -197,7 +195,7 @@ pub fn init(
             server.bind(bind_addr)?
         };
 
-        log::info!("Qdrant HTTP listening on {}", port);
+        log::info!("Qdrant HTTP listening on {port}");
         server.run().await
     })
 }

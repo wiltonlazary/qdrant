@@ -1,23 +1,23 @@
 pub mod types;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::Future;
 use itertools::Itertools;
 use segment::types::{PointIdType, WithPayloadInterface, WithVector};
-use tokio::sync::RwLockReadGuard;
+use serde::Serialize;
+use shard::retrieve::record_internal::RecordInternal;
 use types::PseudoId;
 
 use crate::collection::Collection;
 use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
-use crate::operations::types::{
-    CollectionError, CollectionResult, PointRequestInternal, RecordInternal,
-};
+use crate::operations::types::{CollectionError, CollectionResult, PointRequestInternal};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WithLookup {
     /// Name of the collection to use for points lookup
     pub collection_name: String,
@@ -29,7 +29,7 @@ pub struct WithLookup {
     pub with_vectors: Option<WithVector>,
 }
 
-pub async fn lookup_ids<'a, F, Fut>(
+pub async fn lookup_ids<F, Fut>(
     request: WithLookup,
     values: Vec<PseudoId>,
     collection_by_name: F,
@@ -40,7 +40,7 @@ pub async fn lookup_ids<'a, F, Fut>(
 ) -> CollectionResult<HashMap<PseudoId, RecordInternal>>
 where
     F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+    Fut: Future<Output = Option<Arc<Collection>>>,
 {
     let collection = collection_by_name(request.collection_name.clone())
         .await

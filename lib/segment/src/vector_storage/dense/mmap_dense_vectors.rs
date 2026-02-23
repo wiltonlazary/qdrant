@@ -1,15 +1,18 @@
-use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::mem::{self, size_of, transmute};
+use std::mem::{self, MaybeUninit, size_of, transmute};
 use std::path::Path;
 use std::sync::Arc;
 
 use bitvec::prelude::BitSlice;
+use common::ext::BitSliceExt as _;
+use common::maybe_uninit::maybe_uninit_fill_from;
+use common::mmap;
+use common::mmap::{
+    Advice, AdviceSetting, MULTI_MMAP_IS_SUPPORTED, Madviseable, MmapBitSlice, MmapFlusher,
+};
 use common::types::PointOffsetType;
+use fs_err::{File, OpenOptions};
 use memmap2::Mmap;
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_ops;
-use memory::mmap_type::{MmapBitSlice, MmapFlusher};
 use parking_lot::Mutex;
 
 use crate::common::error_logging::LogError;
@@ -20,7 +23,8 @@ use crate::vector_storage::async_io::UringReader;
 #[cfg(not(target_os = "linux"))]
 use crate::vector_storage::async_io_mock::UringReader;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
-use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient_points;
+use crate::vector_storage::query_scorer::is_read_with_prefetch_efficient;
+use crate::vector_storage::{AccessPattern, Random, Sequential};
 
 const HEADER_SIZE: usize = 4;
 const VECTORS_HEADER: &[u8; HEADER_SIZE] = b"data";
@@ -31,16 +35,19 @@ const DELETED_HEADER: &[u8; HEADER_SIZE] = b"drop";
 pub struct MmapDenseVectors<T: PrimitiveVectorElement> {
     pub dim: usize,
     pub num_vectors: usize,
-    /// Memory mapped file for vector data
+    /// Main vector data mmap for read/write
     ///
     /// Has an exact size to fit a header and `num_vectors` of vectors.
+    /// Best suited for random reads.
     mmap: Arc<Mmap>,
-    /// Same as `mmap`, but with `Advice::Sequential` set
-    /// for better performance when reading vectors sequentially.
-    mmap_sequential: Arc<Mmap>,
+    /// Read-only mmap best suited for sequential reads
+    ///
+    /// `None` on platforms that do not support multiple memory maps to the same file.
+    /// Use [`mmap_seq`] utility function to access this mmap if available.
+    _mmap_seq: Option<Arc<Mmap>>,
     /// Context for io_uring-base async IO
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    uring_reader: Mutex<Option<UringReader<T>>>,
+    uring_reader: Option<Mutex<UringReader<T>>>,
     /// Memory mapped deletion flags
     deleted: MmapBitSlice,
     /// Current number of deleted vectors.
@@ -53,19 +60,27 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         deleted_path: &Path,
         dim: usize,
         with_async_io: bool,
+        madvise: AdviceSetting,
+        populate: bool,
     ) -> OperationResult<Self> {
         // Allocate/open vectors mmap
         ensure_mmap_file_size(vectors_path, VECTORS_HEADER, None)
             .describe("Create mmap data file")?;
-        let mmap = mmap_ops::open_read_mmap(vectors_path, AdviceSetting::Global, false)
+        let mmap = mmap::open_read_mmap(vectors_path, madvise, populate)
             .describe("Open mmap for reading")?;
 
-        let seq_mmap = mmap_ops::open_read_mmap(
-            vectors_path,
-            AdviceSetting::Advice(Advice::Sequential),
-            false,
-        )
-        .describe("Open mmap for sequential reading")?;
+        // Only open second mmap for sequential reads if supported
+        let mmap_seq = if *MULTI_MMAP_IS_SUPPORTED {
+            let mmap_seq = mmap::open_read_mmap(
+                vectors_path,
+                AdviceSetting::Advice(Advice::Sequential),
+                populate,
+            )
+            .describe("Open mmap for sequential reading")?;
+            Some(Arc::new(mmap_seq))
+        } else {
+            None
+        };
 
         let num_vectors = (mmap.len() - HEADER_SIZE) / dim / size_of::<T>();
 
@@ -73,13 +88,13 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         let deleted_mmap_size = deleted_mmap_size(num_vectors);
         ensure_mmap_file_size(deleted_path, DELETED_HEADER, Some(deleted_mmap_size as u64))
             .describe("Create mmap deleted file")?;
-        let deleted_mmap = mmap_ops::open_write_mmap(deleted_path, AdviceSetting::Global, false)
+        let deleted_mmap = mmap::open_write_mmap(deleted_path, AdviceSetting::Global, false)
             .describe("Open mmap deleted for writing")?;
 
         // Advise kernel that we'll need this page soon so the kernel can prepare
         #[cfg(unix)]
         if let Err(err) = deleted_mmap.advise(memmap2::Advice::WillNeed) {
-            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {}", err,);
+            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {err}");
         }
 
         // Transform into mmap BitSlice
@@ -99,15 +114,15 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             dim,
             num_vectors,
             mmap: mmap.into(),
-            mmap_sequential: seq_mmap.into(),
-            uring_reader: Mutex::new(uring_reader),
+            _mmap_seq: mmap_seq,
+            uring_reader: uring_reader.map(Mutex::new),
             deleted,
             deleted_count,
         })
     }
 
     pub fn has_async_reader(&self) -> bool {
-        self.uring_reader.lock().is_some()
+        self.uring_reader.is_some()
     }
 
     pub fn flusher(&self) -> MmapFlusher {
@@ -127,45 +142,52 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         self.dim * size_of::<T>()
     }
 
-    fn raw_vector_offset(&self, offset: usize) -> &[T] {
-        let byte_slice = &self.mmap[offset..(offset + self.raw_size())];
-        let arr: &[T] = unsafe { transmute(byte_slice) };
-        &arr[0..self.dim]
+    /// Helper to get a slice suited for sequential reads if available, otherwise use the main mmap
+    #[inline]
+    fn mmap_seq(&self) -> Arc<Mmap> {
+        #[expect(clippy::used_underscore_binding)]
+        self._mmap_seq.clone().unwrap_or_else(|| self.mmap.clone())
     }
 
-    fn raw_vector_offset_sequential(&self, offset: usize) -> &[T] {
-        let byte_slice = &self.mmap_sequential[offset..(offset + self.raw_size())];
+    fn raw_vector_offset<P: AccessPattern>(&self, offset: usize) -> &[T] {
+        let mmap = if P::IS_SEQUENTIAL {
+            &self.mmap_seq()
+        } else {
+            &self.mmap
+        };
+        let byte_slice = &mmap[offset..(offset + self.raw_size())];
         let arr: &[T] = unsafe { transmute(byte_slice) };
         &arr[0..self.dim]
     }
 
     /// Returns reference to vector data by key
-    fn get_vector(&self, key: PointOffsetType) -> &[T] {
-        self.get_vector_opt(key).expect("vector not found")
+    fn get_vector<P: AccessPattern>(&self, key: PointOffsetType) -> &[T] {
+        self.get_vector_opt::<P>(key).expect("vector not found")
     }
 
     /// Returns an optional reference to vector data by key
-    pub fn get_vector_opt(&self, key: PointOffsetType) -> Option<&[T]> {
+    pub fn get_vector_opt<P: AccessPattern>(&self, key: PointOffsetType) -> Option<&[T]> {
         self.data_offset(key)
-            .map(|offset| self.raw_vector_offset(offset))
+            .map(|offset| self.raw_vector_offset::<P>(offset))
     }
 
-    pub fn get_vector_opt_sequential(&self, key: PointOffsetType) -> Option<&[T]> {
-        self.data_offset(key)
-            .map(|offset| self.raw_vector_offset_sequential(offset))
-    }
-
-    pub fn get_vectors<'a>(&'a self, keys: &[PointOffsetType], vectors: &mut [&'a [T]]) {
-        debug_assert_eq!(keys.len(), vectors.len());
+    pub fn for_each_in_batch<F: FnMut(usize, &[T])>(&self, keys: &[PointOffsetType], mut f: F) {
         debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
-        if is_read_with_prefetch_efficient_points(keys) {
-            for (i, key) in keys.iter().enumerate() {
-                vectors[i] = self.get_vector_opt_sequential(*key).unwrap_or(&[]);
-            }
+
+        // The `f` is most likely a scorer function.
+        // Fetching all vectors first then scoring them is more cache friendly
+        // then fetching and scoring in a single loop.
+        let mut vectors_buffer = [MaybeUninit::uninit(); VECTOR_READ_BATCH_SIZE];
+        let vectors = if is_read_with_prefetch_efficient(keys) {
+            let iter = keys.iter().map(|key| self.get_vector::<Sequential>(*key));
+            maybe_uninit_fill_from(&mut vectors_buffer, iter).0
         } else {
-            for (i, key) in keys.iter().enumerate() {
-                vectors[i] = self.get_vector(*key);
-            }
+            let iter = keys.iter().map(|key| self.get_vector::<Random>(*key));
+            maybe_uninit_fill_from(&mut vectors_buffer, iter).0
+        };
+
+        for (i, vec) in vectors.iter().enumerate() {
+            f(i, vec);
         }
     }
 
@@ -181,7 +203,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
     }
 
     pub fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key as usize).map(|b| *b).unwrap_or(false)
+        self.deleted.get_bit(key as usize).unwrap_or(false)
     }
 
     /// Get [`BitSlice`] representation for deleted vectors with deletion flags
@@ -192,31 +214,13 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         &self.deleted
     }
 
-    pub fn prefault_mmap_pages(&self, path: &Path) -> mmap_ops::PrefaultMmapPages {
-        mmap_ops::PrefaultMmapPages::new(self.mmap.clone(), Some(path))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn process_points_uring(
-        &self,
-        points: impl Iterator<Item = PointOffsetType>,
-        callback: impl FnMut(usize, PointOffsetType, &[T]),
-    ) -> OperationResult<()> {
-        self.uring_reader
-            .lock()
-            .as_mut()
-            .expect("io_uring reader should be initialized")
-            .read_stream(points, callback)
-    }
-
-    #[cfg(not(target_os = "linux"))]
     fn process_points_simple(
         &self,
         points: impl Iterator<Item = PointOffsetType>,
         mut callback: impl FnMut(usize, PointOffsetType, &[T]),
     ) {
         for (idx, point) in points.enumerate() {
-            let vector = self.get_vector(point);
+            let vector = self.get_vector::<Random>(point);
             callback(idx, point, vector);
         }
     }
@@ -229,15 +233,29 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         points: impl Iterator<Item = PointOffsetType>,
         callback: impl FnMut(usize, PointOffsetType, &[T]),
     ) -> OperationResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            self.process_points_uring(points, callback)
-        }
+        match &self.uring_reader {
+            None => self.process_points_simple(points, callback),
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.process_points_simple(points, callback);
-            Ok(())
+            #[cfg(target_os = "linux")]
+            Some(uring_reader) => {
+                // Use `UringReader` on Linux
+                let mut uring_guard = uring_reader.lock();
+                uring_guard.read_stream(points, callback)?;
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            Some(_) => {
+                // Fallback to synchronous processing on non-Linux platforms
+                self.process_points_simple(points, callback);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn populate(&self) {
+        #[expect(clippy::used_underscore_binding)]
+        if let Some(mmap_seq) = &self._mmap_seq {
+            mmap_seq.populate();
         }
     }
 }
@@ -261,10 +279,10 @@ fn ensure_mmap_file_size(path: &Path, header: &[u8], size: Option<u64>) -> Opera
     // Create file, and make it the correct size
     let mut file = File::create(path)?;
     file.write_all(header)?;
-    if let Some(size) = size {
-        if size > header.len() as u64 {
-            file.set_len(size)?;
-        }
+    if let Some(size) = size
+        && size > header.len() as u64
+    {
+        file.set_len(size)?;
     }
     Ok(())
 }

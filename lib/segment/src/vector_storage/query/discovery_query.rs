@@ -1,8 +1,10 @@
+use std::hash::Hash;
 use std::iter;
 
 use common::math::scaled_fast_sigmoid;
 use common::types::ScoreType;
 use itertools::Itertools;
+use serde::Serialize;
 
 use super::context_query::ContextPair;
 use super::{Query, TransformInto};
@@ -22,7 +24,7 @@ impl<T> ContextPair<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Hash)]
 pub struct DiscoveryQuery<T> {
     pub target: T,
     pub pairs: Vec<ContextPair<T>>,

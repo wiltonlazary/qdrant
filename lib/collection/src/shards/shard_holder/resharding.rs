@@ -5,14 +5,18 @@ use std::sync::Arc;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::{Condition, CustomIdCheckerCondition as _, Filter, ShardKey};
+use shard::operations::point_ops::UpdateMode;
 
 use super::ShardHolder;
+use crate::config::ShardingMethod;
 use crate::hash_ring::{self, HashRingRouter};
+use crate::operations::CollectionUpdateOperations;
 use crate::operations::cluster_ops::ReshardingDirection;
+use crate::operations::point_ops::{ConditionalInsertOperationInternal, PointOperations};
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::operations::{point_ops, CollectionUpdateOperations};
-use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
-use crate::shards::resharding::{ReshardKey, ReshardStage, ReshardState};
+use crate::shards::replica_set::ShardReplicaSet;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::resharding::{ReshardKey, ReshardState, ReshardingStage};
 use crate::shards::shard::ShardId;
 
 impl ShardHolder {
@@ -29,6 +33,26 @@ impl ShardHolder {
             shard_key,
         } = resharding_key;
 
+        // Additional shard key check
+        // For auto sharding no shard key must be provided, with custom sharding it must be provided
+        match self.sharding_method {
+            ShardingMethod::Auto => {
+                if shard_key.is_some() {
+                    return Err(CollectionError::bad_request(format!(
+                        "cannot specify shard key {} on collection with auto sharding",
+                        shard_key_fmt(shard_key),
+                    )));
+                }
+            }
+            ShardingMethod::Custom => {
+                if shard_key.is_none() {
+                    return Err(CollectionError::bad_request(
+                        "must specify shard key on collection with custom sharding",
+                    ));
+                }
+            }
+        }
+
         let ring = get_ring(&mut self.rings, shard_key)?;
 
         {
@@ -36,15 +60,15 @@ impl ShardHolder {
             assert_resharding_state_consistency(&state, ring, shard_key);
 
             if let Some(state) = state.deref() {
-                if state.matches(resharding_key) {
-                    return Err(CollectionError::bad_request(format!(
+                return if state.matches(resharding_key) {
+                    Err(CollectionError::bad_request(format!(
                         "resharding {resharding_key} is already in progress:\n{state:#?}"
-                    )));
+                    )))
                 } else {
-                    return Err(CollectionError::bad_request(format!(
+                    Err(CollectionError::bad_request(format!(
                         "another resharding is in progress:\n{state:#?}"
-                    )));
-                }
+                    )))
+                };
             }
         }
 
@@ -88,7 +112,10 @@ impl ShardHolder {
     }
 
     // TODO: do not leave broken intermediate state if this fails midway?
-    pub fn start_resharding_unchecked(
+    /// ## Cancel safety
+    ///
+    /// This function is **not** cancel safe.
+    pub async fn start_resharding_unchecked(
         &mut self,
         resharding_key: ReshardKey,
         new_shard: Option<ShardReplicaSet>,
@@ -103,13 +130,23 @@ impl ShardHolder {
 
         // TODO(resharding): Delete shard on error!?
 
-        let ring = get_ring(&mut self.rings, &shard_key)?;
+        let ring_res = get_ring(&mut self.rings, &shard_key);
+        let ring = match ring_res {
+            Ok(ring) => ring,
+            Err(err) => {
+                if let Some(new_shard) = new_shard {
+                    new_shard.stop_gracefully().await;
+                }
+                return Err(err);
+            }
+        };
         ring.start_resharding(shard_id, direction);
 
         // Add new shard if resharding up
         if let Some(new_shard) = new_shard {
             debug_assert_eq!(direction, ReshardingDirection::Up);
-            self.add_shard(shard_id, new_shard, shard_key.clone())?;
+            self.add_shard(shard_id, new_shard, shard_key.clone())
+                .await?;
         }
 
         self.resharding_state.write(|state| {
@@ -127,14 +164,17 @@ impl ShardHolder {
     }
 
     pub fn commit_read_hashring(&mut self, resharding_key: &ReshardKey) -> CollectionResult<()> {
-        self.check_resharding(resharding_key, check_stage(ReshardStage::MigratingPoints))?;
+        self.check_resharding(
+            resharding_key,
+            check_stage(ReshardingStage::MigratingPoints),
+        )?;
 
         self.resharding_state.write(|state| {
             let Some(state) = state else {
                 unreachable!();
             };
 
-            state.stage = ReshardStage::ReadHashRingCommitted;
+            state.stage = ReshardingStage::ReadHashRingCommitted;
         })?;
 
         Ok(())
@@ -143,7 +183,7 @@ impl ShardHolder {
     pub fn commit_write_hashring(&mut self, resharding_key: &ReshardKey) -> CollectionResult<()> {
         self.check_resharding(
             resharding_key,
-            check_stage(ReshardStage::ReadHashRingCommitted),
+            check_stage(ReshardingStage::ReadHashRingCommitted),
         )?;
 
         let ring = get_ring(&mut self.rings, &resharding_key.shard_key)?;
@@ -154,7 +194,7 @@ impl ShardHolder {
                 unreachable!();
             };
 
-            state.stage = ReshardStage::WriteHashRingCommitted;
+            state.stage = ReshardingStage::WriteHashRingCommitted;
         })?;
 
         Ok(())
@@ -163,7 +203,7 @@ impl ShardHolder {
     pub fn check_finish_resharding(&mut self, resharding_key: &ReshardKey) -> CollectionResult<()> {
         self.check_resharding(
             resharding_key,
-            check_stage(ReshardStage::WriteHashRingCommitted),
+            check_stage(ReshardingStage::WriteHashRingCommitted),
         )?;
 
         Ok(())
@@ -222,7 +262,7 @@ impl ShardHolder {
         Ok(())
     }
 
-    pub fn check_abort_resharding(&mut self, resharding_key: &ReshardKey) -> CollectionResult<()> {
+    pub fn check_abort_resharding(&self, resharding_key: &ReshardKey) -> CollectionResult<()> {
         let state = self.resharding_state.read();
 
         // - do not abort if no resharding operation is ongoing
@@ -242,7 +282,7 @@ impl ShardHolder {
         }
 
         // - it's safe to run, if read hash ring was not committed yet
-        if state.stage < ReshardStage::ReadHashRingCommitted {
+        if state.stage < ReshardingStage::ReadHashRingCommitted {
             return Ok(());
         }
 
@@ -259,6 +299,8 @@ impl ShardHolder {
         resharding_key: ReshardKey,
         force: bool,
     ) -> CollectionResult<()> {
+        log::warn!("Aborting resharding {resharding_key} (force: {force})");
+
         let ReshardKey {
             uuid: _,
             direction,
@@ -267,41 +309,8 @@ impl ShardHolder {
             ref shard_key,
         } = resharding_key;
 
-        let is_in_progress = match self.resharding_state.read().deref() {
-            Some(state) if state.matches(&resharding_key) => {
-                if !force && state.stage >= ReshardStage::ReadHashRingCommitted {
-                    return Err(CollectionError::bad_request(format!(
-                        "can't abort resharding {resharding_key}, \
-                         because read hash ring has been committed already, \
-                         resharding must be completed",
-                    )));
-                }
-
-                true
-            }
-
-            Some(state) => {
-                log::warn!(
-                    "aborting resharding {resharding_key}, \
-                     but another resharding is in progress:\n\
-                     {state:#?}"
-                );
-
-                false
-            }
-
-            None => {
-                log::warn!(
-                    "aborting resharding {resharding_key}, \
-                     but resharding is not in progress"
-                );
-
-                false
-            }
-        };
-
         // Cleanup existing shards if resharding down
-        if is_in_progress && direction == ReshardingDirection::Down {
+        if direction == ReshardingDirection::Down {
             for (&id, shard) in self.shards.iter() {
                 // Skip shards that does not belong to resharding shard key
                 if self.shard_id_to_key_mapping.get(&id) != shard_key.as_ref() {
@@ -315,10 +324,8 @@ impl ShardHolder {
 
                 // Revert replicas in `Resharding` state back into `Active` state
                 for (peer, state) in shard.peers() {
-                    if state == ReplicaState::Resharding
-                        || state == ReplicaState::ReshardingScaleDown
-                    {
-                        shard.set_replica_state(peer, ReplicaState::Active)?;
+                    if state.is_resharding() {
+                        shard.set_replica_state(peer, ReplicaState::Active).await?;
                     }
                 }
 
@@ -328,10 +335,11 @@ impl ShardHolder {
                 }
 
                 // Remove any points that might have been transferred from target shard
+                // Replica may be dead, so we force the delete operation
                 let filter = self.hash_ring_filter(id).expect("hash ring filter");
-                let filter = Filter::new_must_not(Condition::CustomIdChecker(Arc::new(filter)));
+                let filter = Filter::new_must_not(Condition::new_custom(Arc::new(filter)));
                 shard
-                    .delete_local_points(filter, HwMeasurementAcc::disposable()) // Internal operation, no performance tracking needed
+                    .delete_local_points(filter, HwMeasurementAcc::disposable(), true) // Internal operation, no performance tracking needed
                     .await?;
             }
         }
@@ -347,11 +355,13 @@ impl ShardHolder {
         }
 
         // Remove new shard if resharding up
-        if is_in_progress && direction == ReshardingDirection::Up {
+        if direction == ReshardingDirection::Up {
             if let Some(shard) = self.get_shard(shard_id) {
                 // Remove all replicas from shard
                 for (peer_id, replica_state) in shard.peers() {
-                    log::debug!("removing peer {peer_id} with state {replica_state:?} from replica set {shard_id}");
+                    log::debug!(
+                        "removing peer {peer_id} with state {replica_state:?} from replica set {shard_id}",
+                    );
                     shard.remove_peer(peer_id).await?;
                 }
 
@@ -386,18 +396,16 @@ impl ShardHolder {
             }
         }
 
-        if is_in_progress {
-            self.resharding_state.write(|state| {
-                debug_assert!(
-                    state
-                        .as_ref()
-                        .is_some_and(|state| state.matches(&resharding_key)),
-                    "resharding {resharding_key} is not in progress:\n{state:#?}"
-                );
+        self.resharding_state.write(|state| {
+            debug_assert!(
+                state
+                    .as_ref()
+                    .is_some_and(|state| state.matches(&resharding_key)),
+                "resharding {resharding_key} is not in progress:\n{state:#?}"
+            );
 
-                state.take();
-            })?;
-        }
+            state.take();
+        })?;
 
         Ok(())
     }
@@ -466,11 +474,11 @@ impl ShardHolder {
         // - and on *sender* shards during `ReadHashRingCommitted` stage when resharding *up*
 
         let should_split_receiver = is_receiver_shard
-            && state.stage == ReshardStage::MigratingPoints
+            && state.stage == ReshardingStage::MigratingPoints
             && !operation.is_upsert_points();
 
         let should_split_sender = is_sender_shard
-            && state.stage >= ReshardStage::ReadHashRingCommitted
+            && state.stage >= ReshardingStage::ReadHashRingCommitted
             && state.direction == ReshardingDirection::Up;
 
         if !should_split_receiver && !should_split_sender {
@@ -517,13 +525,18 @@ impl ShardHolder {
         self.hash_ring_filter(shard_id)
     }
 
-    pub fn hash_ring_filter(&self, shard_id: ShardId) -> Option<hash_ring::HashRingFilter> {
+    pub fn hash_ring_router(&self, shard_id: ShardId) -> Option<&HashRingRouter> {
         if !self.contains_shard(shard_id) {
             return None;
         }
 
         let shard_key = self.shard_id_to_key_mapping.get(&shard_id).cloned();
         let router = self.rings.get(&shard_key).expect("hashring exists");
+        Some(router)
+    }
+
+    pub fn hash_ring_filter(&self, shard_id: ShardId) -> Option<hash_ring::HashRingFilter> {
+        let router = self.hash_ring_router(shard_id)?;
         let ring = match router {
             HashRingRouter::Single(ring) => ring,
             HashRingRouter::Resharding { old, new } => {
@@ -547,17 +560,57 @@ pub struct OperationsByMode {
 
 impl OperationsByMode {
     pub fn with_update_only_existing(mut self, operation: CollectionUpdateOperations) -> Self {
-        match operation {
-            CollectionUpdateOperations::PointOperation(
-                point_ops::PointOperations::UpsertPoints(operation),
-            ) => {
-                self.update_only_existing = operation.into_update_only();
-            }
+        self.update_only_existing = match operation {
+            CollectionUpdateOperations::PointOperation(point_operation) => match point_operation {
+                PointOperations::UpsertPoints(operation) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::UpsertPointsConditional(
+                            ConditionalInsertOperationInternal {
+                                points_op: operation,
+                                condition: Filter::new(), // Always true condition
+                                update_mode: Some(UpdateMode::UpdateOnly),
+                            },
+                        ),
+                    )]
+                }
+                PointOperations::UpsertPointsConditional(operation) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::UpsertPointsConditional(
+                            ConditionalInsertOperationInternal {
+                                points_op: operation.points_op,
+                                condition: operation.condition,
+                                update_mode: Some(UpdateMode::UpdateOnly),
+                            },
+                        ),
+                    )]
+                }
 
-            operation => {
-                self.update_only_existing = vec![operation];
+                PointOperations::DeletePoints { ids } => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::DeletePoints { ids },
+                    )]
+                }
+                PointOperations::DeletePointsByFilter(op) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::DeletePointsByFilter(op),
+                    )]
+                }
+                PointOperations::SyncPoints(op) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::SyncPoints(op),
+                    )]
+                }
+            },
+            CollectionUpdateOperations::VectorOperation(_)
+            | CollectionUpdateOperations::PayloadOperation(_)
+            | CollectionUpdateOperations::FieldIndexOperation(_) => {
+                vec![operation]
             }
-        }
+            #[cfg(feature = "staging")]
+            CollectionUpdateOperations::StagingOperation(_) => {
+                vec![operation]
+            }
+        };
 
         self
     }
@@ -590,7 +643,7 @@ fn assert_resharding_state_consistency(
     shard_key: &Option<ShardKey>,
 ) {
     match state.as_ref().map(|state| state.stage) {
-        Some(ReshardStage::MigratingPoints | ReshardStage::ReadHashRingCommitted) => {
+        Some(ReshardingStage::MigratingPoints | ReshardingStage::ReadHashRingCommitted) => {
             debug_assert!(
                 ring.is_resharding(),
                 "resharding is in progress, \
@@ -599,7 +652,7 @@ fn assert_resharding_state_consistency(
             );
         }
 
-        Some(ReshardStage::WriteHashRingCommitted) => {
+        Some(ReshardingStage::WriteHashRingCommitted) => {
             debug_assert!(
                 !ring.is_resharding(),
                 "resharding is in progress, \
@@ -619,7 +672,7 @@ fn assert_resharding_state_consistency(
     }
 }
 
-fn check_stage(stage: ReshardStage) -> impl Fn(&ReshardState) -> CollectionResult<()> {
+fn check_stage(stage: ReshardingStage) -> impl Fn(&ReshardState) -> CollectionResult<()> {
     move |state| {
         if state.stage == stage {
             Ok(())

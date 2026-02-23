@@ -1,19 +1,24 @@
 pub mod download;
+pub mod download_result;
+pub mod download_tar;
 pub mod recover;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::{BufWriter, Write};
 
 use collection::operations::snapshot_ops::SnapshotDescription;
 use collection::operations::verification::new_unchecked_verification_pass;
+use fs_err as fs;
+use fs_err::tokio as tokio_fs;
 use serde::{Deserialize, Serialize};
 use tar::Builder as TarBuilder;
 use tempfile::TempPath;
 use tokio::io::AsyncWriteExt;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::content_manager::toc::FULL_SNAPSHOT_FILE_NAME;
 use crate::dispatcher::Dispatcher;
-use crate::rbac::{Access, AccessRequirements};
+use crate::rbac::{AccessRequirements, Auth, CollectionMultipass};
 use crate::{StorageError, TableOfContent};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -27,22 +32,22 @@ pub struct SnapshotConfig {
 
 pub async fn do_delete_full_snapshot(
     dispatcher: &Dispatcher,
-    access: Access,
+    auth: Auth,
     snapshot_name: &str,
 ) -> Result<bool, StorageError> {
-    access.check_global_access(AccessRequirements::new().manage())?;
+    auth.check_global_access(AccessRequirements::new().manage(), "delete_full_snapshot")?;
 
     // All checks should've been done at this point.
     let pass = new_unchecked_verification_pass();
 
-    let toc = dispatcher.toc(&access, &pass);
+    let toc = dispatcher.toc(&auth, &pass);
 
     let snapshot_manager = toc.get_snapshots_storage_manager()?;
     let snapshot_dir =
         snapshot_manager.get_full_snapshot_path(toc.snapshots_path(), snapshot_name)?;
 
     let res = tokio::spawn(async move {
-        log::info!("Deleting full storage snapshot {:?}", snapshot_dir);
+        log::info!("Deleting full storage snapshot {snapshot_dir:?}");
         snapshot_manager.delete_snapshot(&snapshot_dir).await
     })
     .await??;
@@ -52,19 +57,20 @@ pub async fn do_delete_full_snapshot(
 
 pub async fn do_delete_collection_snapshot(
     dispatcher: &Dispatcher,
-    access: Access,
+    auth: Auth,
     collection_name: &str,
     snapshot_name: &str,
 ) -> Result<bool, StorageError> {
-    let collection_pass = access.check_collection_access(
+    let collection_pass = auth.check_collection_access(
         collection_name,
-        AccessRequirements::new().write().whole().extras(),
+        AccessRequirements::new().write().extras(),
+        "delete_collection_snapshot",
     )?;
 
     // All checks should've been done at this point.
     let pass = new_unchecked_verification_pass();
 
-    let toc = dispatcher.toc(&access, &pass);
+    let toc = dispatcher.toc(&auth, &pass);
 
     let snapshot_name = snapshot_name.to_string();
     let collection = toc.get_collection(&collection_pass).await?;
@@ -73,7 +79,7 @@ pub async fn do_delete_collection_snapshot(
         snapshot_manager.get_snapshot_path(collection.snapshots_path(), &snapshot_name)?;
 
     let res = tokio::spawn(async move {
-        log::info!("Deleting collection snapshot {:?}", file_name);
+        log::info!("Deleting collection snapshot {file_name:?}");
         snapshot_manager.delete_snapshot(&file_name).await
     })
     .await??;
@@ -83,35 +89,37 @@ pub async fn do_delete_collection_snapshot(
 
 pub async fn do_list_full_snapshots(
     toc: &TableOfContent,
-    access: Access,
+    auth: Auth,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    access.check_global_access(AccessRequirements::new())?;
+    auth.check_global_access(AccessRequirements::new(), "list_full_snapshots")?;
     let snapshots_manager = toc.get_snapshots_storage_manager()?;
-    let snapshots_path = Path::new(toc.snapshots_path());
+    let snapshots_path = toc.snapshots_path();
     Ok(snapshots_manager.list_snapshots(snapshots_path).await?)
 }
 
 pub async fn do_create_full_snapshot(
     dispatcher: &Dispatcher,
-    access: Access,
+    auth: Auth,
 ) -> Result<SnapshotDescription, StorageError> {
-    access.check_global_access(AccessRequirements::new().manage())?;
+    let collections_pass =
+        auth.check_global_access(AccessRequirements::new().manage(), "create_full_snapshot")?;
 
     // All checks should've been done at this point.
     let pass = new_unchecked_verification_pass();
-    let toc = dispatcher.toc(&access, &pass).clone();
+    let toc = dispatcher.toc(&auth, &pass).clone();
 
-    let res = tokio::spawn(async move { _do_create_full_snapshot(&toc, access).await }).await??;
+    let res = tokio::spawn(async move { _do_create_full_snapshot(&toc, collections_pass).await })
+        .await??;
     Ok(res)
 }
 
 async fn _do_create_full_snapshot(
     toc: &TableOfContent,
-    access: Access,
+    multipass: CollectionMultipass,
 ) -> Result<SnapshotDescription, StorageError> {
-    let snapshot_dir = Path::new(toc.snapshots_path()).to_path_buf();
+    let snapshot_dir = toc.snapshots_path();
 
-    let all_collections = toc.all_collections(&access).await;
+    let all_collections = toc.multipass_into_collections(&multipass).await;
     let mut created_snapshots: Vec<(&str, SnapshotDescription)> = vec![];
     for collection_pass in &all_collections {
         let snapshot_details = toc.create_snapshot(collection_pass).await?;
@@ -130,8 +138,11 @@ async fn _do_create_full_snapshot(
 
     let mut alias_mapping: HashMap<String, String> = Default::default();
     for collection_pass in &all_collections {
-        for alias in toc.collection_aliases(collection_pass, &access).await? {
-            alias_mapping.insert(alias.to_string(), collection_pass.name().to_string());
+        for alias in toc
+            .all_collection_aliases(collection_pass.name(), &multipass)
+            .await
+        {
+            alias_mapping.insert(alias, collection_pass.name().to_string());
         }
     }
 
@@ -142,7 +153,7 @@ async fn _do_create_full_snapshot(
             collections_mapping: collection_name_to_snapshot_path,
             collections_aliases: alias_mapping,
         };
-        let mut config_file = tokio::fs::File::create(&config_path).await?;
+        let mut config_file = tokio_fs::File::create(&config_path).await?;
         config_file
             .write_all(
                 serde_json::to_string_pretty(&snapshot_config)
@@ -191,22 +202,26 @@ async fn _do_create_full_snapshot(
     let full_snapshot_path_clone = temp_full_snapshot_path.clone();
     let archiving = tokio::task::spawn_blocking(move || {
         // have to use std here, cause TarBuilder is not async
-        let file = std::fs::File::create(&full_snapshot_path_clone)?;
-        let mut builder = TarBuilder::new(file);
+        let mut file = BufWriter::new(fs::File::create(&full_snapshot_path_clone)?);
+        let mut builder = TarBuilder::new(&mut file);
         builder.sparse(true);
         for (temp_file, snapshot_name) in temp_collection_snapshots {
             builder.append_path_with_name(&temp_file, &snapshot_name)?;
         }
         builder.append_path_with_name(&config_path_clone, "config.json")?;
-
         builder.finish()?;
+
+        // Explicitly flush write buffer so we can catch IO errors
+        drop(builder);
+        file.flush()?;
+
         Ok::<(), StorageError>(())
     });
-    archiving.await??;
+    AbortOnDropHandle::new(archiving).await??;
 
     let snapshot_description = snapshot_manager
         .store_file(&temp_full_snapshot_path, &full_snapshot_path)
         .await?;
-    tokio::fs::remove_file(&config_path).await?;
+    tokio_fs::remove_file(&config_path).await?;
     Ok(snapshot_description)
 }

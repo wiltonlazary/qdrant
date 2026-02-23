@@ -1,12 +1,14 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cpu::CpuPermit;
+use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
-use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
@@ -14,26 +16,26 @@ use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
 use segment::json_path::JsonPath;
 use segment::payload_json;
-use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::segment_constructor::VectorIndexBuildArgs;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, PayloadSchemaType, SearchParams,
-    SeqNumberType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, HnswGlobalConfig, PayloadSchemaType,
+    SearchParams, SeqNumberType,
 };
 use segment::vector_storage::query::{ContextPair, DiscoveryQuery};
 use tempfile::Builder;
 
 const MAX_EXAMPLE_PAIRS: usize = 3;
 
-fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_pairs: usize = rnd.random_range(1..MAX_EXAMPLE_PAIRS);
+fn random_discovery_query<R: Rng + ?Sized>(rng: &mut R, dim: usize) -> QueryVector {
+    let num_pairs: usize = rng.random_range(1..MAX_EXAMPLE_PAIRS);
 
-    let target = random_vector(rnd, dim).into();
+    let target = random_vector(rng, dim).into();
 
     let pairs = (0..num_pairs)
         .map(|_| {
-            let positive = random_vector(rnd, dim).into();
-            let negative = random_vector(rnd, dim).into();
+            let positive = random_vector(rng, dim).into();
+            let negative = random_vector(rng, dim).into();
             ContextPair { positive, negative }
         })
         .collect_vec();
@@ -41,8 +43,8 @@ fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVect
     DiscoveryQuery::new(target, pairs).into()
 }
 
-fn get_random_keyword_of<R: Rng + ?Sized>(num_options: usize, rnd: &mut R) -> String {
-    let random_number = rnd.random_range(0..num_options);
+fn get_random_keyword_of<R: Rng + ?Sized>(num_options: usize, rng: &mut R) -> String {
+    let random_number = rng.random_range(0..num_options);
     format!("keyword_{random_number}")
 }
 
@@ -61,7 +63,7 @@ fn hnsw_discover_precision() {
     let distance = Distance::Cosine;
     let full_scan_threshold = 16; // KB
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
@@ -72,7 +74,7 @@ fn hnsw_discover_precision() {
 
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
+        let vector = random_vector(&mut rng, dim);
 
         segment
             .upsert_point(
@@ -93,10 +95,11 @@ fn hnsw_discover_precision() {
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit_cpu_count = 1; // single-threaded for deterministic build
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
@@ -113,7 +116,11 @@ fn hnsw_discover_precision() {
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
+            feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -122,7 +129,7 @@ fn hnsw_discover_precision() {
     let mut discovery_hits = 0;
     let attempts = 100;
     for _i in 0..attempts {
-        let query: QueryVector = random_discovery_query(&mut rnd, dim);
+        let query: QueryVector = random_discovery_query(&mut rng, dim);
 
         let index_discovery_result = hnsw_index
             .search(
@@ -169,7 +176,7 @@ fn filtered_hnsw_discover_precision() {
     let full_scan_threshold = 16; // KB
     let num_payload_values = 4;
 
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(42);
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -181,9 +188,9 @@ fn filtered_hnsw_discover_precision() {
     let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
-        let vector = random_vector(&mut rnd, dim);
+        let vector = random_vector(&mut rng, dim);
 
-        let keyword_payload = get_random_keyword_of(num_payload_values, &mut rnd);
+        let keyword_payload = get_random_keyword_of(num_payload_values, &mut rng);
         let payload = payload_json! {keyword_key: keyword_payload};
 
         segment
@@ -202,7 +209,11 @@ fn filtered_hnsw_discover_precision() {
     let payload_index_ptr = segment.payload_index.clone();
     payload_index_ptr
         .borrow_mut()
-        .set_indexed(&JsonPath::new(keyword_key), PayloadSchemaType::Keyword)
+        .set_indexed(
+            &JsonPath::new(keyword_key),
+            PayloadSchemaType::Keyword,
+            &hw_counter,
+        )
         .unwrap();
 
     let hnsw_config = HnswConfig {
@@ -212,10 +223,11 @@ fn filtered_hnsw_discover_precision() {
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
+        inline_storage: None,
     };
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
@@ -232,7 +244,11 @@ fn filtered_hnsw_discover_precision() {
             permit,
             old_indices: &[],
             gpu_device: None,
+            rng: &mut rng,
             stopped: &stopped,
+            hnsw_global_config: &HnswGlobalConfig::default(),
+            feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -243,12 +259,12 @@ fn filtered_hnsw_discover_precision() {
     for _i in 0..attempts {
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
             JsonPath::new(keyword_key),
-            get_random_keyword_of(num_payload_values, &mut rnd).into(),
+            get_random_keyword_of(num_payload_values, &mut rng).into(),
         )));
 
         let filter_query = Some(&filter);
 
-        let query: QueryVector = random_discovery_query(&mut rnd, dim);
+        let query: QueryVector = random_discovery_query(&mut rng, dim);
 
         let index_discovery_result = hnsw_index
             .search(

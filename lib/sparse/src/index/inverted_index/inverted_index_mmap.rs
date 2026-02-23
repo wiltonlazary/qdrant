@@ -3,22 +3,24 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::types::PointOffsetType;
-use io::file_operations::{atomic_save_json, read_json};
-use io::storage_version::StorageVersion;
-use memmap2::{Mmap, MmapMut};
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_ops::{
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::fs::{atomic_save_json, clear_disk_cache, read_json};
+use common::mmap::{Advice, AdviceSetting, Madviseable};
+#[expect(deprecated, reason = "legacy code")]
+use common::mmap::{
     create_and_ensure_length, open_read_mmap, open_write_mmap, transmute_from_u8,
     transmute_from_u8_to_slice, transmute_to_u8, transmute_to_u8_slice,
 };
+use common::storage_version::StorageVersion;
+use common::types::PointOffsetType;
+use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 
 use super::INDEX_FILE_NAME;
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset};
-use crate::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use crate::index::inverted_index::InvertedIndex;
+use crate::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use crate::index::posting_list::PostingListIterator;
 use crate::index::posting_list_common::PostingElementEx;
 
@@ -50,6 +52,7 @@ pub struct InvertedIndexMmap {
 }
 
 #[derive(Debug, Default, Clone)]
+#[repr(C)]
 struct PostingListFileHeader {
     pub start_offset: u64,
     pub end_offset: u64,
@@ -59,6 +62,10 @@ impl InvertedIndex for InvertedIndexMmap {
     type Iter<'a> = PostingListIterator<'a>;
 
     type Version = Version;
+
+    fn is_on_disk(&self) -> bool {
+        true
+    }
 
     fn open(path: &Path) -> std::io::Result<Self> {
         Self::load(path)
@@ -77,15 +84,25 @@ impl InvertedIndex for InvertedIndexMmap {
         Ok(())
     }
 
-    fn get(&self, id: &DimId) -> Option<PostingListIterator> {
-        self.get(id).map(PostingListIterator::new)
+    fn get<'a>(
+        &'a self,
+        id: DimOffset,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<PostingListIterator<'a>> {
+        let posting_list = self.get(&id);
+
+        hw_counter
+            .vector_io_read()
+            .incr_delta(posting_list.map(|x| x.len()).unwrap_or(0) * size_of::<PostingElementEx>());
+
+        posting_list.map(PostingListIterator::new)
     }
 
     fn len(&self) -> usize {
         self.file_header.posting_count
     }
 
-    fn posting_list_len(&self, id: &DimOffset) -> Option<usize> {
+    fn posting_list_len(&self, id: &DimOffset, _hw_counter: &HardwareCounterCell) -> Option<usize> {
         self.get(id).map(|posting_list| posting_list.len())
     }
 
@@ -94,6 +111,11 @@ impl InvertedIndex for InvertedIndexMmap {
             Self::index_file_path(path),
             Self::index_config_file_path(path),
         ]
+    }
+
+    fn immutable_files(path: &Path) -> Vec<PathBuf> {
+        // `InvertedIndexMmap` is always immutable
+        Self::files(path)
     }
 
     fn remove(&mut self, _id: PointOffsetType, _old_vector: RemappedSparseVector) {
@@ -121,7 +143,10 @@ impl InvertedIndex for InvertedIndexMmap {
     }
 
     fn total_sparse_vectors_size(&self) -> usize {
-        debug_assert!(false, "This index is already substituted by the compressed version, no need to maintain new features");
+        debug_assert!(
+            false,
+            "This index is already substituted by the compressed version, no need to maintain new features",
+        );
         0
     }
 
@@ -148,12 +173,19 @@ impl InvertedIndexMmap {
             return None;
         }
         let header_start = *id as usize * POSTING_HEADER_SIZE;
-        let header = transmute_from_u8::<PostingListFileHeader>(
-            &self.mmap[header_start..header_start + POSTING_HEADER_SIZE],
-        )
+        // Safety: memory has correct size and alignment for the type.
+        #[expect(deprecated, reason = "legacy code")]
+        let header = unsafe {
+            transmute_from_u8::<PostingListFileHeader>(
+                &self.mmap[header_start..header_start + POSTING_HEADER_SIZE],
+            )
+        }
         .clone();
         let elements_bytes = &self.mmap[header.start_offset as usize..header.end_offset as usize];
-        Some(transmute_from_u8_to_slice(elements_bytes))
+        // TODO Is not safe, do not use with untrusted files.
+        // TODO add a check for alignment.
+        #[expect(deprecated, reason = "legacy code")]
+        Some(unsafe { transmute_from_u8_to_slice(elements_bytes) })
     }
 
     pub fn convert_and_save<P: AsRef<Path>>(
@@ -237,7 +269,9 @@ impl InvertedIndexMmap {
             elements_offset = posting_header.end_offset as usize;
 
             // save posting header
-            let posting_header_bytes = transmute_to_u8(&posting_header);
+            // Safety: posting_header is a POD type.
+            #[expect(deprecated, reason = "legacy code")]
+            let posting_header_bytes = unsafe { transmute_to_u8(&posting_header) };
             let start_posting_offset = id * POSTING_HEADER_SIZE;
             let end_posting_offset = (id + 1) * POSTING_HEADER_SIZE;
             mmap[start_posting_offset..end_posting_offset].copy_from_slice(posting_header_bytes);
@@ -252,11 +286,25 @@ impl InvertedIndexMmap {
         let mut offset = total_posting_headers_size;
         for posting in &inverted_index_ram.postings {
             // save posting element
-            let posting_elements_bytes = transmute_to_u8_slice(&posting.elements);
+            // Safety: `PostingElementEx` is a POD type.
+            #[expect(deprecated, reason = "legacy code")]
+            let posting_elements_bytes = unsafe { transmute_to_u8_slice(&posting.elements) };
             mmap[offset..offset + posting_elements_bytes.len()]
                 .copy_from_slice(posting_elements_bytes);
             offset += posting_elements_bytes.len();
         }
+    }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> std::io::Result<()> {
+        self.mmap.populate();
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> std::io::Result<()> {
+        clear_disk_cache(&self.path)
     }
 }
 

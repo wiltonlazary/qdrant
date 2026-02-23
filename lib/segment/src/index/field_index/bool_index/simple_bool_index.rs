@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -8,7 +9,7 @@ use serde_json::Value;
 
 use self::memory::{BoolMemory, BooleanItem};
 use super::BoolIndex;
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::index::field_index::map_index::IdIter;
@@ -21,6 +22,7 @@ use crate::types::{FieldCondition, Match, MatchValue, PayloadKeyType, ValueVaria
 
 mod memory {
     use bitvec::vec::BitVec;
+    use common::ext::BitSliceExt as _;
     use common::types::PointOffsetType;
 
     pub struct BooleanItem {
@@ -91,8 +93,8 @@ mod memory {
         pub fn get(&self, id: PointOffsetType) -> BooleanItem {
             debug_assert!(self.trues.len() == self.falses.len());
 
-            let has_true = self.trues.get(id as usize).map(|v| *v).unwrap_or(false);
-            let has_false = self.falses.get(id as usize).map(|v| *v).unwrap_or(false);
+            let has_true = self.trues.get_bit(id as usize).unwrap_or(false);
+            let has_false = self.falses.get_bit(id as usize).unwrap_or(false);
 
             BooleanItem::from_bools(has_true, has_false)
         }
@@ -185,20 +187,48 @@ pub struct SimpleBoolIndex {
 }
 
 impl SimpleBoolIndex {
-    pub fn new(db: Arc<RwLock<DB>>, field_name: &str) -> SimpleBoolIndex {
+    pub fn new(
+        db: Arc<RwLock<DB>>,
+        field_name: &str,
+        create_if_missing: bool,
+    ) -> OperationResult<Option<SimpleBoolIndex>> {
         let store_cf_name = Self::storage_cf_name(field_name);
         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
             db,
             &store_cf_name,
         ));
-        Self {
-            memory: BoolMemory::new(),
-            db_wrapper,
+
+        if !db_wrapper.has_column_family()? {
+            if create_if_missing {
+                db_wrapper.recreate_column_family()?;
+            } else {
+                // Column family doesn't exist, cannot load
+                return Ok(None);
+            }
+        };
+
+        // Load in-memory index from RocksDB
+        let mut memory = BoolMemory::new();
+        for (key, value) in db_wrapper.lock_db().iter()? {
+            let idx = PointOffsetType::from_be_bytes(key.as_ref().try_into().unwrap());
+
+            debug_assert_eq!(value.len(), 1);
+
+            let item = BooleanItem::from(value[0]);
+            memory.set_or_insert(idx, &item);
         }
+
+        Ok(Some(Self { memory, db_wrapper }))
     }
 
-    pub fn builder(db: Arc<RwLock<DB>>, field_name: &str) -> BoolIndexBuilder {
-        BoolIndexBuilder(Self::new(db, field_name))
+    pub fn builder(db: Arc<RwLock<DB>>, field_name: &str) -> OperationResult<BoolIndexBuilder> {
+        Ok(BoolIndexBuilder(
+            Self::new(db, field_name, true)?.ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "Failed to create and open SimpleBoolIndex for field: {field_name}",
+                ))
+            })?,
+        ))
     }
 
     fn storage_cf_name(field: &str) -> String {
@@ -211,6 +241,7 @@ impl SimpleBoolIndex {
             points_count: self.memory.indexed_count(),
             points_values_count: self.memory.trues_count() + self.memory.falses_count(),
             histogram_bucket_size: None,
+            index_type: "simple_bool",
         }
     }
 
@@ -241,7 +272,7 @@ impl SimpleBoolIndex {
         self.memory.get(point_id).has_false()
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (bool, IdIter<'_>)> + '_ {
+    pub fn iter_values_map(&self) -> impl Iterator<Item = (bool, IdIter<'_>)> {
         [
             (false, Box::new(self.memory.iter_has_false()) as IdIter),
             (true, Box::new(self.memory.iter_has_true()) as IdIter),
@@ -287,8 +318,13 @@ impl FieldIndexBuilderTrait for BoolIndexBuilder {
         self.0.db_wrapper.recreate_column_family()
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.0.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.0.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
@@ -297,23 +333,7 @@ impl FieldIndexBuilderTrait for BoolIndexBuilder {
 }
 
 impl PayloadFieldIndex for SimpleBoolIndex {
-    fn load(&mut self) -> OperationResult<bool> {
-        if !self.db_wrapper.has_column_family()? {
-            return Ok(false);
-        }
-
-        for (key, value) in self.db_wrapper.lock_db().iter()? {
-            let idx = PointOffsetType::from_be_bytes(key.as_ref().try_into().unwrap());
-
-            debug_assert_eq!(value.len(), 1);
-
-            let item = BooleanItem::from(value[0]);
-            self.memory.set_or_insert(idx, &item);
-        }
-        Ok(true)
-    }
-
-    fn cleanup(self) -> OperationResult<()> {
+    fn wipe(self) -> OperationResult<()> {
         self.db_wrapper.remove_column_family()
     }
 
@@ -325,9 +345,14 @@ impl PayloadFieldIndex for SimpleBoolIndex {
         vec![]
     }
 
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+
     fn filter<'a>(
         &'a self,
         condition: &'a crate::types::FieldCondition,
+        _: &'a HardwareCounterCell,
     ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
         match &condition.r#match {
             Some(Match::Value(MatchValue {
@@ -343,7 +368,11 @@ impl PayloadFieldIndex for SimpleBoolIndex {
         }
     }
 
-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+    fn estimate_cardinality(
+        &self,
+        condition: &FieldCondition,
+        _: &HardwareCounterCell,
+    ) -> Option<CardinalityEstimation> {
         match &condition.r#match {
             Some(Match::Value(MatchValue {
                 value: ValueVariants::Bool(value),
@@ -403,7 +432,12 @@ impl PayloadFieldIndex for SimpleBoolIndex {
 impl ValueIndexer for SimpleBoolIndex {
     type ValueType = bool;
 
-    fn add_many(&mut self, id: PointOffsetType, values: Vec<bool>) -> OperationResult<()> {
+    fn add_many(
+        &mut self,
+        id: PointOffsetType,
+        values: Vec<bool>,
+        _: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         if values.is_empty() {
             return Ok(());
         }
@@ -415,7 +449,9 @@ impl ValueIndexer for SimpleBoolIndex {
 
         self.memory.set_or_insert(id, &item);
 
-        self.db_wrapper.put(id.to_be_bytes(), item.as_bytes())?;
+        let item_bytes = item.as_bytes();
+
+        self.db_wrapper.put(id.to_be_bytes(), item_bytes)?;
 
         Ok(())
     }

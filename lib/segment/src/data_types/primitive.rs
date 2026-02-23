@@ -3,16 +3,18 @@ use std::borrow::Cow;
 use half::f16;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::named_vectors::CowMultiVector;
 use super::vectors::TypedMultiDenseVector;
 use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorElementTypeHalf};
-use crate::spaces::metric::Metric;
-use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
 use crate::types::{Distance, QuantizationConfig, VectorStorageDatatype};
 
-pub trait PrimitiveVectorElement:
-    Copy + Clone + Default + Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static
+pub trait PrimitiveVectorElement
+where
+    Self: Copy + Clone + Default + Send + Sync + 'static,
+    Self: Serialize + for<'a> Deserialize<'a>,
+    Self: FromBytes + Immutable + IntoBytes + KnownLayout,
 {
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]>;
 
@@ -150,17 +152,7 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
                 .iter()
                 .map(|&x| VectorElementType::from(x))
                 .collect_vec();
-            let preprocessed_vector = match distance {
-                Distance::Cosine => <CosineMetric as Metric<VectorElementType>>::preprocess(vector),
-                Distance::Euclid => <EuclidMetric as Metric<VectorElementType>>::preprocess(vector),
-                Distance::Dot => {
-                    <DotProductMetric as Metric<VectorElementType>>::preprocess(vector)
-                }
-                Distance::Manhattan => {
-                    <ManhattanMetric as Metric<VectorElementType>>::preprocess(vector)
-                }
-            };
-            Cow::from(preprocessed_vector)
+            Cow::from(distance.preprocess_vector::<VectorElementType>(vector))
         }
     }
 

@@ -70,13 +70,14 @@ impl Device {
         instance: Arc<Instance>,
         vk_physical_device: &PhysicalDevice,
     ) -> GpuResult<Arc<Device>> {
-        Self::new_with_queue_index(instance, vk_physical_device, 0)
+        Self::new_with_params(instance, vk_physical_device, 0, false)
     }
 
-    pub fn new_with_queue_index(
+    pub fn new_with_params(
         instance: Arc<Instance>,
         vk_physical_device: &PhysicalDevice,
         queue_index: usize,
+        skip_half_precision: bool,
     ) -> GpuResult<Arc<Device>> {
         #[allow(unused_mut)]
         let mut extensions_cstr: Vec<CString> = vec![CString::from(ash::khr::maintenance1::NAME)];
@@ -140,8 +141,8 @@ impl Device {
         if !enabled_physical_device_features_1_2.shader_int8 == 0 {
             return Err(GpuError::NotSupported("Int8 is not supported".to_string()));
         }
-        let has_half_precision = !instance.skip_half_precision()
-            && enabled_physical_device_features_1_2.shader_float16 == 1;
+        let has_half_precision =
+            !skip_half_precision && enabled_physical_device_features_1_2.shader_float16 == 1;
         if !has_half_precision {
             log::warn!("Half precision is not supported, falling back to full precision floats");
         }
@@ -313,7 +314,7 @@ impl Device {
     }
 
     /// Get CPU allocator.
-    pub fn cpu_allocation_callbacks(&self) -> Option<&vk::AllocationCallbacks> {
+    pub fn cpu_allocation_callbacks(&self) -> Option<&vk::AllocationCallbacks<'_>> {
         self.instance.cpu_allocation_callbacks()
     }
 
@@ -337,7 +338,7 @@ impl Device {
             let mut gpu_allocator = gpu_allocator.lock();
             if let Err(e) = gpu_allocator.free(allocation) {
                 // Log error because free is called from Drop.
-                log::error!("Failed to free GPU memory: {:?}", e);
+                log::error!("Failed to free GPU memory: {e:?}");
             }
         } else {
             log::error!("GPU allocator is not available");

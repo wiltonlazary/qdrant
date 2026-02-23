@@ -1,7 +1,7 @@
-use common::mmap_hashmap::{gen_ident, gen_map, MmapHashMap};
-use criterion::{criterion_group, criterion_main, Criterion};
-use rand::rngs::StdRng;
+use common::mmap_hashmap::{MmapHashMap, gen_ident, gen_map};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 fn bench_mmap_hashmap(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
@@ -18,7 +18,7 @@ fn bench_mmap_hashmap(c: &mut Criterion) {
     )
     .unwrap();
 
-    let mmap = MmapHashMap::<str, u32>::open(&mmap_path).unwrap();
+    let mmap = MmapHashMap::<str, u32>::open(&mmap_path, true).unwrap();
 
     let mut it = keys.iter().cycle();
     c.bench_function("get", |b| {

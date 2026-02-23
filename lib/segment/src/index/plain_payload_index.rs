@@ -1,25 +1,26 @@
 use std::collections::HashMap;
-use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::iterator_ext::IteratorExt;
 use common::types::PointOffsetType;
+use fs_err as fs;
 use schemars::_serde_json::Value;
 
 use super::field_index::FieldIndex;
-use crate::common::operation_error::OperationResult;
+use super::payload_config::PayloadFieldSchemaWithIndexType;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTrackerSS;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
 use crate::index::payload_config::PayloadConfig;
-use crate::index::PayloadIndex;
+use crate::index::{BuildIndexResult, PayloadIndex};
 use crate::json_path::JsonPath;
 use crate::payload_storage::{ConditionCheckerSS, FilterContext};
-use crate::types::{
-    Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
-};
+use crate::types::{Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef};
 
 /// Implementation of `PayloadIndex` which does not really indexes anything.
 ///
@@ -47,7 +48,7 @@ impl PlainPayloadIndex {
         id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
         path: &Path,
     ) -> OperationResult<Self> {
-        create_dir_all(path)?;
+        fs::create_dir_all(path)?;
         let config_path = PayloadConfig::get_config_path(path);
         let config = if config_path.exists() {
             PayloadConfig::load(&config_path)?
@@ -72,30 +73,37 @@ impl PlainPayloadIndex {
 
 impl PayloadIndex for PlainPayloadIndex {
     fn indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema> {
-        self.config.indexed_fields.clone()
+        self.config.indices.to_schemas()
     }
 
     fn build_index(
         &self,
         _field: PayloadKeyTypeRef,
         _payload_schema: &PayloadFieldSchema,
-    ) -> OperationResult<Option<Vec<FieldIndex>>> {
-        Ok(Some(Vec::new()))
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<BuildIndexResult> {
+        Ok(BuildIndexResult::AlreadyBuilt) // No index to build
     }
 
     fn apply_index(
         &mut self,
         field: PayloadKeyType,
         payload_schema: PayloadFieldSchema,
-        _field_index: Vec<FieldIndex>,
+        field_index: Vec<FieldIndex>,
     ) -> OperationResult<()> {
-        if let Some(prev_schema) = self
-            .config
-            .indexed_fields
-            .insert(field, payload_schema.clone())
-        {
+        let new_schema = PayloadFieldSchemaWithIndexType::new(
+            payload_schema,
+            field_index
+                .iter()
+                .map(|i| i.get_full_index_type())
+                .collect(),
+        );
+
+        let prev_schema = self.config.indices.insert(field, new_schema.clone());
+
+        if let Some(prev_schema) = prev_schema {
             // the field is already present with the same schema, no need to save the config
-            if prev_schema == payload_schema {
+            if prev_schema == new_schema {
                 return Ok(());
             }
         }
@@ -104,12 +112,36 @@ impl PayloadIndex for PlainPayloadIndex {
         Ok(())
     }
 
-    fn drop_index(&mut self, field: PayloadKeyTypeRef) -> OperationResult<()> {
-        self.config.indexed_fields.remove(field);
-        self.save_config()
+    fn set_indexed(
+        &mut self,
+        field: PayloadKeyTypeRef,
+        payload_schema: impl Into<PayloadFieldSchema>,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        // No need to build index, just set the field as indexed
+        self.apply_index(field.clone(), payload_schema.into(), vec![])
     }
 
-    fn estimate_cardinality(&self, _query: &Filter) -> CardinalityEstimation {
+    fn drop_index(&mut self, field: PayloadKeyTypeRef) -> OperationResult<bool> {
+        let is_removed = self.config.indices.remove(field).is_some();
+        self.save_config()?;
+        Ok(is_removed)
+    }
+
+    fn drop_index_if_incompatible(
+        &mut self,
+        field: PayloadKeyTypeRef,
+        _new_payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<bool> {
+        // Just always drop the index, as we don't have any indexes
+        self.drop_index(field)
+    }
+
+    fn estimate_cardinality(
+        &self,
+        _query: &Filter,
+        _hw_counter: &HardwareCounterCell, // No measurements needed here.
+    ) -> CardinalityEstimation {
         let available_points = self.id_tracker.borrow().available_point_count();
         CardinalityEstimation {
             primary_clauses: vec![],
@@ -124,19 +156,22 @@ impl PayloadIndex for PlainPayloadIndex {
         &self,
         query: &Filter,
         _nested_path: &JsonPath,
+        hw_counter: &HardwareCounterCell,
     ) -> CardinalityEstimation {
-        self.estimate_cardinality(query)
+        self.estimate_cardinality(query, hw_counter)
     }
 
     fn query_points(
         &self,
-        query: &Filter,
+        filter: &Filter,
         hw_counter: &HardwareCounterCell,
+        is_stopped: &AtomicBool,
     ) -> Vec<PointOffsetType> {
-        let filter_context = self.filter_context(query, hw_counter);
-        self.id_tracker
-            .borrow()
-            .iter_ids()
+        let filter_context = self.filter_context(filter, hw_counter);
+        let id_tracker = self.id_tracker.borrow();
+        let all_points_iter = id_tracker.iter_internal();
+        all_points_iter
+            .stop_if(is_stopped)
             .filter(|id| filter_context.check(*id))
             .collect()
     }
@@ -162,7 +197,7 @@ impl PayloadIndex for PlainPayloadIndex {
         _threshold: usize,
     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
         // No blocks for un-indexed payload
-        Box::new(vec![].into_iter())
+        Box::new(std::iter::empty())
     }
 
     fn overwrite_payload(
@@ -192,6 +227,14 @@ impl PayloadIndex for PlainPayloadIndex {
         unreachable!()
     }
 
+    fn get_payload_sequential(
+        &self,
+        _point_id: PointOffsetType,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        unreachable!()
+    }
+
     fn delete_payload(
         &mut self,
         _point_id: PointOffsetType,
@@ -210,17 +253,6 @@ impl PayloadIndex for PlainPayloadIndex {
     }
 
     fn flusher(&self) -> Flusher {
-        unreachable!()
-    }
-
-    fn infer_payload_type(
-        &self,
-        _key: PayloadKeyTypeRef,
-    ) -> OperationResult<Option<PayloadSchemaType>> {
-        unreachable!()
-    }
-
-    fn take_database_snapshot(&self, _: &Path) -> OperationResult<()> {
         unreachable!()
     }
 

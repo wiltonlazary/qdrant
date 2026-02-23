@@ -3,7 +3,7 @@ use std::hint::black_box;
 use common::bitpacking::{BitReader, BitWriter};
 use common::bitpacking_links::{iterate_packed_links, pack_links};
 use common::bitpacking_ordered;
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use itertools::Itertools as _;
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
@@ -76,10 +76,10 @@ pub fn bench_bitpacking_links(c: &mut Criterion) {
 
         pack_links(
             &mut links,
-            std::iter::repeat_with(|| rng.random_range(0..1u64 << bits_per_unsorted) as u32)
+            &mut std::iter::repeat_with(|| rng.random_range(0..1u64 << bits_per_unsorted) as u32)
                 .unique()
                 .take(sorted_count + unsorted_count)
-                .collect(),
+                .collect_vec(),
             bits_per_unsorted,
             sorted_count,
         );

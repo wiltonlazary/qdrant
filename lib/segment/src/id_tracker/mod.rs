@@ -1,14 +1,17 @@
+pub mod compressed;
 pub mod id_tracker_base;
 pub mod immutable_id_tracker;
 pub mod in_memory_id_tracker;
+pub mod mutable_id_tracker;
 pub mod point_mappings;
+#[cfg(feature = "rocksdb")]
 pub mod simple_id_tracker;
 
 use common::types::PointOffsetType;
 pub use id_tracker_base::*;
 use itertools::Itertools as _;
 
-use crate::types::ExtendedPointId;
+use crate::types::{ExtendedPointId, PointIdType};
 
 /// Calling [`for_each_unique_point`] will yield this struct for each unique
 /// point.
@@ -68,13 +71,22 @@ pub fn for_each_unique_point<'a>(
     f(best_item);
 }
 
+impl From<&ExtendedPointId> for PointIdType {
+    fn from(point_id: &ExtendedPointId) -> Self {
+        match point_id {
+            ExtendedPointId::NumId(idx) => PointIdType::NumId(*idx),
+            ExtendedPointId::Uuid(uuid) => PointIdType::Uuid(*uuid),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::{hash_map, HashMap};
+    use std::collections::{HashMap, hash_map};
 
     use in_memory_id_tracker::InMemoryIdTracker;
-    use rand::rngs::StdRng;
     use rand::SeedableRng as _;
+    use rand::rngs::StdRng;
     use rstest::rstest;
 
     use super::*;

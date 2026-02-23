@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  rust-tests:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -19,21 +19,32 @@ jobs:
     steps:
     - name: Install minimal stable
       uses: dtolnay/rust-toolchain@stable
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - uses: Swatinem/rust-cache@v2
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Install mold
+      uses: rui314/setup-mold@v1
+    - name: Enable mold on Linux
+      run: |
+        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          mkdir .cargo
+          echo "[target.x86_64-unknown-linux-gnu]" >> .cargo/config.toml
+          echo "linker = \"clang\"" >> .cargo/config.toml
+          echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=/usr/local/bin/mold\"]" >> .cargo/config.toml
+        fi
+      shell: bash
     - name: Install nextest
       uses: taiki-e/install-action@nextest
     - name: Build
-      run: cargo build --tests --workspace --locked
+      run: cargo build --workspace --features rocksdb --tests --locked
     - name: Run tests
       # Profile "ci" is configured in .config/nextest.toml
-      run: cargo nextest run --workspace --profile ci --locked
+      run: cargo nextest run --workspace --features rocksdb --profile ci --locked
     - name: Upload test report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: junit-${{ matrix.os }}.xml
         path: target/nextest/ci/junit.xml
@@ -43,7 +54,7 @@ jobs:
   # Failure of updating an issue is ignored because it fails for external contributors.
   process-results:
     runs-on: ubuntu-latest
-    needs: test
+    needs: rust-tests
     permissions:
       contents: read
       issues: write
@@ -52,7 +63,7 @@ jobs:
         os: [ ubuntu-latest, windows-latest, macos-latest  ]
     steps:
       - name: Download test report
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: junit-${{ matrix.os }}.xml
       - name: Process test report
@@ -73,7 +84,7 @@ jobs:
           echo $delimiter >> $GITHUB_OUTPUT
       - name: pull issue template
         if: ${{ steps.process-test-report.outputs.has_flaky_tests == 'true' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           sparse-checkout: |
             .github/ISSUE_TEMPLATE/flaky_test.md

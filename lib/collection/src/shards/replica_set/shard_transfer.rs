@@ -2,12 +2,12 @@ use std::ops::Deref as _;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use segment::types::PointIdType;
+use segment::types::{Filter, PointIdType};
 
 use super::ShardReplicaSet;
 use crate::hash_ring::HashRingRouter;
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::forward_proxy_shard::ForwardProxyShard;
+use crate::shards::forward_proxy_shard::{ForwardProxyShard, TransferBatchResult};
 use crate::shards::local_shard::clock_map::RecoveryPoint;
 use crate::shards::queue_proxy_shard::QueueProxyShard;
 use crate::shards::remote_shard::RemoteShard;
@@ -24,6 +24,7 @@ impl ShardReplicaSet {
         &self,
         remote_shard: RemoteShard,
         resharding_hash_ring: Option<HashRingRouter>,
+        filter: Option<Filter>,
     ) -> CollectionResult<()> {
         let mut local = self.local.write().await;
 
@@ -35,7 +36,7 @@ impl ShardReplicaSet {
             Some(Shard::ForwardProxy(proxy))
                 if proxy.remote_shard.peer_id == remote_shard.peer_id =>
             {
-                return Ok(())
+                return Ok(());
             }
 
             // Unexpected states, error
@@ -78,15 +79,25 @@ impl ShardReplicaSet {
             unreachable!()
         };
 
-        let proxy_shard = ForwardProxyShard::new(
+        let proxy_shard_res = ForwardProxyShard::new(
             self.shard_id,
             local_shard,
             remote_shard,
             resharding_hash_ring,
+            filter,
         );
-        let _ = local.insert(Shard::ForwardProxy(proxy_shard));
 
-        Ok(())
+        match proxy_shard_res {
+            Ok(proxy_shard) => {
+                let _ = local.insert(Shard::ForwardProxy(proxy_shard));
+                Ok(())
+            }
+            Err((err, local_shard)) => {
+                log::warn!("Failed to proxify shard, reverting to local shard: {err}");
+                let _ = local.insert(Shard::Local(local_shard));
+                Err(err)
+            }
+        }
     }
 
     /// Queue proxy our local shard, pointing to the remote shard.
@@ -177,19 +188,19 @@ impl ShardReplicaSet {
 
         // Try to queue proxify with or without version
         let proxy_shard = match from_version {
-            None => Ok(QueueProxyShard::new(
-                local_shard,
-                remote_shard,
-                wal_keep_from,
-                progress,
-            )),
-            Some(from_version) => QueueProxyShard::new_from_version(
-                local_shard,
-                remote_shard,
-                wal_keep_from,
-                from_version,
-                progress,
-            ),
+            None => {
+                Ok(QueueProxyShard::new(local_shard, remote_shard, wal_keep_from, progress).await)
+            }
+            Some(from_version) => {
+                QueueProxyShard::new_from_version(
+                    local_shard,
+                    remote_shard,
+                    wal_keep_from,
+                    from_version,
+                    progress,
+                )
+                .await
+            }
         };
 
         // Insert queue proxy shard on success or revert to local shard on failure
@@ -333,6 +344,8 @@ impl ShardReplicaSet {
 
     /// Custom operation for transferring data from one shard to another during transfer
     ///
+    /// Returns new point offset and transferred count
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
@@ -342,7 +355,7 @@ impl ShardReplicaSet {
         batch_size: usize,
         hashring_filter: Option<&HashRingRouter>,
         merge_points: bool,
-    ) -> CollectionResult<Option<PointIdType>> {
+    ) -> CollectionResult<TransferBatchResult> {
         let local = self.local.read().await;
 
         let Some(Shard::ForwardProxy(proxy)) = local.deref() else {
@@ -467,10 +480,22 @@ impl ShardReplicaSet {
         };
 
         let (local_shard, remote_shard) = queue_proxy.forget_updates_and_finalize();
-        let forward_proxy = ForwardProxyShard::new(self.shard_id, local_shard, remote_shard, None);
-        let _ = local.insert(Shard::ForwardProxy(forward_proxy));
+        let forward_proxy_res =
+            ForwardProxyShard::new(self.shard_id, local_shard, remote_shard, None, None);
 
-        Ok(())
+        match forward_proxy_res {
+            Ok(forward_proxy) => {
+                let _ = local.insert(Shard::ForwardProxy(forward_proxy));
+                Ok(())
+            }
+            Err((err, local_shard)) => {
+                log::warn!(
+                    "Failed to transform queue proxy shard into forward proxy, reverting to local shard: {err}"
+                );
+                let _ = local.insert(Shard::Local(local_shard));
+                Err(err)
+            }
+        }
     }
 
     pub async fn resolve_wal_delta(
@@ -495,6 +520,6 @@ impl ShardReplicaSet {
             ));
         };
 
-        local_shard.wal_version()
+        local_shard.wal_version().await
     }
 }

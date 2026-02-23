@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use segment::data_types::groups::GroupId;
 use segment::json_path::JsonPath;
 use segment::types::{PointIdType, ScoredPoint};
 
-use crate::lookup::WithLookup;
 use crate::operations::types::PointGroup;
 use crate::operations::universal_query::shard_query::ShardQueryRequest;
 
@@ -20,7 +18,7 @@ pub(super) struct Group {
 }
 
 impl Group {
-    pub(super) fn hydrate_from(&mut self, map: &HashMap<PointIdType, ScoredPoint>) {
+    pub(super) fn hydrate_from(&mut self, map: &AHashMap<PointIdType, ScoredPoint>) {
         self.hits.iter_mut().for_each(|hit| {
             if let Some(point) = map.get(&hit.id) {
                 hit.payload.clone_from(&point.payload);
@@ -57,9 +55,6 @@ pub struct QueryGroupRequest {
 
     /// Limit of groups to return
     pub groups: usize,
-
-    /// Options for specifying how to use the group id to lookup points in another collection
-    pub with_lookup: Option<WithLookup>,
 }
 
 #[cfg(test)]

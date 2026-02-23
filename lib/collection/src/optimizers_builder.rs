@@ -1,9 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use fs_err as fs;
 use schemars::JsonSchema;
+use segment::common::anonymize::Anonymize;
 use segment::index::hnsw_index::num_rayon_threads;
-use segment::types::{HnswConfig, QuantizationConfig};
+use segment::types::{HnswConfig, HnswGlobalConfig, QuantizationConfig};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -15,12 +17,13 @@ use crate::collection_manager::optimizers::vacuum_optimizer::VacuumOptimizer;
 use crate::config::CollectionParams;
 use crate::update_handler::Optimizer;
 
-const DEFAULT_MAX_SEGMENT_PER_CPU_KB: usize = 200_000;
-pub const DEFAULT_INDEXING_THRESHOLD_KB: usize = 20_000;
+const DEFAULT_MAX_SEGMENT_PER_CPU_KB: usize = 256_000;
+pub const DEFAULT_INDEXING_THRESHOLD_KB: usize = 10_000;
 const SEGMENTS_PATH: &str = "segments";
 const TEMP_SEGMENTS_PATH: &str = "temp_segments";
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq)]
+#[anonymize(false)]
 pub struct OptimizersConfig {
     /// The minimal fraction of deleted vectors in a segment, required to perform segment optimization
     #[validate(range(min = 0.0, max = 1.0))]
@@ -59,10 +62,11 @@ pub struct OptimizersConfig {
     /// Note: 1Kb = 1 vector of size 256
     #[serde(alias = "memmap_threshold_kb")]
     #[serde(default)]
+    #[deprecated(since = "1.15.0", note = "Use `on_disk` flags instead")]
     pub memmap_threshold: Option<usize>,
     /// Maximum size (in kilobytes) of vectors allowed for plain index, exceeding this threshold will enable vector indexing
     ///
-    /// Default value is 20,000, based on <https://github.com/google-research/google-research/blob/master/scann/docs/algorithms.md>.
+    /// Default value is 10,000, based on experiments and observations.
     ///
     /// To disable vector indexing, set to `0`.
     ///
@@ -78,6 +82,14 @@ pub struct OptimizersConfig {
     /// If 0 - no optimization threads, optimizations will be disabled.
     #[serde(default)]
     pub max_optimization_threads: Option<usize>,
+
+    /// If this option is set, service will try to prevent creation of large unoptimized segments.
+    /// When enabled, updates may be blocked at request level if there are unoptimized segments larger than indexing threshold.
+    /// Updates will be resumed when optimization is completed and segments are optimized below the threshold.
+    /// Using this option may lead to increased delay between submitting an update and its application.
+    /// Default is disabled.
+    #[serde(default)]
+    pub prevent_unoptimized: Option<bool>,
 }
 
 impl OptimizersConfig {
@@ -88,31 +100,41 @@ impl OptimizersConfig {
             vacuum_min_vector_number: 1000,
             default_segment_number: 0,
             max_segment_size: None,
+            #[expect(deprecated)]
             memmap_threshold: None,
             indexing_threshold: Some(100_000),
             flush_interval_sec: 60,
             max_optimization_threads: Some(0),
+            prevent_unoptimized: None,
         }
     }
 
     pub fn get_number_segments(&self) -> usize {
         if self.default_segment_number == 0 {
             let num_cpus = common::cpu::get_num_cpus();
+            // Configure 1 segment per 2 CPUs, as a middle ground between
+            // latency and RPS.
+            let expected_segments = num_cpus / 2;
             // Do not configure less than 2 and more than 8 segments
             // until it is not explicitly requested
-            num_cpus.clamp(2, 8)
+            expected_segments.clamp(2, 8)
         } else {
             self.default_segment_number
         }
     }
 
-    pub fn optimizer_thresholds(&self, num_indexing_threads: usize) -> OptimizerThresholds {
-        let indexing_threshold_kb = match self.indexing_threshold {
+    pub fn get_indexing_threshold_kb(&self) -> usize {
+        match self.indexing_threshold {
             None => DEFAULT_INDEXING_THRESHOLD_KB, // default value
             Some(0) => usize::MAX,                 // disable vector index
             Some(custom) => custom,
-        };
+        }
+    }
 
+    pub fn optimizer_thresholds(&self, num_indexing_threads: usize) -> OptimizerThresholds {
+        let indexing_threshold_kb = self.get_indexing_threshold_kb();
+
+        #[expect(deprecated)]
         let memmap_threshold_kb = match self.memmap_threshold {
             None | Some(0) => usize::MAX, // default | disable memmap
             Some(custom) => custom,
@@ -137,12 +159,10 @@ impl OptimizersConfig {
 pub fn clear_temp_segments(shard_path: &Path) {
     let temp_segments_path = shard_path.join(TEMP_SEGMENTS_PATH);
     if temp_segments_path.exists() {
-        log::debug!("Removing temp_segments directory: {:?}", temp_segments_path);
-        if let Err(err) = std::fs::remove_dir_all(&temp_segments_path) {
+        log::debug!("Removing temp_segments directory: {temp_segments_path:?}");
+        if let Err(err) = fs::remove_dir_all(&temp_segments_path) {
             log::warn!(
-                "Failed to remove temp_segments directory: {:?}, error: {:?}",
-                temp_segments_path,
-                err
+                "Failed to remove temp_segments directory: {temp_segments_path:?}, error: {err:?}"
             );
         }
     }
@@ -153,6 +173,7 @@ pub fn build_optimizers(
     collection_params: &CollectionParams,
     optimizers_config: &OptimizersConfig,
     hnsw_config: &HnswConfig,
+    hnsw_global_config: &HnswGlobalConfig,
     quantization_config: &Option<QuantizationConfig>,
 ) -> Arc<Vec<Arc<Optimizer>>> {
     let num_indexing_threads = num_rayon_threads(hnsw_config.max_indexing_threads);
@@ -167,7 +188,8 @@ pub fn build_optimizers(
             segments_path.clone(),
             temp_segments_path.clone(),
             collection_params.clone(),
-            hnsw_config.clone(),
+            *hnsw_config,
+            hnsw_global_config.clone(),
             quantization_config.clone(),
         )),
         Arc::new(IndexingOptimizer::new(
@@ -176,7 +198,8 @@ pub fn build_optimizers(
             segments_path.clone(),
             temp_segments_path.clone(),
             collection_params.clone(),
-            hnsw_config.clone(),
+            *hnsw_config,
+            hnsw_global_config.clone(),
             quantization_config.clone(),
         )),
         Arc::new(VacuumOptimizer::new(
@@ -186,7 +209,8 @@ pub fn build_optimizers(
             segments_path.clone(),
             temp_segments_path.clone(),
             collection_params.clone(),
-            hnsw_config.clone(),
+            *hnsw_config,
+            hnsw_global_config.clone(),
             quantization_config.clone(),
         )),
         Arc::new(ConfigMismatchOptimizer::new(
@@ -194,7 +218,8 @@ pub fn build_optimizers(
             segments_path,
             temp_segments_path,
             collection_params.clone(),
-            hnsw_config.clone(),
+            *hnsw_config,
+            hnsw_global_config.clone(),
             quantization_config.clone(),
         )),
     ])

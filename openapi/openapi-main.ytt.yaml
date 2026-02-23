@@ -8,7 +8,6 @@ security:
 info:
   title: Qdrant API
   description: >
-
     API description for Qdrant vector search engine.
 
 
@@ -67,7 +66,6 @@ info:
     {
       "result": {
         "status": "green",
-        "vectors_count": 0,
         "segments_count": 5,
         "disk_data_size": 0,
         "ram_data_size": 0,
@@ -528,10 +526,10 @@ paths:
         Since the score of a context relates to loss, the maximum score a point can get is 0.0,
         and it becomes normal that many points can have a score of 0.0.
 
-        When using target (with or without context), the score behaves a little different: The 
+        When using target (with or without context), the score behaves a little different: The
         integer part of the score represents the rank with respect to the context, while the
-        decimal part of the score relates to the distance to the target. The context part of the score for 
-        each pair is calculated +1 if the point is closer to a positive than to a negative part of a pair, 
+        decimal part of the score relates to the distance to the target. The context part of the score for
+        each pair is calculated +1 if the point is closer to a positive than to a negative part of a pair,
         and -1 otherwise.
       operationId: discover_points
       requestBody:
@@ -621,6 +619,12 @@ paths:
           required: true
           schema:
             type: string
+        - name: consistency
+          in: query
+          description: Define read consistency guarantees for the operation
+          required: false
+          schema:
+            $ref: "#/components/schemas/ReadConsistency"
         - name: timeout
           in: query
           description: If set, overrides global timeout for this request. Unit is seconds.
@@ -651,6 +655,12 @@ paths:
           required: true
           schema:
             type: string
+        - name: consistency
+          in: query
+          description: Define read consistency guarantees for the operation
+          required: false
+          schema:
+            $ref: "#/components/schemas/ReadConsistency"
         - name: timeout
           in: query
           description: If set, overrides global timeout for this request. Unit is seconds.
@@ -658,14 +668,8 @@ paths:
           schema:
             type: integer
             minimum: 1
-        - name: consistency
-          in: query
-          description: Define read consistency guarantees for the operation
-          required: false
-          schema:
-            $ref: "#/components/schemas/ReadConsistency"
       responses: #@ response(reference("FacetResponse"))
-      
+
   /collections/{collection_name}/points/query:
     post:
       tags:
@@ -673,13 +677,13 @@ paths:
       summary: Query points
       description: Universally query points. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries.
       operationId: query_points
-      requestBody: 
+      requestBody:
         description: Describes the query to make to the collection
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/QueryRequest"
-              
+
 
       parameters:
         - name: collection_name

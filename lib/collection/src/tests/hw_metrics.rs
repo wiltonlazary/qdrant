@@ -1,24 +1,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::{HwMeasurementAcc, HwSharedDrain};
-use common::cpu::CpuBudget;
+use common::save_on_disk::SaveOnDisk;
 use rand::rngs::ThreadRng;
-use rand::{rng, RngCore};
-use segment::data_types::vectors::{
-    NamedVector, NamedVectorStruct, VectorStructInternal, DEFAULT_VECTOR_NAME,
-};
+use rand::{RngCore, rng};
+use segment::data_types::vectors::{NamedQuery, VectorInternal, VectorStructInternal};
+use shard::query::query_enum::QueryEnum;
+use shard::search::CoreSearchRequestBatch;
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
+use crate::operations::CollectionUpdateOperations;
 use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted,
 };
-use crate::operations::query_enum::QueryEnum;
-use crate::operations::types::{CollectionError, CoreSearchRequest, CoreSearchRequestBatch};
-use crate::operations::CollectionUpdateOperations;
-use crate::save_on_disk::SaveOnDisk;
+use crate::operations::types::{CollectionError, CoreSearchRequest};
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::ShardOperation;
 use crate::tests::fixtures::create_collection_config_with_dim;
@@ -48,7 +47,7 @@ async fn test_hw_metrics_cancellation() {
         payload_index_schema.clone(),
         current_runtime.clone(),
         current_runtime.clone(),
-        CpuBudget::default(),
+        ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
     .await
@@ -56,17 +55,17 @@ async fn test_hw_metrics_cancellation() {
 
     let upsert_ops = make_random_points_upsert_op(10_000);
     shard
-        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .update(upsert_ops.into(), true, None, HwMeasurementAcc::new())
         .await
         .unwrap();
 
     let mut rand = rng();
     let req = CoreSearchRequestBatch {
         searches: vec![CoreSearchRequest {
-            query: QueryEnum::Nearest(NamedVectorStruct::Dense(NamedVector {
-                name: DEFAULT_VECTOR_NAME.to_owned(),
-                vector: rand_vector(512, &mut rand),
-            })),
+            query: QueryEnum::Nearest(NamedQuery {
+                using: None,
+                query: VectorInternal::from(rand_vector(512, &mut rand)),
+            }),
             filter: None,
             params: None,
             limit: 1010,
@@ -77,7 +76,7 @@ async fn test_hw_metrics_cancellation() {
         }],
     };
 
-    let outer_hw = HwSharedDrain::default();
+    let outer_hw = Arc::new(HwSharedDrain::default());
 
     {
         let hw_counter = HwMeasurementAcc::new_with_metrics_drain(outer_hw.clone());
@@ -85,7 +84,7 @@ async fn test_hw_metrics_cancellation() {
             .do_search(
                 Arc::new(req),
                 &current_runtime,
-                Some(Duration::from_millis(10)), // Very short duration to hit timeout before the search finishes
+                Duration::from_millis(10), // Very short duration to hit timeout before the search finishes
                 hw_counter,
             )
             .await;

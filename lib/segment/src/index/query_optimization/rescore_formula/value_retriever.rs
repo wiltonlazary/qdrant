@@ -5,13 +5,14 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::{Number, Value};
 
+use crate::common::utils::MultiValue;
 use crate::index::field_index::FieldIndex;
 use crate::index::query_optimization::payload_provider::PayloadProvider;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::json_path::JsonPath;
 use crate::types::{DateTimePayloadType, PayloadContainer, UuidPayloadType};
 
-pub type VariableRetrieverFn<'a> = Box<dyn Fn(PointOffsetType) -> Option<Value> + 'a>;
+pub type VariableRetrieverFn<'a> = Box<dyn Fn(PointOffsetType) -> MultiValue<Value> + 'a>;
 
 impl StructPayloadIndex {
     /// Prepares optimized functions to extract each of the variables, given a point id.
@@ -68,14 +69,30 @@ fn payload_variable_retriever(
     payload_provider: PayloadProvider,
     json_path: JsonPath,
     hw_counter: &HardwareCounterCell,
-) -> VariableRetrieverFn {
+) -> VariableRetrieverFn<'_> {
     let retriever_fn = move |point_id: PointOffsetType| {
         payload_provider.with_payload(
             point_id,
             |payload| {
-                let values = payload.get_value(&json_path);
-                let value = *values.first()?;
-                Some(value.clone())
+                let values = payload.get_value_cloned(&json_path);
+
+                if json_path.has_wildcard_suffix() {
+                    return values;
+                }
+
+                // Not using array wildcard `[]` on a key which has an array value will return the whole
+                // array as one value, let's flatten the array if that is the case.
+                //
+                // This is the same thing we do for indexing payload values
+                let mut multi_value = MultiValue::new();
+                for value in values {
+                    if let Value::Array(array) = value {
+                        multi_value.extend(array);
+                    } else {
+                        multi_value.push(value);
+                    }
+                }
+                multi_value
             },
             hw_counter,
         )
@@ -83,98 +100,114 @@ fn payload_variable_retriever(
     Box::new(retriever_fn)
 }
 
-/// Returns function to extract the first number a point may have from the index
+/// Returns function to extract all the values a point has in the index
 ///
 /// If there is no appropriate index, returns None
-fn indexed_variable_retriever(index: &FieldIndex) -> Option<VariableRetrieverFn> {
+fn indexed_variable_retriever(index: &FieldIndex) -> Option<VariableRetrieverFn<'_>> {
     match index {
         FieldIndex::IntIndex(numeric_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 numeric_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .map(|value| Value::Number(Number::from(value)))
+                    .into_iter()
+                    .flatten()
+                    .map(|v| Value::Number(Number::from(v)))
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::IntMapIndex(map_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 map_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .map(|&value| Value::Number(Number::from(value)))
+                    .into_iter()
+                    .flatten()
+                    .map(|v| Value::Number(Number::from(*v)))
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::FloatIndex(numeric_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 numeric_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .and_then(Number::from_f64)
-                    .map(Value::Number)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| Some(Value::Number(Number::from_f64(v)?)))
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::DatetimeIndex(numeric_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 numeric_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .and_then(DateTimePayloadType::from_timestamp)
-                    .and_then(|dt| serde_json::to_value(dt).ok())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| {
+                        serde_json::to_value(DateTimePayloadType::from_timestamp(v)?).ok()
+                    })
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::KeywordIndex(keyword_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 keyword_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .map(|s| Value::String(s.to_owned()))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| serde_json::to_value(v).ok())
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::GeoIndex(geo_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 geo_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .and_then(|value| serde_json::to_value(value).ok())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| serde_json::to_value(v).ok())
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
 
         FieldIndex::BoolIndex(bool_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 bool_index
                     .get_point_values(point_id)
-                    .first()
-                    .map(|&value| Value::Bool(value))
+                    .into_iter()
+                    .map(Value::Bool)
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::UuidMapIndex(uuid_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 uuid_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .map(|value| UuidPayloadType::from_u128(*value))
-                    .map(|value| Value::String(value.to_string()))
+                    .into_iter()
+                    .flatten()
+                    .map(|value| Value::String(UuidPayloadType::from_u128(*value).to_string()))
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::UuidIndex(uuid_index) => {
-            let extract_fn = move |point_id: PointOffsetType| -> Option<Value> {
+            let extract_fn = move |point_id: PointOffsetType| -> MultiValue<Value> {
                 uuid_index
                     .get_values(point_id)
-                    .and_then(|mut values| values.next())
-                    .map(UuidPayloadType::from_u128)
-                    .map(|value| Value::String(value.to_string()))
+                    .into_iter()
+                    .flatten()
+                    .map(|value| Value::String(UuidPayloadType::from_u128(value).to_string()))
+                    .collect()
             };
             Some(Box::new(extract_fn))
         }
         FieldIndex::FullTextIndex(_) => None, // Better get it from the payload
+        FieldIndex::NullIndex(_) => None,     // There should be other index for the same field
     }
 }
 
@@ -185,8 +218,10 @@ mod tests {
     use std::sync::Arc;
 
     use atomic_refcell::AtomicRefCell;
-    use serde_json::{from_value, json};
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use serde_json::{Value, from_value, json};
 
+    use crate::common::utils::MultiValue;
     use crate::index::field_index::geo_index::GeoMapIndex;
     use crate::index::field_index::numeric_index::NumericIndex;
     use crate::index::field_index::{FieldIndex, FieldIndexBuilderTrait};
@@ -201,13 +236,13 @@ mod tests {
         let mut in_memory_storage = InMemoryPayloadStorage::default();
 
         // For point id 0: a payload with a numeric value.
-        let payload1: Payload = from_value(json!({
+        let payload0: Payload = from_value(json!({
             "value": 42
         }))
         .unwrap();
 
         // For point id 1: a payload with a geo point.
-        let payload2: Payload = from_value(json!({
+        let payload1: Payload = from_value(json!({
             "location": {
                 "lat": 10.0,
                 "lon": 20.0
@@ -216,7 +251,7 @@ mod tests {
         .unwrap();
 
         // For point id 2: a payload containing both a number and a geo point.
-        let payload3: Payload = from_value(json!({
+        let payload2: Payload = from_value(json!({
             "value": [99, 55],
             "location": {
                 "lat": 15.5,
@@ -225,10 +260,21 @@ mod tests {
         }))
         .unwrap();
 
+        // For point id 3: a payload with an array of 1 number, and an array of 1 geo point.
+        let payload3: Payload = from_value(json!({
+            "value": [42.5],
+            "location": [{
+                "lat": 16.5,
+                "lon": 26.5
+            }]
+        }))
+        .unwrap();
+
         // Insert the payloads into the in-memory storage.
-        in_memory_storage.payload.insert(0, payload1);
-        in_memory_storage.payload.insert(1, payload2);
-        in_memory_storage.payload.insert(2, payload3);
+        in_memory_storage.payload.insert(0, payload0);
+        in_memory_storage.payload.insert(1, payload1);
+        in_memory_storage.payload.insert(2, payload2);
+        in_memory_storage.payload.insert(3, payload3);
 
         // Wrap the in-memory storage in a PayloadStorageEnum.
         let storage_enum = PayloadStorageEnum::InMemoryPayloadStorage(in_memory_storage);
@@ -252,12 +298,13 @@ mod tests {
             payload_provider.clone(),
             &hw_counter,
         );
-        for id in 0..2 {
+        for id in 0..=3 {
             let value = retriever(id);
             match id {
-                0 => assert_eq!(value, Some(json!(42))),
-                1 => assert_eq!(value, None),
-                2 => assert_eq!(value, Some(json!(99.0))),
+                0 => assert_eq!(value, [json!(42)].into()),
+                1 => assert_eq!(value, MultiValue::<Value>::new()),
+                2 => assert_eq!(value, [json!(99), json!(55)].into()),
+                3 => assert_eq!(value, [json!(42.5)].into()),
                 _ => unreachable!(),
             }
         }
@@ -269,12 +316,13 @@ mod tests {
             payload_provider.clone(),
             &hw_counter,
         );
-        for id in 0..2 {
+        for id in 0..=3 {
             let value = retriever(id);
             match id {
-                0 => assert_eq!(value, None),
-                1 => assert_eq!(value, Some(json!({ "lat": 10.0, "lon": 20.0 }))),
-                2 => assert_eq!(value, Some(json!({ "lat": 15.5, "lon": 25.5 }))),
+                0 => assert_eq!(value, MultiValue::<Value>::new()),
+                1 => assert_eq!(value, [json!({ "lat": 10.0, "lon": 20.0 })].into()),
+                2 => assert_eq!(value, [json!({ "lat": 15.5, "lon": 25.5 })].into()),
+                3 => assert_eq!(value, [json!({ "lat": 16.5, "lon": 26.5 })].into()),
                 _ => unreachable!(),
             }
         }
@@ -286,33 +334,55 @@ mod tests {
         let payload_provider = PayloadProvider::new(Arc::new(AtomicRefCell::new(
             PayloadStorageEnum::InMemoryPayloadStorage(InMemoryPayloadStorage::default()),
         )));
+        let hw_counter = HardwareCounterCell::new();
 
         // Create a field index for a number.
         let dir = tempfile::tempdir().unwrap();
-        let mut builder = NumericIndex::builder_mmap(dir.path());
-        builder.add_point(0, &[&42.into()]).unwrap();
-        builder.add_point(1, &[]).unwrap();
-        builder.add_point(2, &[&99.into(), &55.into()]).unwrap();
+        let mut builder = NumericIndex::builder_mmap(dir.path(), false);
+        builder.add_point(0, &[&42.into()], &hw_counter).unwrap();
+        builder.add_point(1, &[], &hw_counter).unwrap();
+        builder
+            .add_point(2, &[&99.into(), &55.into()], &hw_counter)
+            .unwrap();
         let numeric_index = builder.finalize().unwrap();
         let numeric_index = FieldIndex::IntIndex(numeric_index);
 
         // Create a field index for a geo point.
         let dir = tempfile::tempdir().unwrap();
-        let mut builder = GeoMapIndex::mmap_builder(dir.path());
+        let mut builder = GeoMapIndex::builder_mmap(dir.path(), false);
 
-        builder.add_point(0, &[]).unwrap();
+        builder.add_point(0, &[], &hw_counter).unwrap();
         builder
-            .add_point(1, &[&json!({ "lat": 10.0, "lon": 20.0})])
+            .add_point(1, &[&json!({ "lat": 10.0, "lon": 20.0})], &hw_counter)
             .unwrap();
         builder
-            .add_point(2, &[&json!({"lat": 15.5, "lon": 25.5})])
+            .add_point(2, &[&json!({"lat": 15.5, "lon": 25.5})], &hw_counter)
             .unwrap();
         let geo_index = builder.finalize().unwrap();
         let geo_index = FieldIndex::GeoIndex(geo_index);
 
+        // Create a field index for datetime
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = NumericIndex::builder_mmap(dir.path(), false);
+
+        builder
+            .add_point(0, &[&json!("2023-01-01T00:00:00Z")], &hw_counter)
+            .unwrap();
+        builder
+            .add_point(
+                1,
+                &[&json!("2023-01-02"), &json!("2023-01-03T00:00:00Z")],
+                &hw_counter,
+            )
+            .unwrap();
+        builder.add_point(2, &[], &hw_counter).unwrap();
+        let datetime_index = builder.finalize().unwrap();
+        let datetime_index = FieldIndex::DatetimeIndex(datetime_index);
+
         let mut indices = HashMap::new();
         indices.insert("value".try_into().unwrap(), vec![numeric_index]);
         indices.insert("location".try_into().unwrap(), vec![geo_index]);
+        indices.insert("creation".try_into().unwrap(), vec![datetime_index]);
 
         let hw_counter = Default::default();
 
@@ -323,12 +393,12 @@ mod tests {
             payload_provider.clone(),
             &hw_counter,
         );
-        for id in 0..2 {
+        for id in 0..=2 {
             let value = retriever(id);
             match id {
-                0 => assert_eq!(value, Some(json!(42))),
-                1 => assert_eq!(value, None),
-                2 => assert_eq!(value, Some(json!(99))),
+                0 => assert_eq!(value, [json!(42)].into()),
+                1 => assert_eq!(value, MultiValue::<Value>::new()),
+                2 => assert_eq!(value, [json!(99), json!(55)].into()),
                 _ => unreachable!(),
             }
         }
@@ -340,12 +410,32 @@ mod tests {
             payload_provider.clone(),
             &hw_counter,
         );
-        for id in 0..2 {
+        for id in 0..=2 {
             let value = retriever(id);
             match id {
-                0 => assert_eq!(value, None),
-                1 => assert_eq!(value, Some(json!({ "lat": 10.0, "lon": 20.0 }))),
-                2 => assert_eq!(value, Some(json!({ "lat": 15.5, "lon": 25.5 }))),
+                0 => assert_eq!(value, MultiValue::<Value>::new()),
+                1 => assert_eq!(value, [json!({ "lat": 10.0, "lon": 20.0 })].into()),
+                2 => assert_eq!(value, [json!({ "lat": 15.5, "lon": 25.5 })].into()),
+                _ => unreachable!(),
+            }
+        }
+
+        // Test retrieving a datetime from the index.
+        let retriever = variable_retriever(
+            &indices,
+            &"creation".try_into().unwrap(),
+            payload_provider.clone(),
+            &hw_counter,
+        );
+        for id in 0..=2 {
+            let value = retriever(id);
+            match id {
+                0 => assert_eq!(value, [json!("2023-01-01T00:00:00Z")].into()),
+                1 => assert_eq!(
+                    value,
+                    [json!("2023-01-02T00:00:00Z"), json!("2023-01-03T00:00:00Z")].into()
+                ),
+                2 => assert_eq!(value, MultiValue::<Value>::new()),
                 _ => unreachable!(),
             }
         }

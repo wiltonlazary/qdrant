@@ -1,6 +1,8 @@
 use std::path::Path;
-use std::{fs, io, result};
+use std::{io, result};
 
+use common::defaults::APP_USER_AGENT;
+use fs_err as fs;
 use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue};
 use storage::content_manager::errors::StorageError;
 
@@ -61,11 +63,39 @@ fn https_client(
     tls_config: Option<&TlsConfig>,
     verify_https_client_certificate: bool,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().user_agent(APP_USER_AGENT.as_str());
 
     // Configure TLS root certificate and validation
     if let Some(tls_config) = tls_config {
-        builder = builder.add_root_certificate(https_client_ca_cert(tls_config.ca_cert.as_ref())?);
+        if let Some(ca_cert) = &tls_config.ca_cert {
+            match https_client_ca_cert(ca_cert) {
+                Ok(ca_cert) => builder = builder.add_root_certificate(ca_cert),
+                Err(err) => {
+                    // I think it might be Ok to not fail here, if root certificate is not found
+                    // There are 2 possible scenarios:
+                    //
+                    // 1. Server TLS is either not used or it uses some other CA certificate (like global one)
+                    // 2. Server TLS is using self-signed certificate, and we should have it.
+                    //
+                    // In first case, we don't need to load the CA certificate, everything will work in either case.
+                    // In second case, we should have the CA certificate, request will fail because of invalid certificate.
+                    //
+                    // So both scenarios work exactly the same way if we fail early or not.
+                    // Warning message is needed for easier debugging in case of second scenario.
+                    log::warn!(
+                        "Failed to load CA certificate, skipping HTTPS client CA certificate configuration: {err}",
+                    );
+                }
+            }
+        } else if !verify_https_client_certificate {
+            // If ca_cert is not provided, and we are not verifying client certificate,
+            // there is no way to verify https connection.
+            //
+            // So we have to disable certificate verification in order to be able to connect to the server.
+            builder = builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        }
 
         if verify_https_client_certificate {
             builder = builder.identity(https_client_identity(
@@ -89,9 +119,9 @@ fn https_client(
     Ok(client)
 }
 
-fn https_client_ca_cert(ca_cert: &Path) -> Result<reqwest::tls::Certificate> {
-    let ca_cert_pem =
-        fs::read(ca_cert).map_err(|err| Error::failed_to_read(err, "CA certificate", ca_cert))?;
+fn https_client_ca_cert(ca_cert: impl AsRef<Path>) -> Result<reqwest::tls::Certificate> {
+    let ca_cert_pem = fs::read(ca_cert.as_ref())
+        .map_err(|err| Error::failed_to_read(err, "CA certificate", ca_cert.as_ref()))?;
 
     let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)?;
 
@@ -151,6 +181,6 @@ impl From<Error> for StorageError {
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
-        io::Error::new(io::ErrorKind::Other, err)
+        io::Error::other(err)
     }
 }

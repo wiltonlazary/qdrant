@@ -1,17 +1,18 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use segment::fixtures::payload_context_fixture::{
-    create_payload_storage_fixture, create_plain_payload_index, create_struct_payload_index,
-    FixtureIdTracker,
+    FixtureIdTracker, create_payload_storage_fixture, create_plain_payload_index,
+    create_struct_payload_index,
 };
 use segment::fixtures::payload_fixtures::BOOL_KEY;
-use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::index::PayloadIndex;
+use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::types::{Condition, FieldCondition, Filter, Match, PayloadSchemaType, ValueVariants};
 use tempfile::Builder;
 
@@ -38,12 +39,16 @@ pub fn plain_boolean_query_points(c: &mut Criterion) {
     let mut result_size = 0;
     let mut query_count = 0;
 
+    let is_stopped = AtomicBool::new(false);
+
     let hw_counter = HardwareCounterCell::new();
 
     group.bench_function("plain", |b| {
         b.iter(|| {
             let filter = random_bool_filter(&mut rng);
-            result_size += plain_index.query_points(&filter, &hw_counter).len();
+            result_size += plain_index
+                .query_points(&filter, &hw_counter, &is_stopped)
+                .len();
             query_count += 1;
         })
     });
@@ -66,12 +71,16 @@ pub fn struct_boolean_query_points(c: &mut Criterion) {
     let mut group = c.benchmark_group("boolean-query-points");
     let hw_counter = HardwareCounterCell::new();
 
+    let is_stopped = AtomicBool::new(false);
+
     let mut result_size = 0;
     let mut query_count = 0;
     group.bench_function("binary-index", |b| {
         b.iter(|| {
             let filter = random_bool_filter(&mut rng);
-            result_size += struct_index.query_points(&filter, &hw_counter).len();
+            result_size += struct_index
+                .query_points(&filter, &hw_counter, &is_stopped)
+                .len();
             query_count += 1;
         })
     });
@@ -104,12 +113,19 @@ pub fn keyword_index_boolean_query_points(c: &mut Criterion) {
         std::collections::HashMap::new(),
         dir.path(),
         true,
+        true,
     )
     .unwrap();
 
     index
-        .set_indexed(&BOOL_KEY.parse().unwrap(), PayloadSchemaType::Keyword)
+        .set_indexed(
+            &BOOL_KEY.parse().unwrap(),
+            PayloadSchemaType::Keyword,
+            &hw_counter,
+        )
         .unwrap();
+
+    let is_stopped = AtomicBool::new(false);
 
     let mut group = c.benchmark_group("boolean-query-points");
 
@@ -118,7 +134,7 @@ pub fn keyword_index_boolean_query_points(c: &mut Criterion) {
     group.bench_function("keyword-index", |b| {
         b.iter(|| {
             let filter = random_bool_filter(&mut rng);
-            result_size += index.query_points(&filter, &hw_counter).len();
+            result_size += index.query_points(&filter, &hw_counter, &is_stopped).len();
             query_count += 1;
         })
     });

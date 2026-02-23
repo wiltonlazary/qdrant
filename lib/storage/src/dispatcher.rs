@@ -1,18 +1,21 @@
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::rest::models::HardwareUsage;
+use collection::common::fetch_vectors::CollectionName;
 use collection::config::ShardingMethod;
 use collection::operations::verification::VerificationPass;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use common::counter::hardware_accumulator::HwSharedDrain;
 use common::defaults::CONSENSUS_META_OP_WAIT;
-use segment::types::default_shard_number_per_node_const;
+use futures::StreamExt as _;
+use futures::stream::FuturesUnordered;
+use segment::types::ShardKey;
 
 use crate::content_manager::collection_meta_ops::AliasOperations;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
-use crate::rbac::Access;
+use crate::rbac::{Auth, CollectionMultipass};
 use crate::{
     ClusterStatus, CollectionMetaOperations, ConsensusOperations, ConsensusStateRef, StorageError,
     TableOfContent,
@@ -43,13 +46,9 @@ impl Dispatcher {
     }
 
     /// Get the table of content.
-    /// The `_access` and `_verification_pass` parameter are not used, but it's required to verify caller's possession
+    /// The `_auth` and `_verification_pass` parameter are not used, but it's required to verify caller's possession
     /// of both objects.
-    pub fn toc(
-        &self,
-        _access: &Access,
-        _verification_pass: &VerificationPass,
-    ) -> &Arc<TableOfContent> {
+    pub fn toc(&self, _auth: &Auth, _verification_pass: &VerificationPass) -> &Arc<TableOfContent> {
         &self.toc
     }
 
@@ -62,14 +61,21 @@ impl Dispatcher {
     }
 
     /// If `wait_timeout` is not supplied - then default duration will be used.
+    ///
     /// This function needs to be called from a runtime with timers enabled.
+    ///
+    /// ## Cancel safety
+    ///
+    /// This function is cancel safe.
+    ///
+    /// On deployments without consensus - a submitted operation is always run to completion.
     pub async fn submit_collection_meta_op(
         &self,
         operation: CollectionMetaOperations,
-        access: Access,
+        auth: Auth,
         wait_timeout: Option<Duration>,
     ) -> Result<bool, StorageError> {
-        access.check_collection_meta_operation(&operation)?;
+        auth.check_collection_meta_operation(&operation)?;
 
         // if distributed deployment is enabled
         if let Some(state) = self.consensus_state.as_ref() {
@@ -80,27 +86,19 @@ impl Dispatcher {
 
             let op = match operation {
                 CollectionMetaOperations::CreateCollection(mut op) => {
-                    self.toc.check_write_lock()?;
                     if !op.is_distribution_set() {
                         match op.create_collection.sharding_method.unwrap_or_default() {
                             ShardingMethod::Auto => {
                                 // Suggest even distribution of shards across nodes
                                 let number_of_peers = state.0.peer_count();
 
-                                let shard_nr_per_node = self
-                                    .toc
-                                    .storage_config
-                                    .collection
-                                    .as_ref()
-                                    .map(|i| i.shard_number_per_node)
-                                    .unwrap_or(default_shard_number_per_node_const());
-
-                                let suggested_shard_nr = number_of_peers as u32 * shard_nr_per_node;
+                                let collection_defaults =
+                                    self.toc.storage_config.collection.as_ref();
 
                                 let shard_distribution = self.toc.suggest_shard_distribution(
                                     &op,
-                                    NonZeroU32::new(suggested_shard_nr)
-                                        .expect("Peer count should be always >= 1"),
+                                    collection_defaults,
+                                    number_of_peers,
                                 );
 
                                 // Expect all replicas to become active eventually
@@ -140,7 +138,6 @@ impl Dispatcher {
                     CollectionMetaOperations::CreateCollection(op)
                 }
                 CollectionMetaOperations::CreateShardKey(op) => {
-                    self.toc.check_write_lock()?;
                     CollectionMetaOperations::CreateShardKey(op)
                 }
 
@@ -182,8 +179,34 @@ impl Dispatcher {
                 | CollectionMetaOperations::CreatePayloadIndex(_)
                 | CollectionMetaOperations::DropPayloadIndex(_)
                 | CollectionMetaOperations::Nop { .. } => false,
+
+                #[cfg(feature = "staging")]
+                CollectionMetaOperations::TestSlowDown(_) => false,
             };
 
+            // During creation of a shard key, we must ensure that all replicas are ready to accept
+            // write requests, so the client-side script can rely on the fact that the
+            // shard creation request is complete.
+            //
+            // For this we explicitly wait for validation this, we do following checks:
+            //
+            // 1. Wait for consensus to accept shard create operation on current machine.
+            //    ( here newly created shards should start to report state change from `Inactive` to `Active` )
+            // 2. Wait for all local shards to become active.
+            //    ( At this stage we are sure, that all consensus operations are created, but might not be applied everywhere )
+            // 3. Wait for all remote peers to have at least the same state as the current peer.
+            //    ( So we are sure, that all remote peers have also switched to `Active` state )
+            let create_shard_key = match &op {
+                CollectionMetaOperations::CreateShardKey(op) => {
+                    let collection_name: CollectionName = op.collection_name.clone();
+                    let shard_key = op.shard_key.clone();
+                    let initial_state = op.initial_state;
+                    Some((collection_name, shard_key, initial_state))
+                }
+                _ => None,
+            };
+
+            // Send operation to consensus and wait for it to be applied locally
             let res = state
                 .propose_consensus_op_with_await(
                     ConsensusOperations::CollectionMeta(Box::new(op)),
@@ -196,27 +219,40 @@ impl Dispatcher {
                 match operation_awaiter.await {
                     Ok(Ok(())) => {} // all good
                     Ok(Err(err)) => {
-                        log::warn!("Not all expected operations were completed: {}", err)
+                        log::warn!("Not all expected operations were completed: {err}")
                     }
-                    Err(err) => log::warn!("Awaiting for expected operations timed out: {}", err),
+                    Err(err) => log::warn!("Awaiting for expected operations timed out: {err}"),
                 }
             }
+
+            // Wait for shards activation
+            if let Some((collection_name, shard_key, initial_state)) = create_shard_key
+                && initial_state.is_none()
+            {
+                // Only do if initial state is not set because we only wanted to wait for Active since introducing
+                // the Initial state which needs a transition to Active.
+                let remaining_timeout =
+                    wait_timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
+                self.wait_for_shard_key_activation(collection_name, shard_key, remaining_timeout)
+                    .await?;
+            };
 
             // On some operations, synchronize all nodes to ensure all are ready for point operations
             if do_sync_nodes {
                 let remaining_timeout =
                     wait_timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
                 if let Err(err) = self.await_consensus_sync(remaining_timeout).await {
-                    log::warn!("Failed to synchronize all nodes after collection operation in time, some nodes may not be ready: {err}");
+                    log::warn!(
+                        "Failed to synchronize all nodes after collection operation in time, some nodes may not be ready: {err}",
+                    );
                 }
             }
 
             Ok(res)
         } else {
-            if let CollectionMetaOperations::CreateCollection(_) = &operation {
-                self.toc.check_write_lock()?;
-            }
-            self.toc.perform_collection_meta_op(operation).await
+            let toc = self.toc.clone();
+            tokio::task::spawn(async move { toc.perform_collection_meta_op(operation).await })
+                .await?
         }
     }
 
@@ -233,27 +269,69 @@ impl Dispatcher {
     ) -> Result<(), StorageError> {
         let timeout = timeout.unwrap_or(CONSENSUS_META_OP_WAIT);
 
-        if let Some(state) = self.consensus_state.as_ref() {
-            let state = state.hard_state();
-            let term = state.term;
-            let commit = state.commit;
-            let channel_service = self.toc.get_channel_service();
-            let this_peer_id = self.toc.this_peer_id;
+        let Some(state) = self.consensus_state.as_ref() else {
+            return Ok(());
+        };
 
-            channel_service
-                .await_commit_on_all_peers(this_peer_id, commit, term, timeout)
-                .await?;
+        let state = state.hard_state();
+        let term = state.term;
+        let commit = state.commit;
+        let channel_service = self.toc.get_channel_service();
+        let this_peer_id = self.toc.this_peer_id;
 
-            log::debug!(
-                "Consensus is synchronized with term: {}, commit: {}",
-                term,
-                commit
-            );
+        channel_service
+            .await_commit_on_all_peers(this_peer_id, commit, term, timeout)
+            .await?;
 
-            Ok(())
-        } else {
-            Ok(())
+        log::debug!("Consensus is synchronized with term: {term}, commit: {commit}");
+
+        Ok(())
+    }
+
+    /// Waits for all shards of a specific shard key to become active.
+    pub async fn wait_for_shard_key_activation(
+        &self,
+        collection_name: CollectionName,
+        shard_key: ShardKey,
+        timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        let timeout = timeout.unwrap_or(CONSENSUS_META_OP_WAIT);
+
+        let mut wait_for_active = FuturesUnordered::new();
+
+        {
+            let shard_holder = self
+                .toc
+                .get_collection(&CollectionMultipass.issue_pass(&collection_name))
+                .await?
+                .shards_holder()
+                .read_owned()
+                .await;
+
+            for replica_set in shard_holder.all_shards() {
+                if replica_set.shard_key() != Some(&shard_key) {
+                    continue;
+                }
+
+                for (peer_id, replica_state) in replica_set.peers() {
+                    if replica_state == ReplicaState::Active {
+                        continue;
+                    }
+
+                    wait_for_active.push(replica_set.wait_for_state(
+                        peer_id,
+                        ReplicaState::Active,
+                        timeout,
+                    ));
+                }
+            }
         }
+
+        while let Some(result) = wait_for_active.next().await {
+            result?;
+        }
+
+        Ok(())
     }
 
     pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
@@ -261,7 +339,7 @@ impl Dispatcher {
     }
 
     #[must_use]
-    pub fn get_collection_hw_metrics(&self, collection: String) -> HwSharedDrain {
+    pub fn get_collection_hw_metrics(&self, collection: String) -> Arc<HwSharedDrain> {
         self.toc.get_collection_hw_metrics(collection)
     }
 }

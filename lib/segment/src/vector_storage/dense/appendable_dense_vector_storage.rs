@@ -1,88 +1,97 @@
 use std::borrow::Cow;
-use std::fs::create_dir_all;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::mmap::AdviceSetting;
 use common::types::PointOffsetType;
-use memory::madvise::AdviceSetting;
+use fs_err as fs;
 
-use crate::common::operation_error::{check_process_stopped, OperationResult};
 use crate::common::Flusher;
+use crate::common::flags::bitvec_flags::BitvecFlags;
+use crate::common::flags::dynamic_mmap_flags::DynamicMmapFlags;
+use crate::common::operation_error::{OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
-use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
-use crate::vector_storage::dense::dynamic_mmap_flags::DynamicMmapFlags;
-use crate::vector_storage::in_ram_persisted_vectors::InRamPersistedVectors;
-use crate::vector_storage::{DenseVectorStorage, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{
+    AccessPattern, DenseVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum,
+};
 
 const VECTORS_DIR_PATH: &str = "vectors";
 const DELETED_DIR_PATH: &str = "deleted";
 
 #[derive(Debug)]
-pub struct AppendableMmapDenseVectorStorage<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> {
-    vectors: S,
-    deleted: DynamicMmapFlags,
+pub struct AppendableMmapDenseVectorStorage<T: PrimitiveVectorElement> {
+    vectors: ChunkedMmapVectors<T>,
+    /// Flags marking deleted vectors
+    ///
+    /// Structure grows dynamically, but may be smaller than actual number of vectors. Must not
+    /// depend on its length.
+    deleted: BitvecFlags,
     distance: Distance,
     deleted_count: usize,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> AppendableMmapDenseVectorStorage<T, S> {
+impl<T: PrimitiveVectorElement> AppendableMmapDenseVectorStorage<T> {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
-    fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> OperationResult<bool> {
+    fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> bool {
         if !deleted && self.vectors.len() <= key as usize {
-            return Ok(false);
+            return false;
         }
 
-        if self.deleted.len() <= key as usize {
-            self.deleted.set_len(key as usize + 1)?;
-        }
+        // mark deletion
         let previous = self.deleted.set(key, deleted);
+
+        // update counter
         if !previous && deleted {
             self.deleted_count += 1;
         } else if previous && !deleted {
             self.deleted_count -= 1;
         }
-        Ok(previous)
+
+        previous
+    }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        // deleted bitvec is already loaded
+        self.vectors.populate()?;
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        self.deleted.clear_cache()?;
+        self.vectors.clear_cache()?;
+        Ok(())
     }
 }
 
-impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> DenseVectorStorage<T>
-    for AppendableMmapDenseVectorStorage<T, S>
-{
+impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for AppendableMmapDenseVectorStorage<T> {
     fn vector_dim(&self) -> usize {
         self.vectors.dim()
     }
 
-    fn get_dense(&self, key: PointOffsetType) -> &[T] {
+    fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> &[T] {
         self.vectors
-            .get(key as VectorOffsetType)
+            .get::<P>(key as VectorOffsetType)
             .expect("mmap vector not found")
     }
 
-    fn get_dense_batch<'a>(&'a self, keys: &[PointOffsetType], vectors: &mut [&'a [T]]) {
-        debug_assert!(keys.len() == vectors.len());
-        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
-
-        let mut vector_offsets = [0; VECTOR_READ_BATCH_SIZE];
-        for (i, key) in keys.iter().enumerate() {
-            vector_offsets[i] = *key as VectorOffsetType;
-        }
-        self.vectors
-            .get_batch(&vector_offsets[..keys.len()], vectors);
+    fn for_each_in_dense_batch<F: FnMut(usize, &[T])>(&self, keys: &[PointOffsetType], f: F) {
+        self.vectors.for_each_in_batch(keys, f);
     }
 }
 
-impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
-    for AppendableMmapDenseVectorStorage<T, S>
-{
+impl<T: PrimitiveVectorElement> VectorStorage for AppendableMmapDenseVectorStorage<T> {
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -99,22 +108,30 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
         self.vectors.len()
     }
 
-    fn get_vector(&self, key: PointOffsetType) -> CowVector {
-        self.get_vector_opt(key).expect("vector not found")
+    fn get_vector<P: AccessPattern>(&self, key: PointOffsetType) -> CowVector<'_> {
+        self.vectors
+            .get::<P>(key as VectorOffsetType)
+            .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
+            .expect("Vector not found")
     }
 
-    fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
+    fn get_vector_opt<P: AccessPattern>(&self, key: PointOffsetType) -> Option<CowVector<'_>> {
         self.vectors
-            .get(key as VectorOffsetType)
+            .get::<P>(key as VectorOffsetType)
             .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
     }
 
-    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         let vector: &[VectorElementType] = vector.try_into()?;
         let vector = T::slice_from_float_cow(Cow::from(vector));
         self.vectors
-            .insert(key as VectorOffsetType, vector.as_ref())?;
-        self.set_deleted(key, false)?;
+            .insert(key as VectorOffsetType, vector.as_ref(), hw_counter)?;
+        self.set_deleted(key, false);
         Ok(())
     }
 
@@ -124,12 +141,13 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let start_index = self.vectors.len() as PointOffsetType;
+        let disposed_hw = HardwareCounterCell::disposable(); // This function is only used for internal operations.
         for (other_vector, other_deleted) in other_vectors {
             check_process_stopped(stopped)?;
             // Do not perform preprocessing - vectors should be already processed
             let other_vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            let new_id = self.vectors.push(other_vector.as_ref())?;
-            self.set_deleted(new_id as PointOffsetType, other_deleted)?;
+            let new_id = self.vectors.push(other_vector.as_ref(), &disposed_hw)?;
+            self.set_deleted(new_id as PointOffsetType, other_deleted);
         }
         let end_index = self.vectors.len() as PointOffsetType;
         Ok(start_index..end_index)
@@ -153,8 +171,12 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
         files
     }
 
+    fn immutable_files(&self) -> Vec<PathBuf> {
+        self.vectors.immutable_files()
+    }
+
     fn delete_vector(&mut self, key: PointOffsetType) -> OperationResult<bool> {
-        self.set_deleted(key, true)
+        Ok(self.set_deleted(key, true))
     }
 
     fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
@@ -170,13 +192,16 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
     }
 }
 
-pub fn open_appendable_memmap_vector_storage(
+pub fn open_appendable_memmap_vector_storage_full(
     path: &Path,
     dim: usize,
     distance: Distance,
+    madvise: AdviceSetting,
+    populate: bool,
 ) -> OperationResult<VectorStorageEnum> {
-    let storage =
-        open_appendable_memmap_vector_storage_impl::<VectorElementType>(path, dim, distance)?;
+    let storage = open_appendable_memmap_vector_storage_impl::<VectorElementType>(
+        path, dim, distance, madvise, populate,
+    )?;
 
     Ok(VectorStorageEnum::DenseAppendableMemmap(Box::new(storage)))
 }
@@ -185,8 +210,11 @@ pub fn open_appendable_memmap_vector_storage_byte(
     path: &Path,
     dim: usize,
     distance: Distance,
+    madvise: AdviceSetting,
+    populate: bool,
 ) -> OperationResult<VectorStorageEnum> {
-    let storage = open_appendable_memmap_vector_storage_impl(path, dim, distance)?;
+    let storage =
+        open_appendable_memmap_vector_storage_impl(path, dim, distance, madvise, populate)?;
 
     Ok(VectorStorageEnum::DenseAppendableMemmapByte(Box::new(
         storage,
@@ -197,8 +225,11 @@ pub fn open_appendable_memmap_vector_storage_half(
     path: &Path,
     dim: usize,
     distance: Distance,
+    madvise: AdviceSetting,
+    populate: bool,
 ) -> OperationResult<VectorStorageEnum> {
-    let storage = open_appendable_memmap_vector_storage_impl(path, dim, distance)?;
+    let storage =
+        open_appendable_memmap_vector_storage_impl(path, dim, distance, madvise, populate)?;
 
     Ok(VectorStorageEnum::DenseAppendableMemmapHalf(Box::new(
         storage,
@@ -209,22 +240,18 @@ pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
     path: &Path,
     dim: usize,
     distance: Distance,
-) -> OperationResult<AppendableMmapDenseVectorStorage<T, ChunkedMmapVectors<T>>> {
-    create_dir_all(path)?;
+    madvise: AdviceSetting,
+    populate: bool,
+) -> OperationResult<AppendableMmapDenseVectorStorage<T>> {
+    fs::create_dir_all(path)?;
 
     let vectors_path = path.join(VECTORS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
-    let vectors = ChunkedMmapVectors::<T>::open(
-        &vectors_path,
-        dim,
-        Some(false),
-        AdviceSetting::Global,
-        Some(false),
-    )?;
+    let vectors = ChunkedMmapVectors::<T>::open(&vectors_path, dim, madvise, Some(populate))?;
 
-    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
-    let deleted_count = deleted.count_flags();
+    let deleted = BitvecFlags::new(DynamicMmapFlags::open(&deleted_path, populate)?);
+    let deleted_count = deleted.count_trues();
 
     Ok(AppendableMmapDenseVectorStorage {
         vectors,
@@ -235,61 +262,76 @@ pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
     })
 }
 
-pub fn open_appendable_in_ram_vector_storage(
-    path: &Path,
-    dim: usize,
-    distance: Distance,
-) -> OperationResult<VectorStorageEnum> {
-    let storage =
-        open_appendable_in_ram_vector_storage_impl::<VectorElementType>(path, dim, distance)?;
+/// Find files related to this dense vector storage
+#[cfg(any(test, feature = "rocksdb"))]
+pub(crate) fn find_storage_files(vector_storage_path: &Path) -> OperationResult<Vec<PathBuf>> {
+    let vectors_path = vector_storage_path.join(VECTORS_DIR_PATH);
+    let deleted_path = vector_storage_path.join(DELETED_DIR_PATH);
 
-    Ok(VectorStorageEnum::DenseAppendableInRam(Box::new(storage)))
+    let mut files = vec![];
+    files.extend(common::disk::list_files(&vectors_path)?);
+    files.extend(common::disk::list_files(&deleted_path)?);
+    Ok(files)
 }
 
-pub fn open_appendable_in_ram_vector_storage_byte(
-    path: &Path,
-    dim: usize,
-    distance: Distance,
-) -> OperationResult<VectorStorageEnum> {
-    let storage = open_appendable_in_ram_vector_storage_impl(path, dim, distance)?;
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
 
-    Ok(VectorStorageEnum::DenseAppendableInRamByte(Box::new(
-        storage,
-    )))
-}
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use tempfile::Builder;
 
-pub fn open_appendable_in_ram_vector_storage_half(
-    path: &Path,
-    dim: usize,
-    distance: Distance,
-) -> OperationResult<VectorStorageEnum> {
-    let storage = open_appendable_in_ram_vector_storage_impl(path, dim, distance)?;
+    use super::*;
 
-    Ok(VectorStorageEnum::DenseAppendableInRamHalf(Box::new(
-        storage,
-    )))
-}
+    const RAND_SEED: u64 = 42;
 
-pub fn open_appendable_in_ram_vector_storage_impl<T: PrimitiveVectorElement>(
-    path: &Path,
-    dim: usize,
-    distance: Distance,
-) -> OperationResult<AppendableMmapDenseVectorStorage<T, InRamPersistedVectors<T>>> {
-    create_dir_all(path)?;
+    /// Test that `find_storage_files` finds all files that are reported by the storage.
+    #[test]
+    fn test_find_storage_files() {
+        // Numbers chosen so we get 3 data chunks, not just 1
+        const POINT_COUNT: PointOffsetType = 2500;
+        const DIM: usize = 128;
 
-    let vectors_path = path.join(VECTORS_DIR_PATH);
-    let deleted_path = path.join(DELETED_DIR_PATH);
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let mut storage = open_appendable_memmap_vector_storage_full(
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
 
-    let vectors = InRamPersistedVectors::<T>::open(&vectors_path, dim)?;
+        let mut rng = StdRng::seed_from_u64(RAND_SEED);
+        let hw_counter = HardwareCounterCell::disposable();
 
-    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
-    let deleted_count = deleted.count_flags();
+        // Insert points, delete 10% of it, and flush
+        for internal_id in 0..POINT_COUNT {
+            let point = std::iter::repeat_with(|| rng.random_range(-1.0..1.0))
+                .take(DIM)
+                .collect::<Vec<_>>();
+            storage
+                .insert_vector(internal_id, VectorRef::from(&point), &hw_counter)
+                .unwrap();
+        }
+        for internal_id in 0..POINT_COUNT {
+            if !rng.random_bool(0.1) {
+                continue;
+            }
+            storage.delete_vector(internal_id).unwrap();
+        }
+        storage.flusher()().unwrap();
 
-    Ok(AppendableMmapDenseVectorStorage {
-        vectors,
-        deleted,
-        distance,
-        deleted_count,
-        _phantom: Default::default(),
-    })
+        let storage_files = storage.files().into_iter().collect::<HashSet<_>>();
+        let found_files = find_storage_files(dir.path())
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            storage_files, found_files,
+            "find_storage_files must find same files that storage reports",
+        );
+    }
 }

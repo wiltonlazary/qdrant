@@ -3,14 +3,15 @@ mod prof;
 
 use std::sync::atomic::AtomicBool;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use criterion::{criterion_group, criterion_main, Criterion};
-use rand::rngs::StdRng;
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
-use segment::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use rand::rngs::StdRng;
+use segment::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use segment::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
 use segment::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
-use segment::vector_storage::VectorStorage;
+use segment::vector_storage::{Random, VectorStorage};
 use sparse::common::sparse_vector_fixture::random_sparse_vector;
 use tempfile::Builder;
 
@@ -28,12 +29,14 @@ fn sparse_vector_storage_benchmark(c: &mut Criterion) {
     let mut rocksdb_sparse_vector_storage =
         open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &stopped).unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     group.bench_function("insert-rocksdb", |b| {
         b.iter(|| {
             for idx in 0..NUM_VECTORS {
                 let vec = &random_sparse_vector(&mut rnd, MAX_SPARSE_DIM);
                 rocksdb_sparse_vector_storage
-                    .insert_vector(idx as PointOffsetType, vec.into())
+                    .insert_vector(idx as PointOffsetType, vec.into(), &hw_counter)
                     .unwrap();
             }
         })
@@ -42,7 +45,8 @@ fn sparse_vector_storage_benchmark(c: &mut Criterion) {
     group.bench_function("read-rocksdb", |b| {
         b.iter(|| {
             for idx in 0..NUM_VECTORS {
-                let vec = rocksdb_sparse_vector_storage.get_vector_opt(idx as PointOffsetType);
+                let vec =
+                    rocksdb_sparse_vector_storage.get_vector_opt::<Random>(idx as PointOffsetType);
                 assert!(vec.is_some());
             }
         })
@@ -59,7 +63,7 @@ fn sparse_vector_storage_benchmark(c: &mut Criterion) {
             for idx in 0..NUM_VECTORS {
                 let vec = &random_sparse_vector(&mut rnd, MAX_SPARSE_DIM);
                 mmap_sparse_vector_storage
-                    .insert_vector(idx as PointOffsetType, vec.into())
+                    .insert_vector(idx as PointOffsetType, vec.into(), &hw_counter)
                     .unwrap();
             }
         })
@@ -68,7 +72,8 @@ fn sparse_vector_storage_benchmark(c: &mut Criterion) {
     group.bench_function("read-mmap-compression", |b| {
         b.iter(|| {
             for idx in 0..NUM_VECTORS {
-                let vec = mmap_sparse_vector_storage.get_vector_opt(idx as PointOffsetType);
+                let vec =
+                    mmap_sparse_vector_storage.get_vector_opt::<Random>(idx as PointOffsetType);
                 assert!(vec.is_some());
             }
         })

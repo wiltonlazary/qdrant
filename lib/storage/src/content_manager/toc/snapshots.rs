@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 
 use collection::common::snapshots_manager::SnapshotStorageManager;
 use collection::operations::snapshot_ops::SnapshotDescription;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::shard::{PeerId, ShardId};
 use collection::shards::transfer::{ShardTransfer, ShardTransferMethod};
+use fs_err::tokio as tokio_fs;
 
 use super::TableOfContent;
 use crate::content_manager::consensus::operation_sender::OperationSender;
@@ -21,7 +22,7 @@ impl TableOfContent {
         })
     }
 
-    pub fn snapshots_path(&self) -> &str {
+    pub fn snapshots_path(&self) -> &Path {
         &self.storage_config.snapshots_path
     }
 
@@ -30,10 +31,7 @@ impl TableOfContent {
     }
 
     pub fn snapshots_path_for_collection(&self, collection_name: &str) -> PathBuf {
-        Self::collection_snapshots_path(
-            Path::new(&self.storage_config.snapshots_path),
-            collection_name,
-        )
+        Self::collection_snapshots_path(&self.storage_config.snapshots_path, collection_name)
     }
 
     pub async fn create_snapshots_path(
@@ -41,7 +39,7 @@ impl TableOfContent {
         collection_name: &str,
     ) -> Result<PathBuf, StorageError> {
         let snapshots_path = self.snapshots_path_for_collection(collection_name);
-        tokio::fs::create_dir_all(&snapshots_path)
+        tokio_fs::create_dir_all(&snapshots_path)
             .await
             .map_err(|err| {
                 StorageError::service_error(format!(
@@ -56,6 +54,10 @@ impl TableOfContent {
         &self,
         collection_pass: &CollectionPass<'_>,
     ) -> Result<SnapshotDescription, StorageError> {
+        // Increment snapshot telemetry/mertic counter and account for the whole scope.
+        // (This must be a named variable so it doesn't get dropped prematurely!)
+        let _running_snapshots_guard = self.count_snapshot_creation(collection_pass.name());
+
         // create all the directories of the derived collection snapshot path of
         // the collection.
         self.create_snapshots_path(collection_pass.name()).await?;
@@ -134,6 +136,7 @@ impl TableOfContent {
                 to: to_peer,
                 sync,
                 method,
+                filter: None,
             };
             let operation = ConsensusOperations::start_transfer(collection_name, transfer_request);
             proposal_sender.send(operation)?;
